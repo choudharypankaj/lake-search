@@ -138,6 +138,7 @@ type conformance struct {
 		Name     string `json:"name"`
 		Query    string `json:"query"`
 		Baseline string `json:"baseline"`
+		Witness  string `json:"witness"`
 		Compare  string `json:"compare"`
 		Note     string `json:"note"`
 	} `json:"cases"`
@@ -197,7 +198,18 @@ func cmdConform(args []string) int {
 			basePred = b.SQL
 		}
 
-		cond, err := condition(tc.Compare, basePred != "")
+		var witPred string
+		if tc.Witness != "" {
+			w, err := databend.CompileString(tc.Witness, schema)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "case %q witness: %v\n", tc.Name, err)
+				failures++
+				continue
+			}
+			witPred = w.SQL
+		}
+
+		cond, err := condition(tc.Compare, basePred != "", witPred != "")
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "case %q: %v\n", tc.Name, err)
 			failures++
@@ -212,6 +224,9 @@ func cmdConform(args []string) int {
 		if tc.Baseline != "" {
 			fmt.Printf("--   baseline: %s\n", displayQuery(tc.Baseline))
 		}
+		if tc.Witness != "" {
+			fmt.Printf("--   witness: %s\n", displayQuery(tc.Witness))
+		}
 		// The counts are derived tables rather than select-list subqueries so
 		// the CASE can reference them. A select-list alias is not reliably
 		// visible to a sibling expression, and a suite that errors on every
@@ -221,10 +236,16 @@ func cmdConform(args []string) int {
 		if basePred != "" {
 			fmt.Printf("       b.baseline,\n")
 		}
+		if witPred != "" {
+			fmt.Printf("       c.witness,\n")
+		}
 		fmt.Printf("       CASE WHEN %s THEN 'PASS' ELSE 'FAIL' END AS result\n", cond)
 		fmt.Printf("FROM (SELECT count(*) AS actual FROM %s WHERE %s) a", c.Table, pred.SQL)
 		if basePred != "" {
 			fmt.Printf(",\n     (SELECT count(*) AS baseline FROM %s WHERE %s) b", c.Table, basePred)
+		}
+		if witPred != "" {
+			fmt.Printf(",\n     (SELECT count(*) AS witness FROM %s WHERE %s) c", c.Table, witPred)
 		}
 		fmt.Println(";")
 	}
@@ -237,7 +258,7 @@ func cmdConform(args []string) int {
 }
 
 // condition renders the comparison as SQL over the two scalar subqueries.
-func condition(compare string, hasBaseline bool) (string, error) {
+func condition(compare string, hasBaseline, hasWitness bool) (string, error) {
 	needsBaseline := func() error {
 		if !hasBaseline {
 			return fmt.Errorf("compare %q needs a baseline", compare)
@@ -262,6 +283,27 @@ func condition(compare string, hasBaseline bool) (string, error) {
 		// A baseline of zero would make every comparison vacuously true, so
 		// the assertion also requires the baseline to have found something.
 		return fmt.Sprintf("b.baseline > 0 AND a.actual %s b.baseline", ops[compare]), nil
+	case "narrows":
+		// Same as "le", plus the half that matters on this engine: a
+		// mistranslated query returns zero rows, and zero is <= any baseline,
+		// so a plain "le" passes for exactly the failure the suite exists to
+		// catch. Only use it where the two searches genuinely co-occur.
+		if err := needsBaseline(); err != nil {
+			return "", err
+		}
+		return "b.baseline > 0 AND a.actual > 0 AND a.actual <= b.baseline", nil
+	case "partitions":
+		// The strongest form available: actual and witness must be exactly
+		// complementary halves of the baseline, so `a -b` is checked against
+		// `a` and `a AND b` rather than merely being "not bigger than a".
+		// Both halves must be nonempty or the identity is trivial.
+		if err := needsBaseline(); err != nil {
+			return "", err
+		}
+		if !hasWitness {
+			return "", fmt.Errorf("compare %q needs a witness", compare)
+		}
+		return "a.actual > 0 AND c.witness > 0 AND a.actual + c.witness = b.baseline", nil
 	default:
 		return "", fmt.Errorf("unknown compare %q", compare)
 	}

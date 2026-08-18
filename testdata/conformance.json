@@ -15,10 +15,10 @@
     },
     {
       "name": "AND narrows",
-      "query": "snapshot peer",
+      "query": "snapshot region",
       "baseline": "snapshot",
-      "compare": "le",
-      "note": "Adjacency means AND, so adding a term can only shrink the result set. If this ever exceeds the baseline, the default operator has silently become OR."
+      "compare": "narrows",
+      "note": "Adjacency means AND, so adding a term can only shrink the result set. If this ever exceeds the baseline, the default operator has silently become OR. The pair must be one that genuinely co-occurs: with disjoint terms the intersection is legitimately 0, and 0 passes any upper-bound assertion — so this uses `narrows`, which also requires the count to be nonzero."
     },
     {
       "name": "OR widens",
@@ -68,14 +68,15 @@
       "name": "prefix is narrower than substring",
       "query": "snapsh*",
       "baseline": "*napsho*",
-      "compare": "le"
+      "compare": "narrows"
     },
     {
       "name": "negation excludes",
-      "query": "snapshot -TiFlash",
+      "query": "snapshot -region",
       "baseline": "snapshot",
-      "compare": "le",
-      "note": "MUST-VERIFY. Negating a match() relies on the optimiser handling an inverted-index scan under NOT. \u00a75.1 showed match() pushdown does not always respect the surrounding boolean, so this is the case most likely to expose an engine bug rather than a compiler bug."
+      "compare": "partitions",
+      "note": "MUST-VERIFY. Negating a match() relies on the optimiser handling an inverted-index scan under NOT. §5.1 showed match() pushdown does not always respect the surrounding boolean, so this is the case most likely to expose an engine bug rather than a compiler bug. Asserted as an exact partition of the baseline rather than an upper bound, because NOT swallowing the whole predicate yields 0, which is also <= the baseline.",
+      "witness": "snapshot region"
     },
     {
       "name": "negation of an absent term changes nothing",
@@ -100,13 +101,13 @@
       "name": "full-text and structured compose",
       "query": "snapshot component:tikv",
       "baseline": "snapshot",
-      "compare": "le"
+      "compare": "narrows"
     },
     {
       "name": "grouping changes meaning",
       "query": "(snapshot OR peer) component:tikv",
       "baseline": "snapshot OR peer",
-      "compare": "le"
+      "compare": "narrows"
     },
     {
       "name": "existence check",
@@ -129,7 +130,7 @@
       "name": "literal percent is not a wildcard",
       "query": "100%*",
       "compare": "zero",
-      "note": "Verifies the two layers of escaping: LIKE's backslash-percent keeps the percent literal, and the SQL literal doubles the backslash. If Databend does NOT honour backslash escapes inside string literals this case will misbehave \u2014 that is exactly what it is here to detect."
+      "note": "Verifies the two layers of escaping: LIKE's backslash-percent keeps the percent literal, and the SQL literal doubles the backslash. If Databend does NOT honour backslash escapes inside string literals this case will misbehave — that is exactly what it is here to detect."
     },
     {
       "name": "boolean AND agrees with LIKE",
@@ -142,13 +143,15 @@
       "name": "AND is not OR",
       "query": "peer status",
       "baseline": "peer OR status",
-      "compare": "le"
+      "compare": "narrows"
     },
     {
       "name": "negation subtracts exactly",
       "query": "peer -status",
-      "compare": "nonzero",
-      "note": "Measured 18,839 = 91,442 peer - 72,603 (peer AND status), exactly."
+      "compare": "partitions",
+      "note": "The name is now the assertion: `peer -status` plus `peer status` must equal `peer` exactly, no rows lost or double-counted. Measured 21,418 + 74,207 = 95,625.",
+      "baseline": "peer",
+      "witness": "peer status"
     },
     {
       "name": "fuzzy composes with a structured filter",

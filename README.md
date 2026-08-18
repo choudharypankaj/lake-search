@@ -126,12 +126,27 @@ Each statement prints PASS or FAIL. Assertions are relative — `snapshoot~1` mu
 return exactly what `snapshot` returns, `"status peer"` must return nothing when
 `"peer status"` returns many — so the suite stays valid as the table grows.
 
+An upper bound is not enough on this engine. `actual <= baseline` passes when
+`actual` is zero, which is precisely the failure the suite exists to detect, so
+cases whose result must be nonempty assert `narrows` (nonzero *and* not wider),
+and the negation cases assert `partitions`: `a -b` and `a b` must add up to `a`
+exactly, with both halves nonempty. A `NOT` that swallowed its predicate would
+return 0 and pass an upper-bound check; it cannot pass this one.
+
 Two cases are there to catch the *engine* rather than the compiler:
 
 - **negation** relies on the optimiser handling an inverted-index scan under
   `NOT`, which is not something `match()` pushdown obviously respects;
 - **literal `%`** depends on Databend honouring backslash escapes inside string
   literals.
+
+All 26 cases were run against the live warehouse (Databend v1.2.933-nightly,
+`logs.k8s_logs`, ~422k rows) and pass. The two partition identities hold to the
+row — 17,446 + 5 = 17,451 and 21,419 + 74,387 = 95,806 — so negation under an
+inverted-index scan is exact here, not approximate. Note that a co-occurrence
+pair has to be chosen against real data: `snapshot` and `peer` never appear in
+the same line in this table, and an intersection case built on them is
+vacuous.
 
 ## Grafana
 
