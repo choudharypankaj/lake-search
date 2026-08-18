@@ -19,12 +19,39 @@ TABLE = "logs.k8s_logs"
 
 # Every panel filters the same way. $__search interpolates with :sqlstring so an
 # apostrophe in the search box cannot break the literal.
-WHERE = ("$__timeFilter(ts)\n"
-         "  AND component IN (${component:sqlstring})\n"
-         "  AND level IN (${level:sqlstring})\n"
-         "  AND $__search(msg, ${search:sqlstring})")
+#
+# FILTERS is separate from the time predicate because the Event deltas panel
+# needs the same filters over a *different* window; before this it repeated them
+# by hand, which is how the two halves of a comparison quietly stop comparing.
+#
+# `node NOT IN` is the exclude-machine filter. Its variable always carries the
+# sentinel value "(none)", which matches no real node, so the predicate is valid
+# SQL when nothing is being excluded — an empty multi-value variable would
+# interpolate to `node NOT IN ()` and fail to parse.
+FILTERS = ("  AND component IN (${component:sqlstring})\n"
+           "  AND level IN (${level:sqlstring})\n"
+           "  AND node IN (${node:sqlstring})\n"
+           "  AND node NOT IN (${exclude_node:sqlstring})\n"
+           # Rows ingested before the multi-format parser have no kv.format at
+           # all, and `IN (...)` drops NULLs — which would have silently hidden
+           # every historical row the moment this filter existed. coalesce puts
+           # them in a "legacy" bucket that the variable lists like any other.
+           "  AND coalesce(kv['format']::VARCHAR, 'legacy') IN (${logformat:sqlstring})\n"
+           "  AND $__search(msg, ${search:sqlstring})")
+
+WHERE = "$__timeFilter(ts)\n" + FILTERS
 
 FINGERPRINT = "regexp_replace(regexp_replace(msg,'[0-9a-f]{8,}','?'),'[0-9]+','?')"
+
+
+# Grafana ellipsises a table cell by default, so a 900-char operator line reads
+# as truncated even though the whole value is in the response. This is the
+# equivalent of HyperDX's Wrap Lines toggle (MAX_CELL_LENGTH 500 -> 50_000),
+# except it is per-column and always on for the columns that hold log text.
+def wrap(field):
+    return {"matcher": {"id": "byName", "options": field},
+            "properties": [{"id": "custom.cellOptions",
+                            "value": {"type": "auto", "wrapText": True}}]}
 
 
 def target(sql):
@@ -104,7 +131,7 @@ panels.append(panel(1, "timeseries", "Events per minute", 0, 8, 24, 7,
 
 # ------------------------------------------------------------- logs + patterns
 panels.append(panel(2, "logs", "Log lines", 0, 15, 16, 16,
-                    "SELECT ts, level, msg, component, pod, node, source_file\n"
+                    "SELECT ts, level, msg, component, pod, node, source_file, kv\n"
                     f"FROM {TABLE}\nWHERE {WHERE}\nORDER BY ts DESC\nLIMIT 1000",
                     options={"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending",
                              "enableLogDetails": True, "dedupStrategy": "none"}))
@@ -113,6 +140,7 @@ panels.append(panel(3, "table", "Top patterns", 16, 15, 8, 16,
                     f"SELECT component,\n       {FINGERPRINT} AS pattern,\n       count(*) AS events\n"
                     f"FROM {TABLE}\nWHERE {WHERE}\n"
                     "GROUP BY component, pattern\nORDER BY events DESC\nLIMIT 30",
+                    fieldConfig={"defaults": {}, "overrides": [wrap("pattern")]},
                     desc="Fingerprinting: digits and hex ids masked, so 300k lines collapse to a "
                          "handful of shapes. The technique Netflix uses instead of an index; here "
                          "it composes with one."))
@@ -131,9 +159,7 @@ prev AS (
     FROM {TABLE}
     WHERE ts >= to_timestamp(to_unix_timestamp($__fromTime)*2 - to_unix_timestamp($__toTime))
       AND ts <  $__fromTime
-      AND component IN (${{component:sqlstring}})
-      AND level IN (${{level:sqlstring}})
-      AND $__search(msg, ${{search:sqlstring}})
+{FILTERS}
   ) t GROUP BY pattern
 )
 SELECT coalesce(cur.pattern, prev.pattern) AS pattern,
@@ -152,6 +178,7 @@ panels.append(panel(30, "table", "Event deltas — this window vs the one before
                          "the one HyperDX analysis feature with no Grafana equivalent, so it is "
                          "built here in SQL.",
                     fieldConfig={"defaults": {}, "overrides": [
+                        wrap("pattern"),
                         {"matcher": {"id": "byName", "options": "delta"},
                          "properties": [{"id": "custom.cellOptions",
                                          "value": {"type": "color-text"}},
@@ -178,6 +205,7 @@ panels.append(panel(4, "table", "Best matches — BM25 relevance", 0, 42, 24, 10
                     "  AND level IN (${level:sqlstring})\n"
                     "  AND $__search_score(msg, ${search:sqlstring})\n"
                     "ORDER BY relevance DESC\nLIMIT 50",
+                    fieldConfig={"defaults": {}, "overrides": [wrap("msg")]},
                     desc="Ranked by BM25 — something ClickHouse's own docs say it does not do. "
                          "Empty search returns no rows by design: score() requires a search "
                          "function anywhere in the statement, so the macro emits one that "
@@ -206,6 +234,38 @@ dash = {
          "query": f"SELECT DISTINCT level FROM {TABLE} ORDER BY level",
          "multi": True, "includeAll": True, "refresh": 2, "sort": 1,
          "current": {"text": ["All"], "value": ["$__all"]}, "options": []},
+        # Both machine lists are chained on Component: a node that runs no tidb
+        # pod has no business appearing in the list while Component=tidb, and an
+        # exclude list of 21 nodes to find the 5 that can matter is unusable.
+        # Chained on component only — not level, which would make machines
+        # vanish from the list as soon as they stopped erroring, and not the time
+        # range, since this plugin expands macros in the backend and template
+        # variable queries never reach it.
+        # `format` is a reserved word in Databend, so the column is aliased.
+        {"type": "query", "name": "logformat", "label": "Log format", "datasource": DS,
+         "description": "Which parser matched: tidb, klog, zap, tracing, json, "
+                        "raw (nothing matched), legacy (ingested before the parser).",
+         "query": f"SELECT DISTINCT coalesce(kv['format']::VARCHAR, 'legacy') AS log_format "
+                  f"FROM {TABLE} WHERE component IN (${{component:sqlstring}}) ORDER BY log_format",
+         "multi": True, "includeAll": True, "refresh": 2, "sort": 1,
+         "current": {"text": ["All"], "value": ["$__all"]}, "options": []},
+        {"type": "query", "name": "node", "label": "Machine", "datasource": DS,
+         "description": "Include only these nodes. Narrows with Component.",
+         "query": f"SELECT DISTINCT node FROM {TABLE} "
+                  f"WHERE component IN (${{component:sqlstring}}) ORDER BY node",
+         "multi": True, "includeAll": True, "refresh": 2, "sort": 1,
+         "current": {"text": ["All"], "value": ["$__all"]}, "options": []},
+        # Exclude is its own variable rather than "deselect it from Machine",
+        # because excluding one noisy node out of a dozen should be one click,
+        # not eleven. includeAll is off so a selection always exists, and the
+        # sentinel row is what makes "exclude nothing" expressible.
+        {"type": "query", "name": "exclude_node", "label": "Exclude machine", "datasource": DS,
+         "description": "Drop these nodes. Leave (none) selected to exclude nothing. Narrows with Component.",
+         "query": f"SELECT node FROM (SELECT '(none)' AS node UNION ALL "
+                  f"SELECT DISTINCT node FROM {TABLE} "
+                  f"WHERE component IN (${{component:sqlstring}})) t ORDER BY node",
+         "multi": True, "includeAll": False, "refresh": 2, "sort": 1,
+         "current": {"text": ["(none)"], "value": ["(none)"]}, "options": []},
     ]},
     "panels": panels,
 }
