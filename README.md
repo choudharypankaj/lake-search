@@ -5,8 +5,8 @@ Lucene-style search syntax compiled to Databend SQL predicates, for
 warehouse.
 
 ```console
-$ lake-search compile 'level:error snapshoot~1 -TiFlash'
-(lower(level) = lower('error') AND match(msg, 'snapshoot', 'fuzziness=1') AND NOT (match(msg, 'TiFlash')))
+$ lake-search compile 'level:error "peer status" -TiFlash'
+(lower(level) = lower('error') AND query('(msg:"peer status") NOT (msg:TiFlash)'))
 ```
 
 ## Why
@@ -34,15 +34,17 @@ lake-search closes the gap by translating rather than passing through:
 
 | Lucene | Databend |
 | --- | --- |
-| `term` | `match(col, 'term')` |
+| `term` | `query('col:term')` |
 | `"two words"` | `query('col:"two words"')` — order-sensitive |
+| `a b`, `a AND b` | `query('(col:a) AND (col:b)')` — one call, not two |
+| `a -b` | `query('(col:a) NOT (col:b)')` — bare and trailing, never `AND NOT` |
+| `-a -b` | `NOT (query('(col:a) OR (col:b)'))` — De Morgan |
 | `term~2` | `match(col, 'term', 'fuzziness=2')` |
 | `pref*`, `*sub*` | `lower(col) LIKE lower('pref%')` |
 | `field:value` | `lower(field) = lower('value')` — Databend has no `ILIKE` |
 | `field:>100` | `field > 100` |
 | `field:*` | `field IS NOT NULL AND field <> ''` |
-| `-term`, `NOT term` | `NOT (…)` |
-| *(empty)* | `1=1` — and no `match()` anywhere in the output |
+| *(empty)* | `1=1` — and no search function anywhere in the output |
 | unknown field | `kv['field']::VARCHAR` via the VARIANT column |
 
 ## The one-search-function rule
@@ -137,6 +139,23 @@ See [docs/grafana-macro.md](docs/grafana-macro.md) for a `$__search(col, '$q')`
 macro for `databendlabs/grafana-databend-datasource`. It is an additive change
 to the plugin's backend macro registry — one new file and two map entries —
 and it retires the hidden predicate-generating dashboard variable entirely.
+
+## score() and the empty search box
+
+`score()` is rejected unless a search function exists **anywhere in the
+statement**: `[1065] [SQL-BINDER] Score function must be used together with
+match or query function`. Because the `score()` call sits in the select list,
+**no predicate can rescue it** — `SELECT score() … WHERE 1=0` still fails. That
+was verified live, and it rules out the obvious workaround.
+
+`CompileScore` therefore emits a search function that matches nothing:
+
+```sql
+SELECT msg, score() FROM logs.k8s_logs WHERE match(msg, 'zzqqnolakesearchmatchqqzz')
+```
+
+The binder is satisfied, the panel returns zero rows, and the user sees an empty
+relevance panel rather than a red error.
 
 ## Notes on fuzziness
 

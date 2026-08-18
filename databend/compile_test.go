@@ -132,22 +132,31 @@ func TestEmptySearchEmitsNoMatch(t *testing.T) {
 func TestCompileScore(t *testing.T) {
 	s := K8sLogs()
 
+	// `1=0` is NOT sufficient: the binder looks for a search function anywhere
+	// in the statement, and score() sits in the select list. Verified live —
+	// `SELECT score() ... WHERE 1=0` still returns [1065]. So an empty search
+	// must emit a search function that matches nothing.
+	want := "match(msg, '" + ScoreSentinel + "')"
+
 	empty, err := CompileScore("", s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if empty.SQL != MatchNone {
-		t.Errorf("empty score predicate = %s, want %s", empty.SQL, MatchNone)
+	if empty.SQL != want {
+		t.Errorf("empty score predicate = %s, want %s", empty.SQL, want)
+	}
+	if !empty.UsesMatch {
+		t.Error("empty score predicate must still count as using a search function")
 	}
 
-	// A structured-only query has no match() either, so it must also be
-	// downgraded rather than producing invalid SQL.
+	// A structured-only query has no search function either, so it takes the
+	// same path.
 	structured, err := CompileScore("level:error", s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if structured.SQL != MatchNone {
-		t.Errorf("structured-only score predicate = %s, want %s", structured.SQL, MatchNone)
+	if structured.SQL != want {
+		t.Errorf("structured-only score predicate = %s, want %s", structured.SQL, want)
 	}
 
 	withText, err := CompileScore("snapshot", s)

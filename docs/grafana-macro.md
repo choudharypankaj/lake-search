@@ -137,19 +137,64 @@ and register both in `macros.go`:
  }
 ```
 
-## Deploying it
+## Deploying it — what actually works
 
-The plugin is already running unsigned, so no new signing obstacle:
+**Copying the binary into the pod does not survive a restart.** If the
+Deployment sets `GF_INSTALL_PLUGINS`, Grafana **wipes and re-extracts the whole
+plugin directory on every start**, even though the plugin is already installed
+and the version is unchanged. Verified the hard way: a patched binary and a
+backup file next to it were both gone after one pod restart, and the original
+31,223,992-byte binary was back.
+
+So the install URL has to point at your build. Only the backend changes, so the
+frontend and the other platform binaries come straight from upstream:
 
 ```bash
-mage -v build:linux && npm run build          # produces dist/
-kubectl -n <grafana-ns> cp dist/ <pod>:/var/lib/grafana/plugins/databend/
+# 1. build just the backend, in a container (the plugin needs Go 1.25)
+docker run --rm -v "$PWD":/src -w /src \
+  -e CGO_ENABLED=0 -e GOOS=linux -e GOARCH=amd64 -e GOFLAGS=-mod=mod \
+  golang:1.25-alpine go build -ldflags="-s -w" -o gpx_databend_linux_amd64 ./pkg
+
+# 2. take the upstream release and swap in that one file
+gh release download v1.4.9 --repo databendlabs/grafana-databend-datasource --pattern '*.zip'
+unzip -q databendlabs-databend-datasource-1.4.9.zip
+cp -f gpx_databend_linux_amd64 databendlabs-databend-datasource/
+zip -qr databend-datasource-lake-search.zip databendlabs-databend-datasource
+
+# 3. publish it somewhere Grafana can fetch, and point the env var at it
+kubectl -n <ns> set env deployment/grafana \
+  GF_INSTALL_PLUGINS="<zip url>;databendlabs-databend-datasource"
 ```
 
-`GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS` must already list
-`databendlabs-databend-datasource`. **Set `strategy.type: Recreate` on the
-Grafana Deployment** before rolling it — with a single RWO PVC a rolling update
-crash-loops on `index is locked by another process … unified-search/bleve`.
+Vendor this module into the plugin with a `replace` directive rather than a
+network fetch, so the build pins exactly the code you tested:
+
+```
+require github.com/choudharypankaj/lake-search v0.0.0
+replace github.com/choudharypankaj/lake-search => ./lakesearch
+```
+
+Two further requirements: `GF_PLUGINS_ALLOW_LOADING_UNSIGNED_PLUGINS` must list
+`databendlabs-databend-datasource` (the upstream build is unsigned too), and the
+Grafana Deployment needs `strategy.type: Recreate` — with a single RWO PVC a
+rolling update crash-loops on `index is locked by another process …
+unified-search/bleve`.
+
+## Verified live
+
+Through `POST /api/ds/query` against a deployed Grafana 13.2.0, on a 345k-row
+table:
+
+| Query | Before | After |
+| --- | --- | --- |
+| `$__search(msg, '')` | 0 rows | **345,852** |
+| `$__search(msg, 'snapshoot~1')` | 0 rows | **17,376** |
+| `$__search(msg, 'snapsh*')` | 0 rows | **1,019** |
+| `$__search(msg, 'component:tidb "peer status" -zzznone')` | n/a | **72,601** |
+| `$__search(msg, 'region, peer')` | truncated at the comma | **654** |
+| `$__search_score(msg, '')` | `[1065]` | **0 rows, no error** |
+| `$__search_score(msg, 'unreachable')` | n/a | ranked, top score **7.31** |
+| `$__search(msg, 'peer OR -status')` | silently meant `peer` | **rejected with an explanation** |
 
 ## Verifying it
 

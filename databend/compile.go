@@ -89,21 +89,39 @@ func CompileString(q string, s Schema) (Result, error) {
 	return Compile(parser.Parse(q), s)
 }
 
+// ScoreSentinel is a token chosen to match nothing. It exists so that a
+// relevance panel with an empty search box still contains a search function.
+const ScoreSentinel = "zzqqnolakesearchmatchqqzz"
+
 // CompileScore renders a predicate for a panel that also selects score().
 //
 // Databend rejects score() unless a search function is present in the same
-// statement — `[1065] Score function must be used together with match or query
-// function` — so a relevance panel cannot fall back to 1=1 on an empty search.
-// It must return no rows instead.
+// statement: `[1065] [SQL-BINDER] Score function must be used together with
+// match or query function`.
+//
+// The obvious workaround — emitting `1=0` when the box is empty — does **not**
+// work, and this was verified against a live warehouse rather than assumed.
+// The binder looks for a search function *anywhere in the statement*, so
+// `SELECT score() … WHERE 1=0` still fails. Since the score() call sits in the
+// select list, no predicate can rescue it.
+//
+// What does work is a search function that matches nothing: the binder is
+// satisfied, the panel returns zero rows, and no error reaches the user.
 func CompileScore(q string, s Schema) (Result, error) {
 	r, err := CompileString(q, s)
 	if err != nil {
 		return r, err
 	}
 	if !r.UsesMatch {
-		r.SQL = MatchNone
+		col := s.Default
+		if f, ok := s.Fields[strings.ToLower(s.Default)]; ok {
+			col = f.Column
+		}
+		r.SQL = fmt.Sprintf("match(%s, '%s')", col, ScoreSentinel)
+		r.UsesMatch = true
 		r.Warnings = append(r.Warnings,
-			"score() requires a match()/query() predicate; emitting 1=0 so the panel returns no rows")
+			"score() needs a search function even when the search is empty; matching a sentinel token "+
+				"so the panel returns no rows instead of [1065]")
 	}
 	return r, nil
 }
@@ -221,17 +239,37 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 		return c.textBoolean(frags, op)
 	}
 
-	// Mixed: every text child now has to become its own query() call. More
-	// than one is a compile error, reported once at the top level with an
-	// explanation the user can act on.
+	// Mixed. The text children are merged into a single text expression first
+	// and wrapped once — `level:error "peer status" -TiFlash` is an ordinary
+	// query, and wrapping each text leaf separately would spend three search
+	// functions on it and fail.
+	var textFrags []fragment
 	parts := make([]string, 0, len(frags))
+	textSlot := -1
 	for _, f := range frags {
 		if f.isText() {
-			parts = append(parts, c.wrapText(f))
-		} else {
-			parts = append(parts, f.sql)
+			if textSlot < 0 {
+				textSlot = len(parts)
+				parts = append(parts, "") // reserved, filled in below
+			}
+			textFrags = append(textFrags, f)
+			continue
 		}
+		parts = append(parts, f.sql)
 	}
+
+	if len(textFrags) > 0 {
+		merged := textFrags[0]
+		if len(textFrags) > 1 {
+			var err error
+			merged, err = c.textBoolean(textFrags, op)
+			if err != nil {
+				return fragment{}, err
+			}
+		}
+		parts[textSlot] = c.wrapText(merged)
+	}
+
 	return fragment{sql: "(" + strings.Join(parts, " "+op+" ") + ")"}, nil
 }
 
