@@ -54,13 +54,38 @@ Warnings go to stderr, SQL to stdout, so output can be piped safely.
 `)
 }
 
-func cmdCompile(args []string) int {
-	fs := flag.NewFlagSet("compile", flag.ExitOnError)
-	score := fs.Bool("score", false, "compile for a panel that also selects score()")
-	quiet := fs.Bool("quiet", false, "suppress warnings")
-	fs.Parse(args)
+// takeFlags pulls known flags off the front of the argument list and returns
+// the rest verbatim as the query.
+//
+// The standard flag package cannot be used here: `lake-search compile -TiFlash`
+// is a perfectly ordinary search meaning "exclude TiFlash", and flag parsing
+// would reject it as an unknown flag. A search tool whose syntax collides with
+// its own CLI is a bad tool, so the flags are matched explicitly and everything
+// else — leading dash or not — is search text.
+func takeFlags(args []string, flags map[string]*bool) []string {
+	for len(args) > 0 {
+		if args[0] == "--" {
+			return args[1:]
+		}
+		p, ok := flags[args[0]]
+		if !ok {
+			break
+		}
+		*p = true
+		args = args[1:]
+	}
+	return args
+}
 
-	q := strings.Join(fs.Args(), " ")
+func cmdCompile(args []string) int {
+	var scoreV, quietV bool
+	score, quiet := &scoreV, &quietV
+	rest := takeFlags(args, map[string]*bool{
+		"-score": score, "--score": score,
+		"-quiet": quiet, "--quiet": quiet,
+	})
+
+	q := strings.Join(rest, " ")
 	schema := databend.K8sLogs()
 
 	var (
@@ -221,6 +246,10 @@ func condition(compare string, hasBaseline bool) (string, error) {
 	}
 
 	switch compare {
+	case "executes":
+		// For cases whose point is that the statement parses at all — escaping
+		// and injection safety — where the row count is incidental.
+		return "a.actual >= 0", nil
 	case "zero":
 		return "a.actual = 0", nil
 	case "nonzero":

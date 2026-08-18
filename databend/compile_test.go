@@ -18,26 +18,42 @@ func TestCompile(t *testing.T) {
 		{"whitespace only", "   ", MatchAll},
 
 		// --- plain terms ---
-		{"bare term", "TiFlash", `match(msg, 'TiFlash')`},
+		//
+		// Every full-text leaf merges into ONE query() call: Databend allows a
+		// single search function per table, so `match(a) AND match(b)` is
+		// rejected with [1065] duplicate search function.
+		{"bare term", "TiFlash", `query('msg:TiFlash')`},
 		{"two terms are ANDed", "peer status",
-			`(match(msg, 'peer') AND match(msg, 'status'))`},
+			`query('(msg:peer) AND (msg:status)')`},
 		{"explicit AND", "peer AND status",
-			`(match(msg, 'peer') AND match(msg, 'status'))`},
+			`query('(msg:peer) AND (msg:status)')`},
 		{"explicit OR", "peer OR status",
-			`(match(msg, 'peer') OR match(msg, 'status'))`},
+			`query('(msg:peer) OR (msg:status)')`},
 
 		// --- phrases are order-sensitive via query() ---
 		{"phrase", `"peer status"`, `query('msg:"peer status"')`},
 
 		// --- negation, both spellings ---
-		{"NOT keyword", "NOT TiFlash", `NOT (match(msg, 'TiFlash'))`},
+		//
+		// Negation stays *inside* the query() call rather than becoming
+		// `query(a) AND NOT query(b)`, which would spend two search functions.
+		{"NOT keyword", "NOT TiFlash", `NOT (query('msg:TiFlash'))`},
+		// Negatives are bare and trailing: `AND NOT` returns zero rows on this
+		// engine, in every spelling.
 		{"minus shorthand", "snapshot -TiFlash",
-			`(match(msg, 'snapshot') AND NOT (match(msg, 'TiFlash')))`},
+			`query('(msg:snapshot) NOT (msg:TiFlash)')`},
+		{"two exclusions", "peer -status -region",
+			`query('(msg:peer) NOT (msg:status) NOT (msg:region)')`},
+		// All-negative folds through De Morgan into one positive query under a
+		// single SQL NOT, rather than a purely negative query that matches
+		// nothing.
+		{"all negative folds", "-TiFlash -snapshot",
+			`NOT (query('(msg:TiFlash) OR (msg:snapshot)'))`},
 
 		// --- field predicates on plain columns ---
 		{"field equals", "level:error", `lower(level) = lower('error')`},
 		{"field plus term", "level:error snapshot",
-			`(lower(level) = lower('error') AND match(msg, 'snapshot'))`},
+			`(lower(level) = lower('error') AND query('msg:snapshot'))`},
 
 		// --- the two silent-failure traps (§5.10) ---
 		{"fuzzy maps to the option form", "snapshoot~1",
@@ -59,15 +75,15 @@ func TestCompile(t *testing.T) {
 
 		// --- grouping ---
 		{"parens", "(peer OR status) AND level:error",
-			`((match(msg, 'peer') OR match(msg, 'status')) AND lower(level) = lower('error'))`},
+			`(query('(msg:peer) OR (msg:status)') AND lower(level) = lower('error'))`},
 
 		// --- hyphens are part of words, not negation ---
-		{"hyphen inside a word", "pd-0", `match(msg, 'pd-0')`},
+		{"hyphen inside a word", "pd-0", `query('msg:pd-0')`},
 		{"field value with hyphens", "pod:tikv-0", `lower(pod) = lower('tikv-0')`},
 
 		// --- injection safety ---
-		{"quote in term", "it's", `match(msg, 'it''s')`},
-		{"backslash in term", `snapshot\path`, `match(msg, 'snapshot\\path')`},
+		{"quote in term", "it's", `query('msg:"it''s"')`},
+		{"backslash in term", `snapshot\path`, `query('msg:"snapshot\\\\path"')`},
 		// `C:` parses as a field name, so this lands in the VARIANT — Lucene
 		// reads it the same way. Worth asserting so the behaviour is a
 		// decision rather than a surprise.
@@ -138,7 +154,7 @@ func TestCompileScore(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if withText.SQL != `match(msg, 'snapshot')` {
+	if withText.SQL != `query('msg:snapshot')` {
 		t.Errorf("text score predicate = %s", withText.SQL)
 	}
 }
@@ -174,5 +190,41 @@ func TestErrors(t *testing.T) {
 	}
 	if _, err := CompileString("msg:>5", K8sLogs()); err == nil {
 		t.Error("expected an error for a range on a full-text field")
+	}
+}
+
+// Databend allows one search function per table. Anything needing two must fail
+// at compile time with an explanation, because the alternative is SQL that dies
+// at runtime with [1065] duplicate search function for table 0.
+func TestOneSearchFunctionRule(t *testing.T) {
+	s := K8sLogs()
+
+	// Text terms in different branches of a mixed boolean cannot be merged
+	// into one query() call.
+	if _, err := CompileString("(peer level:error) OR (status level:warn)", s); err == nil {
+		t.Error("expected an error: this needs two query() calls")
+	}
+
+	// Fuzziness exists only as an option to match(), so a fuzzy term is a
+	// search function of its own and cannot share a statement with another
+	// full-text term.
+	if _, err := CompileString("snapshoot~1 peer", s); err == nil {
+		t.Error("expected an error: fuzzy term plus a second full-text term")
+	}
+
+	// But a fuzzy term composes freely with structured filters and LIKE,
+	// neither of which is a search function. Both verified live.
+	for _, q := range []string{"snapshoot~1 level:error", "snapshoot~1 region*"} {
+		if _, err := CompileString(q, s); err != nil {
+			t.Errorf("CompileString(%q) should compile: %v", q, err)
+		}
+	}
+}
+
+// OR with a negated child is rejected: Databend drops the negative clause
+// silently, so `a OR -b` would quietly mean `a`.
+func TestNegationUnderOrRejected(t *testing.T) {
+	if _, err := CompileString("peer OR -status", K8sLogs()); err == nil {
+		t.Error("expected an error: a negated term under OR is silently dropped by the engine")
 	}
 }

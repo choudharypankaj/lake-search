@@ -42,8 +42,8 @@
       "name": "fuzzy typo matches the baseline",
       "query": "snapshoot~1",
       "baseline": "snapshot",
-      "compare": "eq",
-      "note": "The headline fix. Typed as Lucene `snapshoot~1` this returns 0 through query(); compiled to match(msg,'snapshoot','fuzziness=1') it returns the full baseline."
+      "compare": "ge",
+      "note": "The headline fix. Typed as Lucene `snapshoot~1` this returns 0 through query(); compiled to match(msg,'snapshoot','fuzziness=1') it returns the baseline and a little more (measured 17,341 against 17,336) because other tokens also sit within one edit of the stem. Hence 'at least the baseline', not equality."
     },
     {
       "name": "fuzziness is bounded",
@@ -55,7 +55,8 @@
       "name": "two edits accepted at fuzziness 2",
       "query": "snpshoot~2",
       "baseline": "snapshot",
-      "compare": "eq"
+      "compare": "ge",
+      "note": "Measured 17,321 against a 17,316 baseline: fuzziness=2 matches a few extra tokens, so the assertion is 'at least the baseline', not equality."
     },
     {
       "name": "prefix wildcard works via LIKE",
@@ -74,7 +75,7 @@
       "query": "snapshot -TiFlash",
       "baseline": "snapshot",
       "compare": "le",
-      "note": "MUST-VERIFY. Negating a match() relies on the optimiser handling an inverted-index scan under NOT. §5.1 showed match() pushdown does not always respect the surrounding boolean, so this is the case most likely to expose an engine bug rather than a compiler bug."
+      "note": "MUST-VERIFY. Negating a match() relies on the optimiser handling an inverted-index scan under NOT. \u00a75.1 showed match() pushdown does not always respect the surrounding boolean, so this is the case most likely to expose an engine bug rather than a compiler bug."
     },
     {
       "name": "negation of an absent term changes nothing",
@@ -121,14 +122,45 @@
     {
       "name": "quote in a term does not break the literal",
       "query": "it's",
-      "compare": "zero",
-      "note": "Injection safety. A count of zero is the expected outcome; what matters is that the statement parses and does not error."
+      "compare": "executes",
+      "note": "Injection safety. The assertion is parseability, not a count: `it's` compiles to a phrase search that legitimately matches (2,056 rows measured, since the tokenizer splits on the apostrophe). What must never happen is a syntax error or a broken string literal."
     },
     {
       "name": "literal percent is not a wildcard",
       "query": "100%*",
       "compare": "zero",
-      "note": "Verifies the two layers of escaping: LIKE's backslash-percent keeps the percent literal, and the SQL literal doubles the backslash. If Databend does NOT honour backslash escapes inside string literals this case will misbehave — that is exactly what it is here to detect."
+      "note": "Verifies the two layers of escaping: LIKE's backslash-percent keeps the percent literal, and the SQL literal doubles the backslash. If Databend does NOT honour backslash escapes inside string literals this case will misbehave \u2014 that is exactly what it is here to detect."
+    },
+    {
+      "name": "boolean AND agrees with LIKE",
+      "query": "peer status",
+      "baseline": "",
+      "compare": "nonzero",
+      "note": "Both terms merge into one query() call. Two match() calls would fail [1065] duplicate search function."
+    },
+    {
+      "name": "AND is not OR",
+      "query": "peer status",
+      "baseline": "peer OR status",
+      "compare": "le"
+    },
+    {
+      "name": "negation subtracts exactly",
+      "query": "peer -status",
+      "compare": "nonzero",
+      "note": "Measured 18,839 = 91,442 peer - 72,603 (peer AND status), exactly."
+    },
+    {
+      "name": "fuzzy composes with a structured filter",
+      "query": "snapshoot~1 component:tikv",
+      "compare": "nonzero",
+      "note": "match(...,'fuzziness=1') is the one search function; the column predicate is not one, so they compose."
+    },
+    {
+      "name": "fuzzy composes with LIKE",
+      "query": "snapshoot~1 region*",
+      "compare": "nonzero",
+      "note": "LIKE is not a search function either."
     }
   ]
 }

@@ -45,6 +45,42 @@ lake-search closes the gap by translating rather than passing through:
 | *(empty)* | `1=1` — and no `match()` anywhere in the output |
 | unknown field | `kv['field']::VARCHAR` via the VARIANT column |
 
+## The one-search-function rule
+
+Verified on a live warehouse (Databend v0.34.0), and it shapes the whole design:
+**a statement may contain at most one search function per table.**
+
+```sql
+match(msg,'a') AND match(msg,'b')   -- [1065] duplicate search function for table 0
+match(msg,'a') AND query('msg:b')   -- same
+query('msg:a') AND query('msg:b')   -- same
+```
+
+So boolean full-text logic cannot be built with SQL `AND`/`OR`. It has to go
+*inside* one `query()` call, and that mini-language has three undocumented
+behaviours that all fail silently:
+
+| Form | Result |
+| --- | --- |
+| `(a) AND NOT (b)` | **0 rows** — `AND NOT` is broken in every spelling |
+| `(a) NOT (b) AND (c)` | everything after the first `NOT` is **ignored** |
+| `(a) OR NOT (b)` | the negative clause is **silently dropped** |
+| `(a) AND (b) NOT (c)` | correct — matches the equivalent LIKE exactly |
+| `(a) NOT (b) NOT (c)` | correct — matches the equivalent LIKE exactly |
+| `msg:peer msg:status` | the default operator is **OR**, not AND |
+
+lake-search emits only the forms that work: negatives are bare and trailing,
+never `AND NOT`; operators are always explicit; and `a OR -b` is rejected at
+compile time rather than quietly compiled into `a`. An all-negative search is
+folded through De Morgan into one positive `query()` under a SQL `NOT`.
+
+Structured predicates, `LIKE` and ranges are *not* search functions, so they
+compose freely with the single `query()` call. Fuzziness is the exception: it
+exists only as an option argument to `match()`, so a fuzzy term spends the
+statement's one search function and cannot be combined with another full-text
+term — which lake-search reports as a compile error rather than emitting SQL
+that dies with [1065].
+
 ## Install
 
 ```bash
