@@ -1,0 +1,134 @@
+{
+  "table": "logs.k8s_logs",
+  "note": "Row-count assertions, not smoke tests. On Databend a mistranslated query returns zero rows and raises no error, so 'the SQL executed' proves nothing. Every case here states a relationship between two counts. Baselines are relative, so the suite stays valid as the table grows.",
+  "cases": [
+    {
+      "name": "empty search returns everything",
+      "query": "",
+      "compare": "nonzero",
+      "note": "The whole reason this project exists. match(msg,'') returns 0 rows silently, and the optimiser pushes match() into the index scan regardless of the surrounding boolean, so an empty box must compile to SQL containing no match() at all."
+    },
+    {
+      "name": "bare token matches",
+      "query": "snapshot",
+      "compare": "nonzero"
+    },
+    {
+      "name": "AND narrows",
+      "query": "snapshot peer",
+      "baseline": "snapshot",
+      "compare": "le",
+      "note": "Adjacency means AND, so adding a term can only shrink the result set. If this ever exceeds the baseline, the default operator has silently become OR."
+    },
+    {
+      "name": "OR widens",
+      "query": "snapshot OR peer",
+      "baseline": "snapshot",
+      "compare": "ge"
+    },
+    {
+      "name": "phrase is order-sensitive",
+      "query": "\"peer status\"",
+      "compare": "nonzero",
+      "note": "Positions are stored: 72,601 rows for this phrase against 0 for the reversed one when measured."
+    },
+    {
+      "name": "reversed phrase finds nothing",
+      "query": "\"status peer\"",
+      "compare": "zero",
+      "note": "Negative control for the case above. If this is ever nonzero, phrase search has degenerated to an unordered token AND."
+    },
+    {
+      "name": "fuzzy typo matches the baseline",
+      "query": "snapshoot~1",
+      "baseline": "snapshot",
+      "compare": "eq",
+      "note": "The headline fix. Typed as Lucene `snapshoot~1` this returns 0 through query(); compiled to match(msg,'snapshoot','fuzziness=1') it returns the full baseline."
+    },
+    {
+      "name": "fuzziness is bounded",
+      "query": "snpshoot~1",
+      "compare": "zero",
+      "note": "Two edits from the stem, rejected at fuzziness=1. Guards against fuzzy matching degenerating into match-anything. NOTE: edit distance is measured against the STEM, not the typed word."
+    },
+    {
+      "name": "two edits accepted at fuzziness 2",
+      "query": "snpshoot~2",
+      "baseline": "snapshot",
+      "compare": "eq"
+    },
+    {
+      "name": "prefix wildcard works via LIKE",
+      "query": "snapsh*",
+      "compare": "nonzero",
+      "note": "Through query() the star is silently ignored and `snapsh*` returns 0 while `snapshot*` returns the full baseline, which looks like success. Compiled to LIKE 'snapsh%' it returns real rows."
+    },
+    {
+      "name": "prefix is narrower than substring",
+      "query": "snapsh*",
+      "baseline": "*napsho*",
+      "compare": "le"
+    },
+    {
+      "name": "negation excludes",
+      "query": "snapshot -TiFlash",
+      "baseline": "snapshot",
+      "compare": "le",
+      "note": "MUST-VERIFY. Negating a match() relies on the optimiser handling an inverted-index scan under NOT. §5.1 showed match() pushdown does not always respect the surrounding boolean, so this is the case most likely to expose an engine bug rather than a compiler bug."
+    },
+    {
+      "name": "negation of an absent term changes nothing",
+      "query": "snapshot -zzzznotpresentzzzz",
+      "baseline": "snapshot",
+      "compare": "eq",
+      "note": "Sharper than the case above: excluding a term that matches nothing must leave the count untouched. If this comes back 0, NOT is swallowing the whole predicate."
+    },
+    {
+      "name": "structured filter narrows",
+      "query": "component:tikv",
+      "compare": "nonzero"
+    },
+    {
+      "name": "structured filter is case-insensitive",
+      "query": "component:TIKV",
+      "baseline": "component:tikv",
+      "compare": "eq",
+      "note": "Databend has no ILIKE, so case-insensitivity is compiled explicitly with lower() on both sides."
+    },
+    {
+      "name": "full-text and structured compose",
+      "query": "snapshot component:tikv",
+      "baseline": "snapshot",
+      "compare": "le"
+    },
+    {
+      "name": "grouping changes meaning",
+      "query": "(snapshot OR peer) component:tikv",
+      "baseline": "snapshot OR peer",
+      "compare": "le"
+    },
+    {
+      "name": "existence check",
+      "query": "pod:*",
+      "compare": "nonzero"
+    },
+    {
+      "name": "hyphen is not negation",
+      "query": "component:tikv pod:*",
+      "compare": "nonzero",
+      "note": "Pod names carry hyphens; if `-` were treated as an operator inside a word the predicate would silently invert."
+    },
+    {
+      "name": "quote in a term does not break the literal",
+      "query": "it's",
+      "compare": "zero",
+      "note": "Injection safety. A count of zero is the expected outcome; what matters is that the statement parses and does not error."
+    },
+    {
+      "name": "literal percent is not a wildcard",
+      "query": "100%*",
+      "compare": "zero",
+      "note": "Verifies the two layers of escaping: LIKE's backslash-percent keeps the percent literal, and the SQL literal doubles the backslash. If Databend does NOT honour backslash escapes inside string literals this case will misbehave — that is exactly what it is here to detect."
+    }
+  ]
+}
