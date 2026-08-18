@@ -1,0 +1,334 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: logging
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: vector
+  namespace: logging
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: vector
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "namespaces", "nodes"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: vector
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: vector
+subjects:
+  - kind: ServiceAccount
+    name: vector
+    namespace: logging
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vector-config
+  namespace: logging
+data:
+  vector.yaml: |
+    data_dir: /vector-data-dir
+
+    api:
+      enabled: true
+      address: 0.0.0.0:8686
+
+    sources:
+      k8s:
+        type: kubernetes_logs
+        # only the TiDB cluster's own components; everything else is noise for now
+        extra_field_selector: ""
+        glob_minimum_cooldown_ms: 5000
+
+    transforms:
+      shape:
+        type: remap
+        inputs: [k8s]
+        drop_on_error: false
+        source: |
+          pod  = string!(.kubernetes.pod_name  || "unknown")
+          ns   = string!(.kubernetes.pod_namespace || "unknown")
+          node = string!(.kubernetes.pod_node_name || "unknown")
+          cont = string!(.kubernetes.container_name || "unknown")
+          raw  = string!(.message || "")
+
+          # component comes from Kubernetes labels, not from the pod name. A prefix match
+          # on "tidb-" also matches tidb-operator and tidb-controller-manager, which put
+          # 20,656 operator rows/hour into the tidb bucket (68.9% of it) and made
+          # component=tidb mean "TiDB or something that manages TiDB".
+          #
+          # Precedence runs generic -> specific, last assignment winning: container name,
+          # then app, k8s-app, app.kubernetes.io/name, and finally
+          # app.kubernetes.io/component, which is the role within a chart (tikv, pd) and
+          # the most useful facet when it exists. Where the role is generic on its own
+          # ("controller", "csi-driver"), kv.service carries the chart name to
+          # disambiguate it.
+          labels = object(.kubernetes.pod_labels) ?? {}
+          l_app  = get(labels, ["app"]) ?? ""
+          l_k8s  = get(labels, ["k8s-app"]) ?? ""
+          l_name = get(labels, ["app.kubernetes.io/name"]) ?? ""
+          l_comp = get(labels, ["app.kubernetes.io/component"]) ?? ""
+          l_inst = get(labels, ["app.kubernetes.io/instance"]) ?? ""
+
+          comp = cont
+          if is_string(l_app)  && l_app  != "" { comp = downcase(string!(l_app))  }
+          if is_string(l_k8s)  && l_k8s  != "" { comp = downcase(string!(l_k8s))  }
+          if is_string(l_name) && l_name != "" { comp = downcase(string!(l_name)) }
+          if is_string(l_comp) && l_comp != "" { comp = downcase(string!(l_comp)) }
+
+          service = ""
+          if is_string(l_inst) && l_inst != "" { service = downcase(string!(l_inst)) }
+          if is_string(l_name) && l_name != "" { service = downcase(string!(l_name)) }
+
+          # The container runtime stamps every line, so it is the timestamp of record for
+          # formats that carry no year (klog) or no timestamp at all. now() would be the
+          # time Vector read the file, which drifts on backlog.
+          ets = now()
+          if is_timestamp(.timestamp) {
+            ets = timestamp!(.timestamp)
+          } else if is_string(.timestamp) {
+            rts, rerr = parse_timestamp(string!(.timestamp), "%+")
+            if rerr == null { ets = rts }
+          }
+
+          lvl    = "UNKNOWN"
+          src    = ""
+          msg    = raw
+          fmt    = "raw"
+          fields = { "container": cont }
+          if service != "" { fields = set!(fields, ["service"], service) }
+
+          bracket_rx = r'\[(?P<k>"(?:[^"\\]|\\.)*"|[^=\]\s]+)=(?P<v>"(?:[^"\\]|\\.)*"|[^\]]*)\]'
+
+          # ---- 1. TiDB/TiKV/PD unified format ----------------------------------------
+          #   [2026/08/17 18:07:01.790 +00:00] [INFO] [file.rs:123] ["message"] [k=v] ...
+          p1, e1 = parse_regex(raw, r'^\[(?P<lts>[^\]]+)\] \[(?P<lvl>[A-Za-z]+)\] \[(?P<src>[^\]]+)\] \[(?P<lmsg>"(?:[^"\\]|\\.)*"|[^\]]*)\](?P<rest>.*)$')
+
+          # ---- 2. klog (Kubernetes components, CSI drivers) --------------------------
+          #   I0818 22:47:56.829767  1 proxier.go:1494] "msg" key=value key="value"
+          p2, e2 = parse_regex(raw, r'^(?P<sev>[IWEF])[0-9]{4} [0-9:.]+ +[0-9]+ (?P<src>[^ \]]+)\] ?(?P<rest>.*)$')
+
+          # ---- 3. ISO-8601 + level (Go zap, Rust tracing) ----------------------------
+          #   2026-08-18T23:23:02.394Z\tERROR\tReconciler error\t{json}
+          #   2026-08-18T23:29:49.785247Z  INFO span{..}: target: message
+          p3, e3 = parse_regex(raw, r'^(?P<lts>[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+Z?)[\t ]+(?P<lvl>[A-Z]{4,5})[\t ]+(?P<rest>.*)$')
+
+          if e1 == null {
+            fmt = "tidb"
+            lvl = upcase(string!(p1.lvl))
+            src = string!(p1.src)
+            msg = string!(p1.lmsg)
+            pts, perr = parse_timestamp(string!(p1.lts), "%Y/%m/%d %H:%M:%S%.3f %z")
+            if perr == null { ets = pts }
+
+            rest = string!(p1.rest)
+            pairs = parse_regex_all(rest, bracket_rx) ?? []
+            for_each(pairs) -> |_i, p| {
+              k = string!(p.k)
+              v = string!(p.v)
+              if starts_with(k, "\"") && ends_with(k, "\"") && strlen(k) >= 2 {
+                k = replace(slice!(k, 1, strlen(k) - 1), "\\\"", "\"")
+              }
+              if starts_with(v, "\"") && ends_with(v, "\"") && strlen(v) >= 2 {
+                v = replace(slice!(v, 1, strlen(v) - 1), "\\\"", "\"")
+              }
+              fields = set!(fields, [k], v)
+            }
+            leftover = strip_whitespace(replace(rest, bracket_rx, ""))
+            if leftover != "" { fields = set!(fields, ["rest_unparsed"], leftover) }
+          } else if e2 == null {
+            # klog carries no year, so ets stays on the runtime timestamp.
+            fmt = "klog"
+            sev = string!(p2.sev)
+            if sev == "I" { lvl = "INFO"  }
+            if sev == "W" { lvl = "WARN"  }
+            if sev == "E" { lvl = "ERROR" }
+            if sev == "F" { lvl = "FATAL" }
+            src = string!(p2.src)
+            msg = string!(p2.rest)
+
+            # klog v2 emits `"the message" key=value key="value"`.
+            q, qerr = parse_regex(msg, r'^"(?P<m>(?:[^"\\]|\\.)*)" ?(?P<kvs>.*)$')
+            if qerr == null {
+              msg = replace(string!(q.m), "\\\"", "\"")
+              kvs = strip_whitespace(string!(q.kvs))
+              if kvs != "" {
+                parsed_kvs, kverr = parse_key_value(kvs)
+                if kverr == null {
+                  fields = merge(fields, parsed_kvs)
+                } else {
+                  fields = set!(fields, ["rest_unparsed"], kvs)
+                }
+              }
+            }
+          } else if e3 == null {
+            lvl = upcase(string!(p3.lvl))
+            msg = string!(p3.rest)
+            pts, perr = parse_timestamp(string!(p3.lts), "%+")
+            if perr == null { ets = pts }
+
+            if contains(msg, "\t") {
+              # zap: message and a trailing JSON object, tab separated.
+              fmt = "zap"
+              parts = split(msg, "\t")
+              msg = strip_whitespace(string!(parts[0]))
+              tail = strip_whitespace(string!(parts[-1]))
+              if starts_with(tail, "{") {
+                j, jerr = parse_json(tail)
+                if jerr == null {
+                  fields = merge(fields, object!(j))
+                } else {
+                  fields = set!(fields, ["rest_unparsed"], tail)
+                }
+              } else if strlen(join!(parts, " ")) > strlen(msg) {
+                fields = set!(fields, ["rest_unparsed"], strip_whitespace(join!(slice!(parts, 1), " ")))
+              }
+            } else {
+              fmt = "tracing"
+            }
+          } else if starts_with(strip_whitespace(raw), "{") {
+            j, jerr = parse_json(strip_whitespace(raw))
+            if jerr == null {
+              fmt = "json"
+              o = object!(j)
+              for_each(o) -> |k, v| {
+                lk = downcase(k)
+                if lk == "level" || lk == "severity" || lk == "levelname" {
+                  lvl = upcase(string(v) ?? "UNKNOWN")
+                } else if lk == "msg" || lk == "message" {
+                  msg = string(v) ?? ""
+                } else if lk == "ts" || lk == "time" || lk == "timestamp" {
+                  jts, jtserr = parse_timestamp(string(v) ?? "", "%+")
+                  if jtserr == null { ets = jts }
+                } else if lk == "caller" || lk == "logger" || lk == "source" {
+                  src = string(v) ?? ""
+                } else {
+                  fields = set!(fields, [k], v)
+                }
+              }
+            }
+          }
+
+          msg = replace(msg, r'^"', "")
+          msg = replace(msg, r'"$', "")
+          msg = strip_whitespace(msg)
+          fields = set!(fields, ["format"], fmt)
+
+          . = {
+            "ts":          format_timestamp!(ets, "%Y-%m-%d %H:%M:%S%.6f"),
+            "component":   comp,
+            "level":       lvl,
+            "namespace":   ns,
+            "pod":         pod,
+            "node":        node,
+            "source_file": src,
+            "msg":         msg,
+            "kv":          fields
+          }
+      # tidb-operator prints multi-line ASCII status tables, one log event per
+      # border or row: `+------------+` and `| id | name | status |`. During a
+      # reconcile storm that was 16,595 events/hour, 21% of all volume, and it
+      # is unparseable by construction — there is no message in a `+---+` line.
+      # Dropped here rather than at query time so it never reaches storage or
+      # the row counts.
+      #
+      # Only events no parser claimed are eligible, so a genuine message that
+      # happens to begin with `|` inside a structured log line survives. Vector
+      # counts what this discards as component_discarded_events_total, so the
+      # volume stays observable instead of just disappearing.
+      drop_table_art:
+        type: filter
+        inputs: [shape]
+        condition:
+          type: vrl
+          source: |
+            fmt = string(.kv.format) ?? ""
+            body = string(.msg) ?? ""
+            !(fmt == "raw" && match(body, r'^[|+]'))
+
+    sinks:
+      lake:
+        type: databend
+        inputs: [drop_table_art]
+        endpoint: "${DATABEND_DSN}"
+        database: logs
+        table: k8s_logs
+        batch:
+          # 1s default would create ~86k tiny blocks/day and the lake never compacts itself
+          timeout_secs: 60
+          max_events: 10000
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: vector
+  namespace: logging
+  labels:
+    app: vector
+spec:
+  selector:
+    matchLabels:
+      app: vector
+  template:
+    metadata:
+      labels:
+        app: vector
+    spec:
+      serviceAccountName: vector
+      # must run on every node, including tainted TiKV/PD nodes
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: vector
+          image: timberio/vector:0.39.0-alpine
+          args: ["--config", "/etc/vector/vector.yaml"]
+          env:
+            - name: VECTOR_SELF_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: DATABEND_DSN
+              valueFrom:
+                secretKeyRef:
+                  name: vector-lake
+                  key: dsn
+          resources:
+            requests: { cpu: 50m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - name: config
+              mountPath: /etc/vector
+              readOnly: true
+            - name: data
+              mountPath: /vector-data-dir
+            - name: varlog
+              mountPath: /var/log
+              readOnly: true
+            - name: varlibdockercontainers
+              mountPath: /var/lib/docker/containers
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: vector-config
+        - name: data
+          hostPath:
+            path: /var/lib/vector
+            type: DirectoryOrCreate
+        - name: varlog
+          hostPath:
+            path: /var/log
+        - name: varlibdockercontainers
+          hostPath:
+            path: /var/lib/docker/containers
