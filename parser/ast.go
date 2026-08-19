@@ -1,10 +1,11 @@
 // Package parser turns Lucene-style search text into a small, engine-neutral
 // syntax tree.
 //
-// The split is deliberate and mirrors how HyperDX is built: a generic grammar
-// front end (there, a fork of bripkens/lucene) feeding an engine-specific SQL
-// emitter (there, a 2,200-line ClickHouse renderer). The grammar is commodity;
-// the emitter is where every dialect trap lives. Keeping them apart means the
+// The split is deliberate, and it is how every mature implementation of this
+// pattern ends up structured: a generic grammar front end feeding an
+// engine-specific SQL emitter. The grammar is commodity — Lucene's shape has
+// been stable for two decades — while the emitter is where every dialect trap
+// lives, and it is invariably the larger half. Keeping them apart means the
 // Databend emitter in ../databend can be reviewed, tested and corrected on its
 // own, and a second emitter can be added without touching this package.
 //
@@ -17,10 +18,10 @@ type Node interface{ node() }
 // And requires every child to match. It is also the *implicit* operator between
 // adjacent terms: `foo bar` parses as And{foo, bar}.
 //
-// Lucene's own default is OR, but every log-search UI that matters — Kibana's
-// KQL, ClickStack/HyperDX — defaults to AND, because with OR a second search
-// term makes the result set larger, which is never what someone narrowing down
-// an incident wants. We follow the log-search convention, not Lucene's.
+// Lucene's own default is OR, but log-search interfaces conventionally default
+// to AND — Kibana's KQL among them — because with OR a second search term makes
+// the result set *larger*, which is never what someone narrowing down an
+// incident wants. We follow the log-search convention, not Lucene's.
 type And struct{ Children []Node }
 
 // Or matches if any child matches.

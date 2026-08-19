@@ -24,12 +24,12 @@ hidden predicate-building variables: v3 of this dashboard carried `pred`,
 
 — and pinned a stale predicate into any link someone pasted into a ticket.
 
-Three panels exist to close HyperDX gaps rather than to look busy:
+Three panels exist to answer questions the search box cannot, rather than to look busy:
 
 | Panel | Why |
 | --- | --- |
-| **Event deltas** | Each fingerprint's count in this window against the preceding window of equal length. `events_before = 0` means new behaviour. The one HyperDX analysis feature with no Grafana equivalent. |
-| **Top pods / Top nodes** | Field facets, the equivalent of HyperDX's sidebar counts. |
+| **Event deltas** | Each fingerprint's count in this window against the preceding window of equal length. `events_before = 0` means new behaviour — the one thing no built-in Grafana panel type will tell you. |
+| **Top pods / Top nodes** | Field facets — the per-value counts a dedicated log UI puts in a sidebar. |
 | **Distinct patterns** stat | A jump means genuinely new log shapes, not merely more volume. |
 
 Still not possible through SQL, and honestly out of reach here: **live tail**

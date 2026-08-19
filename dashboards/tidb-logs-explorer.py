@@ -8,9 +8,11 @@ Two things change from v3:
      datasource backend. That removes the leaked predicates from shareable URLs
      and makes Lucene syntax work instead of failing silently.
 
-  2. Three panels are added to close the largest remaining HyperDX gaps that
-     are actually achievable on this engine: event deltas, and two facet
-     tables. Live tail and highlighting remain impossible via SQL.
+  2. Three panels are added for the discovery questions the search box cannot
+     answer and this engine can: event deltas, and two facet tables. Live tail
+     and match highlighting remain out of reach through SQL — the plugin
+     declares no streaming, and Grafana highlights only when a datasource
+     returns `searchWords`.
 """
 import json
 
@@ -46,8 +48,9 @@ FINGERPRINT = "regexp_replace(regexp_replace(msg,'[0-9a-f]{8,}','?'),'[0-9]+','?
 
 # Grafana ellipsises a table cell by default, so a 900-char operator line reads
 # as truncated even though the whole value is in the response. This is the
-# equivalent of HyperDX's Wrap Lines toggle (MAX_CELL_LENGTH 500 -> 50_000),
-# except it is per-column and always on for the columns that hold log text.
+# usually solved with a wrap-lines toggle; per-column and always-on is the
+# closer fit here, because Grafana persists such a toggle per dashboard rather
+# than per user, so one reader's preference becomes everyone's.
 def wrap(field):
     return {"matcher": {"id": "byName", "options": field},
             "properties": [{"id": "custom.cellOptions",
@@ -186,8 +189,7 @@ panels.append(panel(30, "table", "Event deltas — this window vs the one before
                     desc="What changed. Each pattern's count in this window against the "
                          "immediately preceding window of equal length. A pattern with "
                          "events_before = 0 is new; a large positive delta is a spike. This is "
-                         "the one HyperDX analysis feature with no Grafana equivalent, so it is "
-                         "built here in SQL.",
+                         "No built-in panel type computes this, so it is built here in SQL.",
                     fieldConfig={"defaults": {}, "overrides": [
                         wrap("pattern"),
                         {"matcher": {"id": "byName", "options": "delta"},
@@ -200,7 +202,7 @@ panels.append(panel(31, "table", "Top pods", 12, 31, 6, 11,
                     "SELECT pod, count(*) AS events\n"
                     f"FROM {TABLE}\nWHERE {WHERE}\n"
                     "GROUP BY pod ORDER BY events DESC LIMIT 20",
-                    desc="Field facet, the equivalent of HyperDX's sidebar counts."))
+                    desc="Field facet — the per-value counts a dedicated log UI puts in a sidebar."))
 
 panels.append(panel(32, "table", "Top nodes", 18, 31, 6, 11,
                     "SELECT node, count(*) AS events\n"
@@ -217,7 +219,7 @@ panels.append(panel(4, "table", "Best matches — BM25 relevance", 0, 42, 24, 10
                     "  AND $__search_score(msg, ${search:sqlstring})\n"
                     "ORDER BY relevance DESC\nLIMIT 50",
                     fieldConfig={"defaults": {}, "overrides": [wrap("msg")]},
-                    desc="Ranked by BM25 — something ClickHouse's own docs say it does not do. "
+                    desc="Ranked by BM25, straight from the inverted index. "
                          "Empty search returns no rows by design: score() requires a search "
                          "function anywhere in the statement, so the macro emits one that "
                          "matches nothing rather than letting the panel error."))
