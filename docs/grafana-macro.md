@@ -36,7 +36,8 @@ This removes three things at once:
 - the separate `1=0` variable for the relevance panel, replaced by
   `$__search_score()`;
 - every silent-failure trap, because `~N` and `*` are rewritten rather than
-  passed through to `query()`.
+  passed through to `query()`, and an exclusion is an anti-join rather than a
+  bare `NOT` around a search function.
 
 ## The patch
 
@@ -112,7 +113,12 @@ func unquote(s string) string {
 //
 // The datasource already stores a logs schema (logsTable, logsTimeColumn,
 // logsLevelColumn, logsMessageColumn) — a fuller integration reads the field
-// map from there instead of hardcoding it.
+// map from there instead of hardcoding it, and reads Table from logsTable.
+//
+// Table matters for one construct: excluding a full-text term with no positive
+// term beside it compiles to an anti-join, which has to name the table.
+// Leaving it wrong points that subquery at the wrong table; leaving it empty
+// makes that one shape a compile error instead.
 func schemaFor(col string) databend.Schema {
 	s := databend.K8sLogs()
 	if col != "" && col != s.Default {
@@ -182,19 +188,55 @@ unified-search/bleve`.
 
 ## Verified live
 
-Through `POST /api/ds/query` against a deployed Grafana 13.2.0, on a 345k-row
-table:
+Through `POST /api/ds/query` against a deployed Grafana 13.2.0. The table is
+live and grows by roughly a thousand rows a minute, so the right-hand column is
+a dated snapshot rather than an invariant — what the table asserts is the shape
+of the left-hand column. Re-measured 2026-08-19 against 508,072 rows:
 
 | Query | Before | After |
 | --- | --- | --- |
-| `$__search(msg, '')` | 0 rows | **345,852** |
-| `$__search(msg, 'snapshoot~1')` | 0 rows | **17,376** |
+| `$__search(msg, '')` | 0 rows | **508,072** |
+| `$__search(msg, 'snapshoot~1')` | 0 rows | **17,608** |
 | `$__search(msg, 'snapsh*')` | 0 rows | **1,019** |
-| `$__search(msg, 'component:tidb "peer status" -zzznone')` | n/a | **72,601** |
-| `$__search(msg, 'region, peer')` | truncated at the comma | **654** |
+| `$__search(msg, 'component:tidb "peer status" -zzznone')` | n/a | **90,091** |
+| `$__search(msg, 'region, peer')` | truncated at the comma | **1,248** |
 | `$__search_score(msg, '')` | `[1065]` | **0 rows, no error** |
-| `$__search_score(msg, 'unreachable')` | n/a | ranked, top score **7.31** |
-| `$__search(msg, 'peer OR -status')` | silently meant `peer` | **rejected with an explanation** |
+| `$__search_score(msg, 'unreachable')` | n/a | ranked, top score **10.16** |
+| `$__search(msg, 'peer OR -status')` | silently meant `peer` | **folded through De Morgan** |
+
+### Since that build
+
+The rows above were measured through the deployed plugin, whose backend still carries the
+earlier build of this library. The shapes below were added after it and are measured the same
+way the conformance suite measures — `lake-search compile` piped into the warehouse — against
+543,806 rows on 2026-08-19. "Before" is the previous build's own output, compiled and counted
+identically, not a recollection.
+
+| Query | Before | After |
+| --- | --- | --- |
+| `level:(error OR warn) "peer status"` | `1=1`, **543,806** — the field *and* the group were dropped, and parsing stopped there, so the phrase went too | **90,091** |
+| `peer OR -status` | rejected at compile time | **531,371** |
+| `-pdctl` | `NOT (query('msg:pdctl'))`, **0** — an empty screen, because nothing in the window says `pdctl` | **the whole window** |
+| `kv.container:vector` | `kv['kv.container']`, **0** | **7,853** |
+| `http://0.0.0.0:8686/playground` | `kv['http']`, **0** | **50**, equal to the matching `LIKE` |
+| `store_id:[1000000 TO 2000000]` | `kv['store_id'] = '[1000000' AND query('(msg:TO) AND (msg:"2000000]")')` — silently wrong | **1,101** |
+| `ts:[2026-08-18 TO 2026-08-19]` | rejected, and the remediation it suggested did not itself compile | **152,317** |
+| `ts:>2026-08-18T22:30:00Z` | **222,922** — the bound truncated to 22:00 with no diagnostic | **164,594** |
+| `"peer status"~3` | `query('(msg:"peer status") AND (msg:"~3")')`, **0** — a search for the literal token `~3` | **88,441** |
+| `"peer status"~3^2` | **0** — the two markers arrive as one word and neither was read | **88,441**, equal to the unboosted form |
+
+The `-pdctl` row is a defect in its own right, not a new feature: it was shipped, and it fires
+whenever someone excludes a noise pattern that has stopped being emitted in the selected time
+range — which the data-plane scale-down makes routine. `NOT (query(x))` is not the complement of
+`query(x)`, because the search function is pushed into the index scan whatever the boolean around
+it, so an `x` matching nothing prunes the whole scan. A leading negation now compiles to an
+anti-join, which keeps tokenised semantics and needs `Schema.Table` — so `schemaFor` in the patch
+above should set it from the datasource's configured logs table rather than leaving the default.
+
+The first row is the one to read twice. A field in front of a group was dropped along with the
+group, and because the parser stopped at that point the rest of the query went with it — so a
+dashboard filtering `level:(error OR warn) "peer status"` showed every row in the table and no
+error anywhere.
 
 ## Verifying it
 

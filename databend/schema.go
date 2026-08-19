@@ -46,6 +46,17 @@ type Schema struct {
 	// Default is the field name a bare term searches, e.g. "msg".
 	Default string
 
+	// Table is the qualified table the predicate will run against.
+	//
+	// It is needed for exactly one construct: excluding a full-text term with
+	// no positive term beside it. A bare SQL NOT around a search function is
+	// not the complement of that search — the engine prunes the scan when the
+	// search matches nothing, so `-absent_token` returns zero rows instead of
+	// every row. The correct form is an anti-join, and an anti-join has to
+	// name the table. Leave it empty and that one shape becomes a compile
+	// error rather than a wrong answer.
+	Table string
+
 	// Fields is keyed by the lowercased name the user types.
 	Fields map[string]Field
 
@@ -59,7 +70,13 @@ type Schema struct {
 
 	// CaseInsensitive compares plain string columns with lower() on both
 	// sides. Defaults on, because `level:error` must match a stored "ERROR"
-	// the way it would in Kibana — and Databend has no ILIKE.
+	// the way it would in Kibana.
+	//
+	// Databend does have ILIKE — measured, `pod ILIKE '%tikv%'` and
+	// `lower(pod) LIKE lower('%tikv%')` return the same 189,623 rows — but
+	// there is no case-insensitive `=`, so equality needs lower() on both
+	// sides regardless. LIKE is spelled the same way for symmetry, and so
+	// that one flag governs both.
 	CaseInsensitive bool
 }
 
@@ -83,19 +100,64 @@ func (s Schema) Lookup(name string) (Field, bool) {
 
 // variantPath renders a VARIANT key access, cast to VARCHAR so it compares
 // against string literals rather than JSON values.
+//
+// A dotted name is a path, not a key. Two rules make it read the way it is
+// written: a leading `<variant>.` is the column itself and is consumed, so
+// `kv.container` looks up `container` rather than a flat key literally named
+// `kv.container`; and the remaining segments chain as subscripts, since
+// `kv['a']['b']` is legal here and returns NULL rather than erroring when the
+// path is absent.
 func variantPath(col, key string) string {
-	return col + "['" + escapeString(key) + "']::VARCHAR"
+	segments := strings.Split(key, ".")
+	if len(segments) > 1 && strings.EqualFold(segments[0], col) {
+		segments = segments[1:]
+	}
+	if len(segments) == 1 {
+		return col + "['" + escapeString(segments[0]) + "']::VARCHAR"
+	}
+
+	// Both readings are legitimate once dots are in play: `a.b` may be a path
+	// to a nested value, or it may be a flat key that happens to contain a dot
+	// — bag keys come from log lines and nothing forbids one. Chaining alone
+	// would make the flat key unreachable, so the flat form is tried first and
+	// the path is the fallback. A missing subscript is NULL rather than an
+	// error here, which is what makes the COALESCE work.
+	var chain strings.Builder
+	chain.WriteString(col)
+	for _, seg := range segments {
+		chain.WriteString("['")
+		chain.WriteString(escapeString(seg))
+		chain.WriteString("']")
+	}
+	return "COALESCE(" + col + "['" + escapeString(strings.Join(segments, ".")) + "'], " +
+		chain.String() + ")::VARCHAR"
 }
 
 // K8sLogs is the schema for the logs.k8s_logs table built in
-// LOG_PIPELINE_FINDINGS.md: nine columns fed by a Vector DaemonSet, with an
-// INVERTED index on msg and arbitrary parsed [k=v] pairs in kv.
+// LOG_PIPELINE_FINDINGS.md: nine columns fed by a Vector DaemonSet, with
+// arbitrary parsed [k=v] pairs in kv and two indexes on msg — an INVERTED one
+// carrying the english tokenizer, stopword filter and stemmer, and an NGRAM
+// one that makes LIKE prefix and substring searches index-backed:
+//
+//	CREATE TABLE logs.k8s_logs (
+//	  ts TIMESTAMP NULL, component VARCHAR NULL, level VARCHAR NULL,
+//	  namespace VARCHAR NULL, pod VARCHAR NULL, node VARCHAR NULL,
+//	  source_file VARCHAR NULL, msg VARCHAR NULL, kv VARIANT NULL,
+//	  SYNC INVERTED INDEX idx_msg (msg)
+//	    filters = 'english_stop,english_stemmer', tokenizer = 'english',
+//	  SYNC NGRAM INDEX idx_msg_ng (msg)
+//	) ENGINE=FUSE CLUSTER BY (to_date(ts), component)
+//
+// Declaring the NGRAM index here is what suppresses the full-scan warning on
+// wildcard searches. Point this at a table built without it and the warning is
+// correct, so drop the Ngram flag rather than the index.
 func K8sLogs() Schema {
 	return Schema{
 		Default: "msg",
+		Table:   "logs.k8s_logs",
 		Fields: map[string]Field{
-			"msg":         {Column: "msg", Kind: Text},
-			"message":     {Column: "msg", Kind: Text}, // ES/OTel habit
+			"msg":         {Column: "msg", Kind: Text, Ngram: true},
+			"message":     {Column: "msg", Kind: Text, Ngram: true}, // ES/OTel habit
 			"ts":          {Column: "ts", Kind: Timestamp},
 			"timestamp":   {Column: "ts", Kind: Timestamp},
 			"component":   {Column: "component", Kind: String},

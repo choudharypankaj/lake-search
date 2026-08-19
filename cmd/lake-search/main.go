@@ -114,7 +114,12 @@ func cmdSQL(args []string) int {
 	limit := fs.Int("limit", 100, "row limit")
 	fs.Parse(args)
 
-	r, err := databend.CompileString(strings.Join(fs.Args(), " "), databend.K8sLogs())
+	// The schema carries the table too: excluding a full-text term compiles to
+	// an anti-join, which has to name the same table the SELECT reads.
+	schema := databend.K8sLogs()
+	schema.Table = *table
+
+	r, err := databend.CompileString(strings.Join(fs.Args(), " "), schema)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -173,6 +178,7 @@ func cmdConform(args []string) int {
 	}
 
 	schema := databend.K8sLogs()
+	schema.Table = c.Table
 	fmt.Printf("-- lake-search conformance suite over %s\n", c.Table)
 	fmt.Printf("-- %s\n--\n", wrapComment(c.Note))
 	fmt.Println("-- Every statement below prints PASS or FAIL. Any FAIL is a real defect:")

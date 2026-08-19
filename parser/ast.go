@@ -47,6 +47,20 @@ type Term struct {
 	// fuzziness was requested.
 	Fuzz int
 
+	// Slop is N from a `~N` after a closing quote — Lucene's phrase
+	// proximity. Zero means none was requested, which includes `~0`: on a
+	// phrase that asks for exactly the ordering an unadorned phrase already
+	// has, so there is nothing to reject.
+	Slop int
+
+	// Boost is N from a trailing `^N`, kept as typed. It is a relevance
+	// weight, not a filter: it changes the order score() produces and leaves
+	// the matched set alone.
+	Boost string
+
+	// Regex records that Value is the body of a `/pattern/` term.
+	Regex bool
+
 	// Prefix and Suffix record wildcards: `foo*` sets Prefix, `*foo` sets
 	// Suffix, `*foo*` sets both. A wildcard-only value (`field:*`) sets
 	// Exists instead.
@@ -57,15 +71,27 @@ type Term struct {
 	Exists bool
 }
 
-// Range is a numeric or temporal comparison: `duration:>1000`.
+// Range is a one-sided numeric or temporal comparison: `duration:>1000`.
 type Range struct {
 	Field string
 	Op    string // ">", ">=", "<", "<="
 	Value string
 }
 
-func (*And) node()   {}
-func (*Or) node()    {}
-func (*Not) node()   {}
-func (*Term) node()  {}
-func (*Range) node() {}
+// Between is a two-sided range written in bracket form: `field:[a TO b]` for
+// inclusive bounds, `{a TO b}` for exclusive ones, mixed spellings allowed. A
+// bound of `*` is unbounded, so `[a TO *]` is a one-sided comparison and
+// `[* TO *]` is an existence check.
+type Between struct {
+	Field  string
+	Lo, Hi string // "" or "*" for an unbounded side
+	LoIncl bool
+	HiIncl bool
+}
+
+func (*And) node()     {}
+func (*Or) node()      {}
+func (*Not) node()     {}
+func (*Term) node()    {}
+func (*Range) node()   {}
+func (*Between) node() {}

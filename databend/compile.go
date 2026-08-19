@@ -10,10 +10,17 @@ import (
 
 // MatchAll and MatchNone are the predicates emitted for an empty search.
 //
-// MatchAll exists because `match(col,”)` matches nothing, raises no error, and
-// the optimiser pushes match() into the index scan regardless of the surrounding
-// boolean — so `(” = ” OR match(msg,”))` also returns zero rows. The only
-// safe handling of an empty search box is SQL containing no match() at all.
+// MatchAll exists because an *empty search argument* matches nothing, raises no
+// error, and prunes the index scan before any surrounding boolean is evaluated:
+// `match(msg,”)` is 0 rows, and so is `(1=1 OR match(msg,”))` — a literal-true
+// disjunct cannot rescue it. The only safe handling of an empty search box is
+// SQL containing no match() at all.
+//
+// The rule is about the empty argument, not about search functions under a
+// boolean. A *non-empty* one composes with ordinary SQL exactly: measured,
+// query('msg:peer') is 109,950, lower(level)=lower('warn') is 9,287, their
+// conjunction 341, and their disjunction 118,896 = 109,950 + 9,287 - 341. The
+// mixed branch of boolean() depends on that and is sound.
 const (
 	MatchAll  = "1=1"
 	MatchNone = "1=0"
@@ -148,13 +155,34 @@ type fragment struct {
 func (f fragment) isText() bool { return f.text != "" }
 
 type compiler struct {
-	schema      Schema
-	warnings    []string
+	schema   Schema
+	warnings []string
+
+	// searchFuncs counts search functions in the *outer* scan, which is what
+	// the one-per-table rule and score() both care about. A search function
+	// inside an anti-join subquery is a separate scan and is not counted:
+	// measured, `match(msg,…) AND msg NOT IN (SELECT msg … WHERE query(…))`
+	// runs and returns 17,608 rows, while `SELECT score() … ` with only the
+	// subquery's search function still fails [1065] — the binder does not see
+	// through the subquery either.
 	searchFuncs int
+
+	// textCols records every column that reached a text fragment, so a
+	// negated fragment knows which column its anti-join keys on.
+	textCols []string
 }
 
 func (c *compiler) warn(format string, args ...interface{}) {
 	c.warnings = append(c.warnings, fmt.Sprintf(format, args...))
+}
+
+func (c *compiler) noteTextCol(col string) {
+	for _, existing := range c.textCols {
+		if existing == col {
+			return
+		}
+	}
+	c.textCols = append(c.textCols, col)
 }
 
 // finalize converts the root fragment into SQL, spending a search function if
@@ -166,20 +194,78 @@ func (c *compiler) finalize(f fragment) (string, error) {
 		}
 		return f.sql, nil
 	}
-	return c.wrapText(f), nil
+	return c.wrapText(f)
 }
 
-// wrapText spends one search function, turning a query()-language expression
-// into SQL.
-func (c *compiler) wrapText(f fragment) string {
-	c.searchFuncs++
-	sql := "query('" + escapeString(f.text) + "')"
+// wrapText turns a query()-language expression into SQL, spending the
+// statement's one search function.
+//
+// # Why a negated fragment is not simply wrapped in NOT
+//
+// `NOT (query(x))` is not the complement of `query(x)`. The optimiser pushes
+// the search function into the index scan regardless of the surrounding
+// boolean — the same mechanism that makes an empty search argument return
+// nothing — so when x matches no row at all, the scan is pruned to nothing and
+// the NOT returns **zero rows instead of every row**. Measured over a
+// 152,317-row window:
+//
+//	token              query()   NOT (query())   anti-join
+//	zzzznosuchtoken          0               0     152,317
+//	qqqqwwww                 0               0     152,317
+//	pdctl                    0               0     152,317
+//	tiflash             23,381         128,936     128,936
+//
+// The three absent tokens are the defect: "everything except a term that does
+// not occur here" is the whole window, and the bare NOT answers zero. It is a
+// realistic thing to ask — excluding a noise pattern that happens not to occur
+// in the selected time range — and it fails silently. No SQL-level wrapping
+// rescues it: COALESCE, CASE, `= FALSE`, `AND TRUE` and `1=1 OR …` were all
+// measured and all return zero, because the pruning happens before any of them
+// is evaluated.
+//
+// The anti-join does rescue it, exactly, and keeps tokenised semantics rather
+// than degrading to a substring match: the search function runs in its own
+// scan, where pruning it to nothing correctly yields an empty exclusion set.
+// A negation that keeps a positive term beside it — `a -b` — never comes here
+// at all, because it stays inside one query() call where the positive drives
+// the scan.
+func (c *compiler) wrapText(f fragment) (string, error) {
 	if f.negated {
-		// Verified: NOT around a whole query() call is legal and correct
-		// (237,325 rows against a 73,201-row positive match on 309,007 total).
-		return "NOT (" + sql + ")"
+		return c.antiJoin(f)
 	}
-	return sql
+	c.searchFuncs++
+	return "query('" + escapeString(f.text) + "')", nil
+}
+
+// antiJoin renders the complement of a full-text expression.
+func (c *compiler) antiJoin(f fragment) (string, error) {
+	switch {
+	case len(c.textCols) == 0:
+		return "", fmt.Errorf("internal: negated text fragment with no text column")
+	case len(c.textCols) > 1:
+		return "", fmt.Errorf(
+			"excluding a full-text search across more than one indexed column (%s) is not "+
+				"supported: the exclusion needs an anti-join, and it can key on only one column",
+			strings.Join(c.textCols, ", "))
+	case c.schema.Table == "":
+		return "", fmt.Errorf(
+			"excluding a full-text term with no positive term beside it needs the table name, " +
+				"because `NOT (query(...))` returns 0 rows rather than every row whenever the " +
+				"excluded expression matches nothing: set Schema.Table, or write `a -b` so the " +
+				"exclusion stays inside the search function")
+	}
+
+	col := c.textCols[0]
+	c.warn("excluding %q with no positive term beside it compiles to an anti-join against %s, "+
+		"which scans the table a second time: `a -b` keeps the exclusion inside the one search "+
+		"function and costs nothing extra", col, c.schema.Table)
+
+	// COALESCE covers a NULL in the outer row — a row with no text at all
+	// contains nothing, so it survives the exclusion — and the subquery
+	// excludes NULLs of its own so a NULL can never poison the NOT IN.
+	return fmt.Sprintf(
+		"COALESCE(%s NOT IN (SELECT %s FROM %s WHERE %s IS NOT NULL AND query('%s')), TRUE)",
+		col, col, c.schema.Table, col, escapeString(f.text)), nil
 }
 
 func (c *compiler) render(n parser.Node) (fragment, error) {
@@ -194,6 +280,8 @@ func (c *compiler) render(n parser.Node) (fragment, error) {
 		return c.term(t)
 	case *parser.Range:
 		return c.rangeNode(t)
+	case *parser.Between:
+		return c.betweenNode(t)
 	default:
 		return fragment{}, fmt.Errorf("unsupported node %T", n)
 	}
@@ -209,7 +297,14 @@ func (c *compiler) not(child parser.Node) (fragment, error) {
 		f.negated = !f.negated
 		return f, nil
 	}
-	return fragment{sql: "NOT (" + f.sql + ")"}, nil
+	// COALESCE, not a bare NOT: every column in a log table is nullable, and
+	// `NOT (col = 'x')` is NULL — and therefore excluded — wherever col is
+	// NULL, so `x` and `-x` would not add up to the table. Measured on the
+	// VARIANT path, where a missing key makes it bite immediately:
+	// kv['container']='vector' is 6,742 and NOT(...) is 443,148, three short
+	// of the 449,893 total; the COALESCE form returns 443,151 and partitions
+	// exactly. Unknown means "not excluded".
+	return fragment{sql: "COALESCE(NOT (" + f.sql + "), TRUE)"}, nil
 }
 
 // boolean combines children, keeping everything in the text language when it
@@ -267,7 +362,11 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 				return fragment{}, err
 			}
 		}
-		parts[textSlot] = c.wrapText(merged)
+		wrapped, err := c.wrapText(merged)
+		if err != nil {
+			return fragment{}, err
+		}
+		parts[textSlot] = wrapped
 	}
 
 	return fragment{sql: "(" + strings.Join(parts, " "+op+" ") + ")"}, nil
@@ -311,10 +410,28 @@ func (c *compiler) textBoolean(frags []fragment, op string) (fragment, error) {
 	}
 
 	if len(negatives) > 0 && op == "OR" {
-		return fragment{}, fmt.Errorf(
-			"a negated term cannot be combined with OR in full-text search: " +
-				"Databend drops the negative clause silently, so `a OR -b` would quietly mean `a`. " +
-				"Rewrite as `(a) -b` if you meant to exclude from the whole result")
+		// `(a) OR NOT (b)` really does drop the negative clause silently, so
+		// the shape cannot be emitted as written — but it can be rewritten.
+		// De Morgan folds an OR-with-negatives into the one clause shape this
+		// engine evaluates correctly, positives ANDed and negatives bare and
+		// trailing, under a single SQL NOT:
+		//
+		//	p1 OR p2 OR NOT n1 OR NOT n2
+		//	 == NOT( n1 AND n2 AND NOT(p1 OR p2) )
+		//	 -> NOT( query('(n1) AND (n2) NOT ((p1) OR (p2))') )
+		//
+		// Still one search function. Measured: `peer OR -status` becomes
+		// NOT(query('(msg:status) NOT ((msg:peer))')) = 440,181 = 449,893 total
+		// minus the 9,712 rows matching `(status) NOT (peer)`.
+		//
+		// The result stays a text fragment rather than being spent as SQL, so
+		// it composes further. That is safe because a NOT nested inside a
+		// negative group is evaluated correctly here — verified, not assumed:
+		// query('(region) NOT ((peer) NOT ((store)))') returns 15,634, exactly
+		// 20,144 - 4,853 + 343.
+		expr := strings.Join(negatives, " AND ")
+		expr += " NOT (" + strings.Join(positives, " OR ") + ")"
+		return fragment{text: expr, negated: true}, nil
 	}
 
 	expr := strings.Join(positives, " "+op+" ")
@@ -343,6 +460,16 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 		return fragment{sql: c.exists(f)}, nil
 	}
 
+	if t.Regex {
+		return c.regexTerm(f, t, name)
+	}
+
+	if t.Boost != "" && f.Kind != Text {
+		return fragment{}, fmt.Errorf(
+			"boost ^%s needs a full-text field: %q is compared, not scored, so there is no "+
+				"relevance for a weight to move", t.Boost, name)
+	}
+
 	switch f.Kind {
 	case Text:
 		return c.textTerm(f, t)
@@ -355,7 +482,12 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 		}
 		return fragment{sql: f.Column + " = " + t.Value}, nil
 	case Timestamp:
-		return fragment{}, fmt.Errorf("field %q is a timestamp; use a range such as %s:>'2026-08-18 00:00:00'", name, name)
+		// The remediation has to be a spelling that survives the lexer: a
+		// quoted literal with a space in it does not, because the space ends
+		// the word and the quotes end up inside the SQL literal.
+		return fragment{}, fmt.Errorf(
+			"field %q is a timestamp, so it needs a comparison rather than a value: "+
+				"%s:>2026-08-18T22:30:00Z, or a two-sided %s:[2026-08-18 TO 2026-08-19]", name, name, name)
 	default:
 		return c.stringTerm(f, t)
 	}
@@ -388,6 +520,10 @@ func (c *compiler) textTerm(f Field, t *parser.Term) (fragment, error) {
 		// a fuzzy term a search function in its own right, so it cannot share
 		// a statement with any other full-text term. It does compose with
 		// structured filters and LIKE, both verified.
+		if t.Boost != "" {
+			c.warn("boost ^%s is not expressible on a fuzzy term: fuzziness reaches the engine "+
+				"through match()'s option argument, which has no weight of its own", t.Boost)
+		}
 		c.searchFuncs++
 		return fragment{sql: fmt.Sprintf("match(%s, '%s', 'fuzziness=%d')",
 			f.Column, escapeString(t.Value), t.Fuzz)}, nil
@@ -395,16 +531,87 @@ func (c *compiler) textTerm(f Field, t *parser.Term) (fragment, error) {
 	case t.Phrase:
 		// Positions are stored: "peer status" returns 72,601 where the
 		// reversed phrase returns 0.
-		return fragment{text: f.Column + ":" + quoteQueryValue(t.Value, true)}, nil
+		//
+		// Proximity is real here and N is honoured, which is worth stating
+		// because it is easy to measure wrongly — sample only the exact phrase
+		// and a large N and both land on plateaus. The full ladder, frozen:
+		//
+		//	"region peer"      654    "peer status"       88,441
+		//	"region peer"~0    654    "status peer"            0
+		//	"region peer"~1    654    "status peer"~1          0
+		//	"region peer"~2  4,593    "status peer"~2     88,441
+		//	"region peer"~3  4,593    "status peer"~5     88,441
+		//	"region peer"~10 4,853
+		//	region AND peer  4,853
+		//
+		// Strictly monotone, converging on the unordered AND, and the reversed
+		// phrase first matches at exactly ~2 — a transposition costs two,
+		// which is textbook Lucene.
+		c.noteTextCol(f.Column)
+		return fragment{text: c.boost(f.Column+":"+quoteQueryValue(t.Value, true)+slopSuffix(t), t)}, nil
 
 	default:
-		return fragment{text: f.Column + ":" + quoteQueryValue(t.Value, false)}, nil
+		c.noteTextCol(f.Column)
+		return fragment{text: c.boost(f.Column+":"+quoteQueryValue(t.Value, false), t)}, nil
 	}
+}
+
+// slopSuffix renders a phrase's proximity marker. `~0` is left off: it asks
+// for exactly the ordering an unadorned phrase already has, and the two were
+// measured to return the same rows.
+func slopSuffix(t *parser.Term) string {
+	if t.Slop <= 0 {
+		return ""
+	}
+	return "~" + strconv.Itoa(t.Slop)
+}
+
+// boost appends a relevance weight to a query()-language clause.
+//
+// It is a ranking device, not a filter: measured, `(msg:region)^5 OR (msg:peer)`
+// returns the same 125,241 rows as the unweighted disjunction, and only the
+// score() ordering moves. A search that never selects score() is therefore
+// unaffected by it, which is worth saying out loud rather than letting someone
+// conclude the boost did nothing.
+func (c *compiler) boost(clause string, t *parser.Term) string {
+	if t.Boost == "" {
+		return clause
+	}
+	c.warn("boost ^%s only reorders score(); the set of matching rows is unchanged, "+
+		"so it does nothing in a panel that does not select score()", t.Boost)
+	return "(" + clause + ")^" + t.Boost
+}
+
+// regexTerm compiles `/pattern/` to RLIKE.
+//
+// RLIKE is not a search function, so a regex composes freely with the one
+// query() call — but no index serves it, so it is a full scan and says so. Note
+// that RLIKE is case-insensitive on this engine whatever the schema's
+// CaseInsensitive setting says (measured: `msg RLIKE 'PEER.*STATUS'` and
+// `msg RLIKE 'peer.*status'` both return 88,451, while `msg LIKE '%PEER%'`
+// returns 0 against 109,878 for the lowercase pattern). A pattern that must be
+// case-sensitive has to say so itself with `(?-i)`, which works.
+func (c *compiler) regexTerm(f Field, t *parser.Term, name string) (fragment, error) {
+	switch f.Kind {
+	case Number, Timestamp:
+		return fragment{}, fmt.Errorf(
+			"field %q is not text; a regex term has nothing to match against", name)
+	}
+	if t.Fuzz > 0 || t.Boost != "" {
+		c.warn("fuzziness and boost are not meaningful on a regex term; ignoring them on %q", f.Column)
+	}
+	c.warn("regex on %q compiles to RLIKE, which neither the inverted nor the NGRAM index "+
+		"serves: this is a full scan", f.Column)
+	return fragment{sql: f.Column + " RLIKE '" + escapeString(t.Value) + "'"}, nil
 }
 
 func (c *compiler) stringTerm(f Field, t *parser.Term) (fragment, error) {
 	if t.Fuzz > 0 {
 		c.warn("fuzziness needs an inverted index; %q is a plain column, matching exactly instead", f.Column)
+	}
+	if t.Slop > 0 {
+		c.warn("phrase proximity needs an inverted index to have positions to measure; %q is a "+
+			"plain column, matching the phrase exactly instead", f.Column)
 	}
 	if t.Prefix || t.Suffix {
 		return fragment{sql: c.like(f, t.Value, t.Prefix, t.Suffix)}, nil
@@ -412,7 +619,10 @@ func (c *compiler) stringTerm(f Field, t *parser.Term) (fragment, error) {
 
 	lit := "'" + escapeString(t.Value) + "'"
 	if c.schema.CaseInsensitive {
-		// Databend has no ILIKE, so case-insensitivity is explicit.
+		// There is no case-insensitive `=` on this engine — ILIKE exists, but
+		// it is a LIKE, so it would turn an equality into a pattern match —
+		// which is why case-insensitivity is spelled out with lower() on both
+		// sides rather than borrowed from an operator.
 		return fragment{sql: fmt.Sprintf("lower(%s) = lower(%s)", f.Column, lit)}, nil
 	}
 	return fragment{sql: f.Column + " = " + lit}, nil
@@ -443,34 +653,135 @@ func (c *compiler) exists(f Field) string {
 }
 
 func (c *compiler) rangeNode(r *parser.Range) (fragment, error) {
-	f, known := c.schema.Lookup(r.Field)
+	f, err := c.rangeField(r.Field)
+	if err != nil {
+		return fragment{}, err
+	}
+	col, lits, err := c.bounds(f, r.Field, r.Value)
+	if err != nil {
+		return fragment{}, err
+	}
+	return fragment{sql: col + " " + r.Op + " " + lits[0]}, nil
+}
+
+// betweenNode compiles the bracket range forms.
+//
+// These are ordinary SQL comparisons, never the search mini-language: that has
+// a range form of its own, but it is inverted-index-only and single-token-only
+// — `query('msg:[a TO b]')` fails with `[1903] Unsupported query: Range query
+// boundary cannot have multiple tokens` — so routing a bracket range through it
+// would trade a working predicate for an error. As plain SQL it also costs no
+// search function and composes with one freely.
+func (c *compiler) betweenNode(b *parser.Between) (fragment, error) {
+	f, err := c.rangeField(b.Field)
+	if err != nil {
+		return fragment{}, err
+	}
+
+	// `[* TO *]` asks only that the field have a value.
+	if b.Lo == "" && b.Hi == "" {
+		return fragment{sql: c.exists(f)}, nil
+	}
+
+	var vals []string
+	if b.Lo != "" {
+		vals = append(vals, b.Lo)
+	}
+	if b.Hi != "" {
+		vals = append(vals, b.Hi)
+	}
+	col, lits, err := c.bounds(f, b.Field, vals...)
+	if err != nil {
+		return fragment{}, err
+	}
+
+	if b.Lo != "" && b.Hi != "" && b.LoIncl && b.HiIncl {
+		return fragment{sql: col + " BETWEEN " + lits[0] + " AND " + lits[1]}, nil
+	}
+
+	var parts []string
+	i := 0
+	if b.Lo != "" {
+		op := ">"
+		if b.LoIncl {
+			op = ">="
+		}
+		parts = append(parts, col+" "+op+" "+lits[i])
+		i++
+	}
+	if b.Hi != "" {
+		op := "<"
+		if b.HiIncl {
+			op = "<="
+		}
+		parts = append(parts, col+" "+op+" "+lits[i])
+	}
+	if len(parts) == 1 {
+		return fragment{sql: parts[0]}, nil
+	}
+	return fragment{sql: "(" + strings.Join(parts, " AND ") + ")"}, nil
+}
+
+// rangeField resolves the field of any comparison and rejects the one kind
+// that cannot carry one.
+func (c *compiler) rangeField(name string) (Field, error) {
+	f, known := c.schema.Lookup(name)
 	if f.Column == "" {
-		return fragment{}, fmt.Errorf("unknown field %q and no VARIANT column configured", r.Field)
+		return Field{}, fmt.Errorf("unknown field %q and no VARIANT column configured", name)
 	}
 	if !known {
 		c.warn("field %q is not a column; reading it from the %s VARIANT (no index, full scan)",
-			r.Field, c.schema.Variant)
+			name, c.schema.Variant)
+	}
+	if f.Kind == Text {
+		return Field{}, fmt.Errorf("field %q is full-text indexed; ranges are not meaningful on it", name)
+	}
+	return f, nil
+}
+
+// bounds renders the column expression and the literals of a comparison.
+//
+// Whether the bounds are numeric is decided once for the whole predicate rather
+// than per bound, so a two-sided range cannot end up comparing one side as a
+// number and the other as a string.
+func (c *compiler) bounds(f Field, name string, vals ...string) (col string, lits []string, err error) {
+	numeric := true
+	for _, v := range vals {
+		if _, e := strconv.ParseFloat(v, 64); e != nil {
+			numeric = false
+		}
 	}
 
 	switch f.Kind {
 	case Number:
-		if _, err := strconv.ParseFloat(r.Value, 64); err != nil {
-			return fragment{}, fmt.Errorf("field %q is numeric but %q is not a number", r.Field, r.Value)
+		if !numeric {
+			for _, v := range vals {
+				if _, e := strconv.ParseFloat(v, 64); e != nil {
+					return "", nil, fmt.Errorf("field %q is numeric but %q is not a number", name, v)
+				}
+			}
 		}
-		return fragment{sql: f.Column + " " + r.Op + " " + r.Value}, nil
+		return f.Column, vals, nil
 
 	case Timestamp:
-		return fragment{sql: fmt.Sprintf("%s %s '%s'", f.Column, r.Op, escapeString(r.Value))}, nil
-
-	case Text:
-		return fragment{}, fmt.Errorf("field %q is full-text indexed; ranges are not meaningful on it", r.Field)
+		return f.Column, quoteAll(vals), nil
 
 	default:
-		if _, err := strconv.ParseFloat(r.Value, 64); err == nil {
-			return fragment{sql: fmt.Sprintf("%s::DOUBLE %s %s", f.Column, r.Op, r.Value)}, nil
+		// A VARIANT value arrives as VARCHAR, so a numeric comparison needs the
+		// second cast; a string one compares as it stands.
+		if numeric {
+			return f.Column + "::DOUBLE", vals, nil
 		}
-		return fragment{sql: fmt.Sprintf("%s %s '%s'", f.Column, r.Op, escapeString(r.Value))}, nil
+		return f.Column, quoteAll(vals), nil
 	}
+}
+
+func quoteAll(vals []string) []string {
+	out := make([]string, len(vals))
+	for i, v := range vals {
+		out[i] = "'" + escapeString(v) + "'"
+	}
+	return out
 }
 
 // quoteQueryValue renders a value inside the query() mini-language.

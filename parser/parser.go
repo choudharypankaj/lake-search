@@ -109,7 +109,11 @@ func (p *parser) parsePrimary() Node {
 
 	case tokQuoted:
 		t := p.next()
-		return &Term{Value: t.val, Phrase: true}
+		return p.phrase("", t.val)
+
+	case tokRegex:
+		t := p.next()
+		return &Term{Value: t.val, Regex: true}
 
 	case tokWord:
 		w := p.next()
@@ -122,17 +126,102 @@ func (p *parser) parsePrimary() Node {
 
 	default:
 		// A stray colon, paren or operator: consume it so we always advance.
+		// Never consume EOF — a dangling `NOT` would then walk the index past
+		// the end of the token slice and panic on the next peek, which is a
+		// crash rather than the generous reading Parse promises.
+		if p.atEnd() {
+			return nil
+		}
 		p.next()
 		return nil
+	}
+}
+
+// phrase builds a quoted term, attaching a `~N` proximity marker if one
+// follows the closing quote.
+//
+// The marker has to be recognised here rather than left in the token stream:
+// as an ordinary word `~3` it becomes a second search term, and searching a
+// log table for the literal token `~3` matches nothing.
+func (p *parser) phrase(field, value string) Node {
+	t := &Term{Field: field, Value: value, Phrase: true}
+
+	// The markers arrive as one word, because nothing separates them from each
+	// other: `"a b"~3^2` lexes as the single word `~3^2`. Splitting them here
+	// is what stops `~3` becoming a search term of its own.
+	w := p.peek()
+	if w.kind != tokWord {
+		return t
+	}
+	base, tilde, hasTilde, boost := trailingMarkers(w.val)
+	if base != "" || (!hasTilde && boost == "") {
+		return t // not a bare marker run
+	}
+	p.next()
+	if hasTilde {
+		t.Slop = tilde
+	}
+	t.Boost = boost
+	return t
+}
+
+// trailingMarkers splits a trailing run of Lucene's `~N` and `^N` markers off a
+// word, returning what precedes them.
+//
+// It reads right to left so both orderings work and so a marker is only ever
+// recognised at the end: `foo^bar` keeps its caret, because `bar` is not a
+// number, and `1.5^2` yields the value 1.5 with a boost of 2.
+func trailingMarkers(raw string) (base string, tilde int, hasTilde bool, boost string) {
+	base = raw
+	for {
+		i := strings.LastIndexAny(base, "~^")
+		if i < 0 {
+			return base, tilde, hasTilde, boost
+		}
+		num := base[i+1:]
+		switch base[i] {
+		case '~':
+			if num == "" {
+				tilde, hasTilde = 1, true
+			} else if n, err := strconv.Atoi(num); err == nil && n >= 0 {
+				tilde, hasTilde = n, true
+			} else {
+				return base, tilde, hasTilde, boost
+			}
+		case '^':
+			if _, err := strconv.ParseFloat(num, 64); err != nil {
+				return base, tilde, hasTilde, boost
+			}
+			boost = num
+		}
+		base = base[:i]
 	}
 }
 
 // parseFieldValue handles everything to the right of `field:`.
 func (p *parser) parseFieldValue(field string) Node {
 	switch p.peek().kind {
+	case tokLParen:
+		// `field:(a OR b)` — the field scopes the whole group, which is how an
+		// OR over one field is written. Without this branch the field and the
+		// group are both dropped and the query compiles to match-everything.
+		p.next()
+		inner := p.parseOr()
+		p.skip(tokRParen) // tolerate a missing close paren
+		stampField(inner, field)
+		return inner
+
+	case tokRange:
+		t := p.next()
+		return buildBetween(field, t.val)
+
+	case tokRegex:
+		t := p.next()
+		return &Term{Field: field, Value: t.val, Regex: true}
+
 	case tokQuoted:
 		t := p.next()
-		return &Term{Field: field, Value: t.val, Phrase: true}
+		return p.phrase(field, t.val)
 
 	case tokWord:
 		v := p.next().val
@@ -169,17 +258,16 @@ func (p *parser) parseFieldValue(field string) Node {
 func buildTerm(field, raw string, phrase bool) Node {
 	t := &Term{Field: field, Phrase: phrase}
 
-	// Fuzziness: `term~`, `term~2`. Only a trailing marker counts, so a tilde
-	// inside a word (rare, but possible in a log line) is left alone.
-	if i := strings.LastIndexByte(raw, '~'); i > 0 && i < len(raw) {
-		suffix := raw[i+1:]
-		if suffix == "" {
-			t.Fuzz = 1
-			raw = raw[:i]
-		} else if n, err := strconv.Atoi(suffix); err == nil && n >= 0 {
-			t.Fuzz = n
-			raw = raw[:i]
+	// Fuzziness `term~N` and boost `term^N`, in either order. Only a *trailing*
+	// run counts, so a tilde or caret inside a word — both occur in log lines —
+	// is left alone, and a run that would consume the whole word is not a
+	// marker at all but the search text itself.
+	if base, tilde, hasTilde, boost := trailingMarkers(raw); base != "" {
+		raw = base
+		if hasTilde {
+			t.Fuzz = tilde
 		}
+		t.Boost = boost
 	}
 
 	if strings.HasPrefix(raw, "*") {
@@ -210,4 +298,59 @@ func splitRangeOp(v string) (op, rest string) {
 		}
 	}
 	return "", v
+}
+
+// stampField pushes the field of a `field:(...)` group down onto every leaf
+// inside it that did not name a field of its own.
+//
+// An inner field wins: in `foo:(bar:(baz) qux)` the `baz` leaf keeps `bar`, and
+// only `qux` inherits `foo` — the reading every Lucene front end gives it.
+func stampField(n Node, field string) {
+	switch t := n.(type) {
+	case *And:
+		for _, c := range t.Children {
+			stampField(c, field)
+		}
+	case *Or:
+		for _, c := range t.Children {
+			stampField(c, field)
+		}
+	case *Not:
+		stampField(t.Child, field)
+	case *Term:
+		if t.Field == "" {
+			t.Field = field
+		}
+	case *Range:
+		if t.Field == "" {
+			t.Field = field
+		}
+	case *Between:
+		if t.Field == "" {
+			t.Field = field
+		}
+	}
+}
+
+// buildBetween turns `[a TO b]`, `{a TO b}` and their mixed spellings into a
+// Between node. `*` on either side means unbounded.
+func buildBetween(field, raw string) Node {
+	bounds := splitRangeBounds(raw)
+	if bounds == nil {
+		return nil
+	}
+	b := &Between{
+		Field:  field,
+		Lo:     bounds[0],
+		Hi:     bounds[1],
+		LoIncl: strings.HasPrefix(raw, "["),
+		HiIncl: strings.HasSuffix(raw, "]"),
+	}
+	if b.Lo == "*" {
+		b.Lo = ""
+	}
+	if b.Hi == "*" {
+		b.Hi = ""
+	}
+	return b
 }
