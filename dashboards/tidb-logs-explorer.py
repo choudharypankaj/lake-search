@@ -82,10 +82,12 @@ panels.append({
         "`$__search` macro ([lake-search](https://github.com/choudharypankaj/lake-search)).\n\n"
         "`snapshot` · `\"peer status\"` (phrase, order matters) · `component:tikv` · "
         "`level:ERROR` · `-TiFlash` (exclude) · `a OR b` · `(a OR b) c` · "
-        "`snapshoot~1` (fuzzy) · `snapsh*` (prefix) · `pod:*` (exists)\n\n"
+        "`snapshoot~1` (fuzzy) · `snapsh*` (wildcard) · `pod:*` (exists)\n\n"
         "Empty box browses everything. Stemming is on — `truncate` finds *Truncating*. "
         "**Fuzziness is measured against the stem**, so `unreachble` needs `~2`, not `~1`. "
-        "`a OR -b` is rejected on purpose: the engine would silently drop the `-b`."
+        "A wildcard matches **within one word**: `snapsh*` finds *snapshot*, never across a space. "
+        "Operator words are only operators where one fits — `snapshot or peer` is an OR, "
+        "`msg:(not)` searches for the word *not*."
     )}
 })
 
@@ -251,7 +253,7 @@ dash = {
     "editable": True,
     "templating": {"list": [
         {"type": "textbox", "name": "search", "label": "Search",
-         "description": "Lucene-style: field:value, \"phrase\", -exclude, OR, term~1, pref*",
+         "description": "Lucene-style: field:value, \"phrase\", -exclude, OR, term~1, wild*card",
          "query": "", "current": {"text": "", "value": ""}, "options": []},
         {"type": "query", "name": "component", "label": "Component", "datasource": DS,
          "query": f"SELECT DISTINCT component FROM {TABLE} ORDER BY component",
