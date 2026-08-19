@@ -142,9 +142,28 @@ func searchArgs(args []string) (col, text string, err error) {
 	return col, text, nil
 }
 
+// unquote reverses Grafana's `:sqlstring` formatting.
+//
+// `:sqlstring` does two things: it wraps the value in single quotes AND doubles
+// every apostrophe inside it. Stripping only the quotes leaves the doubling in
+// place, and the compiler escapes it a second time — `store's` arrives as
+// `store''s`, is emitted as `store''''s`, and matches nothing.
+//
+// The tokenised path hides this, because the analyzer discards apostrophes: a
+// plain search for `store's regions` returns the right rows while every literal
+// path — regex, wildcard, a field value — returns zero with no diagnostic.
+// Measured: `LIKE '%store''s%'` is 336 rows, `RLIKE 'store''''s'` is 0.
+//
+// Undoing the doubling is gated on having actually stripped a matching pair of
+// quotes, so the hand-written `'$q'` spelling, which is already correct, is left
+// alone. An empty box still arrives as `''`, still strips to the empty string,
+// and still compiles to 1=1.
 func unquote(s string) string {
-	if len(s) >= 2 && (s[0] == '\'' || s[0] == '"') && s[len(s)-1] == s[0] {
-		return s[1 : len(s)-1]
+	if len(s) >= 2 && s[0] == '\'' && s[len(s)-1] == '\'' {
+		return strings.ReplaceAll(s[1:len(s)-1], "''", "'")
+	}
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return strings.ReplaceAll(s[1:len(s)-1], `""`, `"`)
 	}
 	return s
 }

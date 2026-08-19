@@ -80,8 +80,15 @@ STALE = ("CASE WHEN max_ts >= $__fromTime THEN '' "
 panels = []
 
 # ---------------------------------------------------------------- help text
+# Collapsed by default. The syntax strip is a cheatsheet you scan once; the
+# caveats below it are troubleshooting material — needed the moment a search
+# surprises you, not on every visit — and four rows of permanent prose at the
+# top of a twelve-panel board is the wrong price for that. The one-line version
+# lives on the Search field itself, where Grafana shows it as you type.
 panels.append({
-    "id": 10, "type": "text", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 4},
+    "id": 11, "type": "row", "title": "Search syntax", "collapsed": True,
+    "gridPos": {"x": 0, "y": 0, "w": 24, "h": 1}, "panels": [{
+    "id": 10, "type": "text", "gridPos": {"x": 0, "y": 1, "w": 24, "h": 4},
     "options": {"mode": "markdown", "content": (
         "**Search** uses Lucene-style syntax, compiled to Databend SQL by the "
         "`$__search` macro ([lake-search](https://github.com/choudharypankaj/lake-search)).\n\n"
@@ -94,7 +101,7 @@ panels.append({
         "Operator words are only operators where one fits — `snapshot or peer` is an OR, "
         "`msg:(not)` searches for the word *not*."
     )}
-})
+}]})
 
 # ------------------------------------------------------------- stat tiles
 stat_opts = {"options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": False},
@@ -258,7 +265,9 @@ dash = {
     "editable": True,
     "templating": {"list": [
         {"type": "textbox", "name": "search", "label": "Search",
-         "description": "Lucene-style: field:value, \"phrase\", -exclude, OR, term~1, wild*card",
+         "description": "Lucene-style. field:value · \"phrase\" · -exclude · a OR b · term~1 (fuzzy) "
+                        "· wild*card (within one word) · field:* (exists). Empty browses everything. "
+                        "Stemming is on. Open the Search syntax row for the full notes.",
          "query": "", "current": {"text": "", "value": ""}, "options": []},
         {"type": "query", "name": "component", "label": "Component", "datasource": DS,
          "query": f"SELECT component AS __value, component || {STALE} AS __text "

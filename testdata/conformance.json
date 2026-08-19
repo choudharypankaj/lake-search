@@ -373,6 +373,13 @@
       "note": "Pod names carry hyphens; if `-` were treated as an operator inside a word the predicate would silently invert."
     },
     {
+      "name": "an apostrophe survives every path, not just the tokenised one",
+      "query": "msg:/store's/",
+      "baseline": "*store's*",
+      "compare": "eq",
+      "note": "Both sides carry an apostrophe and reach the engine by different routes — the regex compiles to RLIKE, the wildcard to LIKE — so they agree only if the string escaper emits exactly one level of doubling. They are pinned to each other rather than to a count because the pair is what detects a second escaping: `store''s` matched 336 rows and `store''''s` matched 0, and a one-sided assertion cannot tell those apart from a term that is simply rare. The macro layer feeding this compiler had exactly that bug — Grafana's `:sqlstring` doubles apostrophes and the macro stripped only the quotes — and the tokenised path hid it, because the analyzer discards apostrophes and kept returning the right rows while every literal path returned nothing."
+    },
+    {
       "name": "quote in a term does not break the literal",
       "query": "it's",
       "compare": "executes",
