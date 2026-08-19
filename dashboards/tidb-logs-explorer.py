@@ -72,6 +72,11 @@ def panel(pid, ptype, title, x, y, w, h, sql, desc="", **kw):
     return p
 
 
+# A facet value with nothing in the current window keeps its place in the list and
+# says when it was last seen, rather than disappearing — see the Machine comment.
+STALE = ("CASE WHEN max_ts >= $__fromTime THEN '' "
+         "ELSE '  · last seen ' || to_string(max_ts) END")
+
 panels = []
 
 # ---------------------------------------------------------------- help text
@@ -256,33 +261,49 @@ dash = {
          "description": "Lucene-style: field:value, \"phrase\", -exclude, OR, term~1, wild*card",
          "query": "", "current": {"text": "", "value": ""}, "options": []},
         {"type": "query", "name": "component", "label": "Component", "datasource": DS,
-         "query": f"SELECT DISTINCT component FROM {TABLE} ORDER BY component",
-         "multi": True, "includeAll": True, "refresh": 2, "sort": 1,
+         "query": f"SELECT component AS __value, component || {STALE} AS __text "
+                  f"FROM (SELECT component, max(ts) AS max_ts FROM {TABLE} GROUP BY component) t "
+                  f"ORDER BY max_ts DESC",
+         "multi": True, "includeAll": True, "refresh": 2, "sort": 0,
          "current": {"text": ["All"], "value": ["$__all"]}, "options": []},
         {"type": "query", "name": "level", "label": "Level", "datasource": DS,
-         "query": f"SELECT DISTINCT level FROM {TABLE} ORDER BY level",
-         "multi": True, "includeAll": True, "refresh": 2, "sort": 1,
+         "query": f"SELECT level AS __value, level || {STALE} AS __text "
+                  f"FROM (SELECT level, max(ts) AS max_ts FROM {TABLE} GROUP BY level) t "
+                  f"ORDER BY max_ts DESC",
+         "multi": True, "includeAll": True, "refresh": 2, "sort": 0,
          "current": {"text": ["All"], "value": ["$__all"]}, "options": []},
         # Both machine lists are chained on Component: a node that runs no tidb
         # pod has no business appearing in the list while Component=tidb, and an
         # exclude list of 21 nodes to find the 5 that can matter is unusable.
         # Chained on component only — not level, which would make machines
-        # vanish from the list as soon as they stopped erroring, and not the time
-        # range, since this plugin expands macros in the backend and template
-        # variable queries never reach it.
+        # vanish from the list as soon as they stopped erroring.
+        #
+        # Ranked by recency and LABELLED rather than filtered to the window, which
+        # is the one thing that must not happen: Grafana's MultiValueVariable
+        # intersects the current selection with the freshly-fetched options and,
+        # when nothing survives, falls back to the FIRST option — not to "All".
+        # So dropping dead values would mean pinning a machine, panning the time
+        # range, and silently reading a different machine's logs. Every value
+        # stays selectable; the ones with nothing in the window carry their last
+        # seen stamp. sort must be 0, or Grafana re-sorts by text and throws the
+        # recency order away.
         # `format` is a reserved word in Databend, so the column is aliased.
         {"type": "query", "name": "logformat", "label": "Log format", "datasource": DS,
          "description": "Which parser matched: tidb, klog, zap, tracing, json, "
                         "raw (nothing matched), legacy (ingested before the parser).",
-         "query": f"SELECT DISTINCT coalesce(kv['format']::VARCHAR, 'legacy') AS log_format "
-                  f"FROM {TABLE} WHERE component IN (${{component:sqlstring}}) ORDER BY log_format",
-         "multi": True, "includeAll": True, "refresh": 2, "sort": 1,
+         "query": f"SELECT lf AS __value, lf || {STALE} AS __text FROM ("
+                  f"SELECT coalesce(kv['format']::VARCHAR, 'legacy') AS lf, max(ts) AS max_ts "
+                  f"FROM {TABLE} WHERE component IN (${{component:sqlstring}}) GROUP BY lf) t "
+                  f"ORDER BY max_ts DESC",
+         "multi": True, "includeAll": True, "refresh": 2, "sort": 0,
          "current": {"text": ["All"], "value": ["$__all"]}, "options": []},
         {"type": "query", "name": "node", "label": "Machine", "datasource": DS,
          "description": "Include only these nodes. Narrows with Component.",
-         "query": f"SELECT DISTINCT node FROM {TABLE} "
-                  f"WHERE component IN (${{component:sqlstring}}) ORDER BY node",
-         "multi": True, "includeAll": True, "refresh": 2, "sort": 1,
+         "query": f"SELECT node AS __value, node || {STALE} AS __text FROM ("
+                  f"SELECT node, max(ts) AS max_ts FROM {TABLE} "
+                  f"WHERE component IN (${{component:sqlstring}}) GROUP BY node) t "
+                  f"ORDER BY max_ts DESC",
+         "multi": True, "includeAll": True, "refresh": 2, "sort": 0,
          "current": {"text": ["All"], "value": ["$__all"]}, "options": []},
         # Exclude is its own variable rather than "deselect it from Machine",
         # because excluding one noisy node out of a dozen should be one click,
@@ -290,10 +311,14 @@ dash = {
         # sentinel row is what makes "exclude nothing" expressible.
         {"type": "query", "name": "exclude_node", "label": "Exclude machine", "datasource": DS,
          "description": "Drop these nodes. Leave (none) selected to exclude nothing. Narrows with Component.",
-         "query": f"SELECT node FROM (SELECT '(none)' AS node UNION ALL "
-                  f"SELECT DISTINCT node FROM {TABLE} "
-                  f"WHERE component IN (${{component:sqlstring}})) t ORDER BY node",
-         "multi": True, "includeAll": False, "refresh": 2, "sort": 1,
+         "query": f"SELECT __value, __text FROM ("
+                  f"SELECT '(none)' AS __value, '(none)' AS __text, 1 AS grp, NULL AS max_ts "
+                  f"UNION ALL "
+                  f"SELECT node, node || {STALE}, 0 AS grp, max_ts FROM ("
+                  f"SELECT node, max(ts) AS max_ts FROM {TABLE} "
+                  f"WHERE component IN (${{component:sqlstring}}) GROUP BY node) t"
+                  f") u ORDER BY grp DESC, max_ts DESC",
+         "multi": True, "includeAll": False, "refresh": 2, "sort": 0,
          "current": {"text": ["(none)"], "value": ["(none)"]}, "options": []},
     ]},
     "panels": panels,
