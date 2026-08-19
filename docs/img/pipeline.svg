@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="200" viewBox="0 0 880 200" role="img" aria-label="Lucene-style search text compiled to a Databend SQL predicate">
+  <style>
+    .box   { fill: #6b7fa312; stroke: #6b7fa3; stroke-width: 1.5; rx: 8; }
+    .label { font: 600 11px ui-sans-serif, system-ui, sans-serif; fill: #6b7fa3; letter-spacing: .08em; }
+    .code  { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; fill: #7a8ba8; }
+    .key   { fill: #4f9d69; }
+    .warn  { fill: #b8804f; }
+    .arrow { stroke: #6b7fa3; stroke-width: 1.5; fill: none; marker-end: url(#a); }
+    .note  { font: italic 11px ui-sans-serif, system-ui, sans-serif; fill: #8b93a1; }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M0 0 L10 5 L0 10 z" fill="#6b7fa3"/>
+    </marker>
+  </defs>
+
+  <rect class="box" x="8" y="30" width="270" height="74"/>
+  <text class="label" x="24" y="52">WHAT YOU TYPE</text>
+  <text class="code" x="24" y="80">level:error <tspan class="key">"peer status"</tspan> <tspan class="warn">-TiFlash</tspan></text>
+
+  <path class="arrow" d="M286 67 H 344"/>
+  <text class="label" x="292" y="58">lake-search</text>
+
+  <rect class="box" x="352" y="30" width="520" height="74"/>
+  <text class="label" x="368" y="52">WHAT DATABEND RUNS</text>
+  <text class="code" x="368" y="80">lower(level) = lower('error') AND query('(msg:"peer status") NOT (msg:TiFlash)')</text>
+
+  <text class="note" x="24" y="140">One search function per statement — so the boolean logic goes inside a single query() call,</text>
+  <text class="note" x="24" y="158">negatives bare and trailing (AND NOT silently matches nothing), ~N routed to match(fuzziness=N),</text>
+  <text class="note" x="24" y="176">pref* routed to LIKE, and an empty box compiled to 1=1 with no search function at all.</text>
+</svg>

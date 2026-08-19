@@ -130,8 +130,19 @@ panels.append(panel(1, "timeseries", "Events per minute", 0, 8, 24, 7,
                                               "min": 0}, "overrides": []}))
 
 # ------------------------------------------------------------- logs + patterns
+# The Logs panel columns are aliased to Grafana's logs-frame names —
+# timestamp / body / severity / attributes. Panels here send raw SQL, and the
+# plugin only attaches its ColumnHint.LogMessage / LogLevel / Time markers on
+# queries built through the visual query builder, so a raw-SQL frame arrives
+# with no indication of which field is the log line. Grafana then falls back to
+# "first time field, first string field" — and with the natural column order
+# that first string field was `level`, so every line rendered as INFO or ERROR
+# with the actual message demoted to a detected field. Aliasing is also
+# belt-and-braces: `body` is now both the canonical name and the first string
+# field, so either rule picks it.
 panels.append(panel(2, "logs", "Log lines", 0, 15, 16, 16,
-                    "SELECT ts, level, msg, component, pod, node, source_file, kv\n"
+                    "SELECT ts AS timestamp, msg AS body, level AS severity,\n"
+                    "       component, pod, node, source_file, kv AS attributes\n"
                     f"FROM {TABLE}\nWHERE {WHERE}\nORDER BY ts DESC\nLIMIT 1000",
                     options={"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending",
                              "enableLogDetails": True, "dedupStrategy": "none"}))
