@@ -39,6 +39,33 @@
       "note": "Negative control for the case above. If this is ever nonzero, phrase search has degenerated to an unordered token AND."
     },
     {
+      "name": "a phrase that loses tokens is still a phrase",
+      "query": "\"not ready\"",
+      "baseline": "msg:/not ready/",
+      "compare": "eq",
+      "note": "A phrase constrains positions, and positions only exist between tokens. The analyzer strips stopwords and punctuation from the phrase first, and when fewer than two tokens survive the engine drops the adjacency constraint and matches the survivor everywhere - silently. Measured: query('msg:\"not ready\"') and query('msg:ready') were the same 2,320 rows against a true 250, and \"the leader\" returned 9,716 against a true 4. The baseline is a /regex/ term, so ground truth comes from RLIKE, outside the code path under test. A phrase that keeps two or more tokens is untouched, which the two proximity cases and 'reversed phrase finds nothing' guard."
+    },
+    {
+      "name": "a one-word phrase keeps the index",
+      "query": "\"snapshots\"",
+      "baseline": "snapshots",
+      "compare": "eq",
+      "note": "A phrase the analyzer leaves alone must not be diverted off the index. The guard that routed collapsed phrases to a scan first tested how many tokens SURVIVED rather than whether any were DESTROYED, so a quoted single word tripped it: `\"snapshots\"` became lower(msg) LIKE lower('%snapshots%') and returned 9 rows against 17,595, because the index stems `snapshots` onto `snapshot` and a substring scan cannot. That is a 1,955x under-match with no signal, the same failure class the collapsed-phrase branch exists to remove, pointed the other way. `eq` is two-sided: the under-match fails it at 9, and 1=1 fails it at the whole table."
+    },
+    {
+      "name": "an empty phrase matches nothing",
+      "query": "\"\"",
+      "compare": "zero",
+      "note": "The degenerate end of the same guard. An empty phrase destroys nothing, so it keeps the index and query('msg:\"\"') correctly returns 0. Under the token-count test it became lower(msg) LIKE lower('%%') - every row in the table, offered as the answer to a search for nothing. Zero is the exact answer here rather than a floor, so this case is one-sided only in form."
+    },
+    {
+      "name": "a collapsed phrase is not just its surviving token",
+      "query": "\"not ready\"",
+      "baseline": "ready",
+      "compare": "shrinks",
+      "note": "Names the original defect as a relationship rather than a number. When the analyzer cuts a phrase below two tokens the engine drops the adjacency constraint and matches the survivor everywhere: query('msg:\"not ready\"') and query('msg:ready') were the same 2,320 rows over the frozen window against a true 250, and they are 4,023 and 1,932 live. The emitted form keeps the token in query() - so the index still drives the scan - and ANDs a literal scan for the whole phrase, which is what makes it strictly smaller. It goes red if the residual is ever dropped, and `shrinks` rather than `lt` because a phrase that matched nothing at all would satisfy a bare inequality."
+    },
+    {
       "name": "fuzzy typo matches the baseline",
       "query": "snapshoot~1",
       "baseline": "snapshot",
@@ -59,16 +86,59 @@
       "note": "Measured 17,321 against a 17,316 baseline: fuzziness=2 matches a few extra tokens, so the assertion is 'at least the baseline', not equality."
     },
     {
-      "name": "prefix wildcard works via LIKE",
+      "name": "a token wildcard returns rows",
       "query": "snapsh*",
       "compare": "nonzero",
-      "note": "Through query() the star is silently ignored and `snapsh*` returns 0 while `snapshot*` returns the full baseline, which looks like success. Compiled to LIKE 'snapsh%' it returns real rows."
+      "note": "A smoke test, and now named as one. It is kept because the original defect returned zero rows - query('msg:\"snapsh*\"') truncates the term at the star and `snapsh` is not a token - but non-empty is all it can see, and every way this answer can be wrong now leaves it non-empty. The four cases after it are the real guards. The predicate is no longer a LIKE either: a wildcard whose literal characters are all token characters compiles to the word-boundary regex lower(msg) RLIKE '(^|[^a-z0-9])snapsh[a-z0-9]*([^a-z0-9]|$)', which is the token reading Lucene's `*` asks for."
     },
     {
-      "name": "prefix is narrower than substring",
+      "name": "a token wildcard is never narrower than the bare token",
       "query": "snapsh*",
-      "baseline": "*napsho*",
-      "compare": "narrows"
+      "baseline": "snapshot",
+      "compare": "ge",
+      "note": "The lower bound of the wildcard family. It fails on the defect it was written for: the anchored LIKE this used to emit, lower(msg) LIKE lower('snapsh%'), asks whether the whole message begins with snapsh and found 1,019 rows against 17,595 for the token - 94% of the answer gone, every returned row correct. Any word the stemmed token search finds also begins with the literal prefix, so the wildcard can only be the wider set; `ge` rather than `eq` because the index stems and a regex does not (17,622 against 17,609 measured live). One-sided by construction - it passes for any superset, 1=1 included - so the upper bound is asserted separately, three cases down."
+    },
+    {
+      "name": "a mid-token wildcard still finds the word it spans",
+      "query": "reg*on",
+      "baseline": "msg:/(^|[^a-z0-9])region([^a-z0-9]|$)/",
+      "compare": "ge",
+      "note": "Replaces `reg*on region` eq `region`, which was written for the substring emission and is false under the token one: the index stems `regions` onto `region`, and the token pattern reg[a-z0-9]*on requires the word to END in `on`, so the conjunction is legitimately smaller than the stemmed token (22,182 against 27,017 measured live). This states the relationship that does hold in both readings - every line containing the whole word `region` contains a word matching reg...on - and it fails on the original defect, where `reg*on` was forwarded into query() as a phrase, truncated at the star, and returned 36 rows none of which contained `region`. The baseline is a /regex/ term, which is the one path nothing else in the compiler shares."
+    },
+    {
+      "name": "a single-character wildcard matches exactly one character",
+      "query": "pod:grafana-?????????-?????",
+      "baseline": "pod:/^grafana-.{9}-.{5}$/",
+      "compare": "eq",
+      "note": "Pins both bounds against an oracle that never touches the LIKE path. The case this replaces compared pod:tikv-tikv-?????? with pod:tikv-tikv-*, which are provably the same 189,623 rows on this table - every pod with that prefix has exactly six characters after it - so `narrows` degenerated to `nonzero` and would have passed just as well if `?` had compiled to `%`. This pair does not: 7,362 rows have exactly nine then five characters, 9,851 have the prefix at all (live). It fails if `?` becomes `%` (7,362 against 9,851), if `?` is compared literally as it was originally (0 rows), and if the `?`-to-`_` translation ever runs before escapeLike and a literal underscore stops being distinguishable from a wildcard."
+    },
+    {
+      "name": "a token wildcard does not spill past the token",
+      "query": "to*",
+      "baseline": "msg:/to/",
+      "compare": "shrinks",
+      "note": "The upper bound the suite never had. Served as a substring, `to*` is lower(msg) LIKE lower('%to%') and matches `store`, `into` and `storage`; served as a token it is the word-boundary regex. Measured live, 216,664 against 272,059 - so the assertion is strict inequality, and if the emission ever reverts to a substring the two sides become the same number and the case goes red. `shrinks` also requires the count to be non-empty, because on this engine a mistranslated query returns zero rows and zero is less than any baseline. Chosen for the size of the gap: `to` is a common English fragment, so the two readings differ by 55,395 rows rather than by the handful that separates them for a rarer prefix."
+    },
+    {
+      "name": "a mid-token wildcard stays inside one word",
+      "query": "reg*on",
+      "baseline": "msg:/reg.*on/",
+      "compare": "shrinks",
+      "note": "The baseline is exactly what the previous emission was: lower(msg) LIKE lower('%reg%on%') and msg RLIKE 'reg.*on' are the same predicate, measured 28,371 = 28,371 live. That predicate is unbounded - the star crosses word boundaries, so 899 of its rows over a frozen window contained no word matching reg...on at all and the longest single match spanned 746 characters and four words. The token reading is 22,388. Strict inequality is the whole assertion: it is red the moment a mid-token star is allowed to span words again."
+    },
+    {
+      "name": "a suffix wildcard is not a prefix wildcard",
+      "query": "*region",
+      "baseline": "region*",
+      "compare": "shrinks",
+      "note": "Both spellings used to collapse to lower(msg) LIKE lower('%region%') - identical predicates, 20,158 rows each on the frozen window - so nothing in the suite could tell a suffix wildcard from a prefix one, and a user could not either. As tokens they are different questions: words ENDING in region, 22,182, against words BEGINNING with it, 27,059 (live). The case fails if either spelling stops anchoring its literal to the right end of the token, and it fails if both collapse onto one predicate again."
+    },
+    {
+      "name": "a single-character wildcard is not a multi-character one",
+      "query": "pod:grafana-?????????-?????",
+      "baseline": "pod:grafana-*",
+      "compare": "shrinks",
+      "note": "The companion to the case above, and the direct guard on `?` not becoming `%`: nine-then-five characters is 7,362 rows where the bare prefix is 9,851 (live). Stated as `shrinks` rather than `narrows` deliberately - `narrows` admits equality, which is exactly how the vacuous version of this case passed. Note that the two sides do coincide inside some short windows (both 2,956 over [2026-08-19 00:00, 05:00)), where every grafana pod happens to share one name length; the suite runs unwindowed, where the deployment's older pods keep the gap open."
     },
     {
       "name": "negation excludes",
@@ -84,6 +154,155 @@
       "baseline": "snapshot",
       "compare": "eq",
       "note": "Sharper than the case above: excluding a term that matches nothing must leave the count untouched. If this comes back 0, NOT is swallowing the whole predicate."
+    },
+    {
+      "name": "a stopword term is searchable",
+      "query": "to",
+      "baseline": "msg:/(^|[^a-z0-9])to([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "The inverted index on msg carries filters='english_stop', and the filter runs over the query as well as the document: 33 ordinary English words are deleted before the index is read, so the clause matches nothing and nothing is raised. Verified word by word - all 33 return 0 through query(). The baseline is a /regex/ term, which compiles to RLIKE and is therefore the one baseline in this file that does not go through the code path under test. Measured 130,002 both ways, against 0 before the fix."
+    },
+    {
+      "name": "an ordinary word still goes through the index",
+      "query": "from",
+      "baseline": "msg:/(^|[^a-z0-9])from([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "The control for the case above, and it asserts two things at once. It proves the word-boundary regex is the right ground truth for a token search - the index and the regex agree exactly at 93,645 on a word neither filters - and it guards the stopword branch against firing on ordinary words, since routing `from` onto a scan would be a needless full scan on every query that contains it."
+    },
+    {
+      "name": "excluding a stopword actually excludes",
+      "query": "replica -no",
+      "baseline": "replica",
+      "witness": "replica no",
+      "compare": "partitions",
+      "note": "The negative half of the stopword defect, and the worst-behaved shape on the full-text surface: the analyzer emptied the negated clause, so it evaporated and `replica -no` returned the 1,743 rows of `replica` unchanged - 20x too many, with no signal at all. It needs no new code once a stopword leaf is a SQL fragment, because compiler.not already null-safes SQL. Measured 87 + 1,656 = 1,743."
+    },
+    {
+      "name": "an operator word is searchable as a value",
+      "query": "msg:not",
+      "baseline": "msg:/(^|[^a-z0-9])not([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "Two independent mechanisms had to be fixed for this one query, which is why they landed together. The lexer classified the VALUE `not` as an operator, so parseFieldValue had no case for it, the leaf vanished and the whole query compiled to 1=1 - the filter was not wrong, it was gone, and all 449,893 rows came back against a true 22,850. Fixing only that turns the wrong answer into zero rows, because `not` is also one of the 33 stopwords. Measured 22,850 both ways."
+    },
+    {
+      "name": "an operator word inside a group is still a value",
+      "query": "msg:(not)",
+      "baseline": "msg:/(^|[^a-z0-9])not([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "The colon rule that fixed `msg:not` does not reach inside a field-scoped group, and this shape kept the original bug for a full round: `msg:(not)` and `msg:(and)` compiled to 1=1 - 610,028 rows over the window they were measured on, against a true 26,716 - with no warning. Only the uppercase spellings are operators now, which is Lucene's own rule, so the word survives to the compiler and is matched by scan. Fails at the whole table if the group path ever loses it again."
+    },
+    {
+      "name": "a query that is nothing but an operator word still filters",
+      "query": "not",
+      "baseline": "msg:/(^|[^a-z0-9])not([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "The bare form, which has no operator position at all and no colon to key on. It compiled to 1=1 as well. Uppercase NOT with nothing to negate is demoted back to the word it was typed as, so `not` and `NOT` agree. What this case can prove is bounded and worth stating: the baseline is the same word-boundary regex the compiler emits, differing only by lower(), so it pins the routing and the boundary spelling, not the claim that a boundary scan equals a token search. That claim is a separate case - `from`, an ordinary word with no inflections, measured equal through the index and through the regex - and it is false in general wherever the index stems."
+    },
+    {
+      "name": "an operator word beside a term keeps both clauses",
+      "query": "msg:(peer AND not)",
+      "baseline": "peer msg:/(^|[^a-z0-9])not([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "This one dropped the clause outright rather than the whole filter: `msg:(peer AND not)` compiled to query('msg:peer') alone, 109,950 rows against a true 297 - a 370x over-match that looks entirely plausible on screen. The baseline spells the same conjunction a way the lexer cannot mis-read, so the case fails both if the trailing word is dropped again and if it is applied as a negation."
+    },
+    {
+      "name": "an operator word in a group is not a negation",
+      "query": "msg:(not ready)",
+      "baseline": "ready msg:/(^|[^a-z0-9])not([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "The worst of the four, because it did not merely widen: read as an operator, the leading `not` turned the group into an anti-join and returned the COMPLEMENT of what was asked - 447,573 rows over the frozen window where the two words co-occur in 1,855. An inversion passes every upper-bound-free assertion in a suite, so it needs an equality against a baseline that cannot invert."
+    },
+    {
+      "name": "a lowercase or is the same operator as an uppercase one",
+      "query": "snapshot or peer",
+      "baseline": "snapshot OR peer",
+      "compare": "eq",
+      "note": "The suite had no lowercase-operator case at all, in either direction, and that absence is how a change making only the UPPERCASE spellings operators reached a green tree. It compiled this query to a three-word conjunction with the English word `or` required on the line: 0 rows over the frozen window against the 201,403 both spellings return now. eq is two-sided - it fails at 0 if `or` becomes a term, and it fails if the operator is dropped instead, because the AND of the same two terms is 5,717."
+    },
+    {
+      "name": "a lowercase or widens the way an operator must",
+      "query": "snapshot or peer",
+      "baseline": "snapshot",
+      "compare": "gt",
+      "note": "The independent half of the case above: it does not compare two spellings against each other, so it still fails if BOTH spellings regress together. A disjunction must be strictly larger than either side - 201,403 against 17,617 frozen. Any reading that turns `or` into a required term makes the count fall below the baseline instead."
+    },
+    {
+      "name": "a lowercase and is the same operator as an uppercase one",
+      "query": "region and peer",
+      "baseline": "region peer",
+      "compare": "eq",
+      "note": "Adjacency already means AND, so an applied `and` must be invisible: 5,717 = 5,717 frozen. Searched for as a word instead, the query becomes region AND the word `and` AND peer, which is a strict subset. `snapshot AND peer` cannot be used here - those two terms genuinely never co-occur in this table, and an assertion whose baseline is 0 proves nothing."
+    },
+    {
+      "name": "a lowercase or inside a field group is still an OR",
+      "query": "level:(error or warn)",
+      "baseline": "level:(error OR warn)",
+      "compare": "eq",
+      "note": "The shape the README advertises, in the spelling users actually type. On a single-valued column the term reading is not merely narrower, it is a structural contradiction - level='error' AND level='or' AND level='warn' can never match any row - so the regression this catches returns 0 forever and looks exactly like an empty time range. 224,144 = 224,144 frozen."
+    },
+    {
+      "name": "a field group with a lowercase or is not a contradiction",
+      "query": "level:(error or warn)",
+      "baseline": "level:error",
+      "compare": "gt",
+      "note": "The two-spelling case above passes if both spellings break together; this one does not. The union of two level values must be strictly larger than either - 224,144 against 177,692 frozen, and 177,692 + 46,452 = 224,144 exactly. Fails at 0 the moment the group turns back into a conjunction of equalities on one column."
+    },
+    {
+      "name": "&& is an operator and has no case to get wrong",
+      "query": "region && peer",
+      "baseline": "region peer",
+      "compare": "eq",
+      "note": "The symbols carry no case, so the case rule must not reach them - and equally the POSITION rule must, which is why the pair with `||` below is here too. 5,717 = 5,717 frozen. An earlier warning text claimed the uppercase words were the only operators while the very statement it was printed beside applied `&&`; this case is the assertion that text should have had. Its blind spot, stated because a case whose limits are unstated is a false comfort: if `&&` stopped being an operator and became a term, the emitted query('(msg:region) AND (msg:\"&&\") AND (msg:peer)') still returns 5,717 - this engine drops a clause whose analyzed form is empty when it sits inside a conjunction, even though query('msg:\"&&\"') alone returns 0. What this case does catch is the symbols joining the wrong way: swap && and || in the lexer and it reads 282,378 against 5,717."
+    },
+    {
+      "name": "|| is an operator and has no case to get wrong",
+      "query": "region || peer",
+      "baseline": "region OR peer",
+      "compare": "eq",
+      "note": "The disjunctive half, and the one that can fail both ways: 206,046 = 206,046 frozen, against 5,717 for the conjunction of the same two terms. Unlike its && sibling it catches BOTH mutations - `||` demoted to a term collapses it to the 5,717 of the AND, and `||` joining as AND does the same - because here the empty-clause drop turns a disjunction into a conjunction rather than into itself."
+    },
+    {
+      "name": "an uppercase operator word with nothing to operate on is a value",
+      "query": "msg:(NOT)",
+      "baseline": "msg:/(^|[^a-z0-9])not([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "Position, not spelling, is what disqualifies this one: NOT is written unambiguously and still has nothing to its right. The lowercase sibling two cases up is caught by the same rule for a different reason, and pinning both is what stops a future fix keying on case alone. Without the demotion pass this compiles to 1=1 - the whole table, 715,185 rows frozen, against 30,896."
+    },
+    {
+      "name": "a lowercase not before a term is a value, not a negation",
+      "query": "msg:(not ready)",
+      "baseline": "msg:(NOT ready)",
+      "compare": "shrinks",
+      "note": "The case rule's whole content, stated as a measurement. `not` and `NOT` in the SAME grammatical position must mean different things, because NOT inverts the term it takes while and/or only join terms that keep their own meaning either way: reading a lowercase English word as an inversion hands back the complement of the table. 3,537 against 711,157 frozen, out of 715,185. shrinks needs both sides nonzero and the left strictly smaller, so it fails the instant the two spellings agree - which is exactly what a case-insensitive NOT would make them do."
+    },
+    {
+      "name": "an uppercase NOT before a term still negates",
+      "query": "msg:(NOT ready)",
+      "baseline": "ts:*",
+      "witness": "ready",
+      "compare": "partitions",
+      "note": "The other side of the same rule, and the reason the case above cannot be satisfied by simply deleting NOT. The negation and the term it negates must be exact complements: 711,157 + 4,028 = 715,185 frozen, and 103,905 + 12 = 103,917 over a second, disjoint window. If lowercase were the only spelling that stopped negating, this stays green; if NOT stopped negating at all, it goes red."
+    },
+    {
+      "name": "a quoted operator word is never an operator",
+      "query": "\"not\" ready",
+      "baseline": "ready msg:/(^|[^a-z0-9])not([^a-z0-9]|$)/",
+      "compare": "eq",
+      "note": "Quotes are the one place where the answer does not depend on position or spelling at all. 3,537 = 3,537 frozen. Routed through the keyword switch instead, the phrase becomes a negation and the query returns the complement of `ready` - measured at 711,157 on a build mutated to do exactly that."
+    },
+    {
+      "name": "a leading operator word is searched for, not dropped",
+      "query": "or region",
+      "baseline": "region",
+      "compare": "shrinks",
+      "note": "An infix operator with nothing on its left will never acquire one - a leading `or` is a typo or the English word, never a half-typed query - so it is demoted to the word and the search narrows: 85 against 27,977 frozen. Dropping it instead makes the two sides identical, which shrinks rejects. This is the assertion that separates 'demoted to a value' from 'silently discarded'."
+    },
+    {
+      "name": "a trailing operator word is dropped, not searched for",
+      "query": "region or",
+      "baseline": "region",
+      "compare": "eq",
+      "note": "The deliberate exception, pinned so it stays deliberate. `region or` is someone mid-keystroke on `region or peer`, and demoting the operator to a required word would collapse the result set between two keystrokes - the flicker the parser's own contract exists to prevent. 27,977 = 27,977 frozen. On a build that demotes trailing operators too, the left side falls to the rows containing both `region` and the word `or`."
     },
     {
       "name": "structured filter narrows",
@@ -113,6 +332,39 @@
       "name": "existence check",
       "query": "pod:*",
       "compare": "nonzero"
+    },
+    {
+      "name": "a bag key that exists with an empty value still exists",
+      "query": "rest:*",
+      "baseline": "rest:/./",
+      "compare": "gt",
+      "note": "The [k=v] extractor writes an empty value whenever a log line says key= with nothing after it, and the existence test used to be (x IS NOT NULL AND x <> ''), which denies exactly the rows that prove the key is there. The baseline is a /regex/ term - RLIKE '.' needs one character, so it is the non-empty half - and existence must be strictly larger than it. Measured 433,901 > 333,266; before the fix both sides were 333,266 and the assertion failed. The cast is dropped as well as the <> '': a JSON null is distinguishable from a missing key only before it, and existence is the question that distinction answers. A real column keeps the other reading, since an empty level is not a level."
+    },
+    {
+      "name": "an existence test does not match the whole table",
+      "query": "rest:*",
+      "baseline": "ts:*",
+      "compare": "lt",
+      "note": "The guard on the case above: widening an existence test until it matched everything would satisfy gt just as well as fixing it."
+    },
+    {
+      "name": "a quoted field name reaches a bag key containing a space",
+      "query": "\"msg type\":MsgRequestVote",
+      "baseline": "\"msg type\":*",
+      "compare": "narrows",
+      "note": "Nine keys in this table contain spaces and are visible in any attributes panel, and no syntax reached them: a quoted token was always a phrase, so the colon fell into the word scanner - which cannot open a field on an empty name - and the query became a phrase plus a search for the literal token :MsgRequestVote. Zero rows, and the filter the user typed was gone. narrows rather than eq because a value is a subset of the key's rows: measured 4,312 of 5,560 whole-table. Both halves of this case are new - the baseline is an existence test on a quoted key, which needed the same parse."
+    },
+    {
+      "name": "a VARIANT key is matched with the case it was typed in",
+      "query": "tableID:*",
+      "compare": "nonzero",
+      "note": "Half of the asymmetry the VARIANT warning states, asserted rather than described. kv['tableID'] is 51,070 rows live. Together with the case below it is the only thing that would catch someone lowercasing the key inside variantPath - which would turn the warning into a false statement while every existing test still passed - and it is why the warning itself now carries no number: the count it used to quote was true at one bound on one afternoon and had tripled two hours later."
+    },
+    {
+      "name": "a mis-cased VARIANT key is silently empty",
+      "query": "tableid:*",
+      "compare": "zero",
+      "note": "The other half. Go's structured loggers emit camelCase keys - tableID, reconcileID, controllerKind, TiFlash - and the bag subscript is exact, so the lowercase spelling of a key that exists 51,070 times returns 0 rows and no error. Note that the repo's usual /regex/ oracle CANNOT check this: RLIKE is case-insensitive on this engine, so kv::VARCHAR RLIKE '\"tableid\":' returns the same count as the correctly-cased pattern. array_contains(object_keys(kv), ...) agrees with the subscript, and so does this case."
     },
     {
       "name": "hyphen is not negation",
@@ -252,6 +504,20 @@
       "baseline": "ts:>2026-08-18T22:00:00Z",
       "compare": "lt",
       "note": "The nastiest class on this surface, because it does not look broken. The lexer used to split on every colon, so the bound became '2026-08-18T22' - which Databend accepts without complaint and resolves to 22:00:00, silently widening the window by up to an hour. Both bounds truncated to the same literal, so the two counts were equal and any upper-bound assertion passed. Strict inequality is what catches it. Measured 70,681 against 129,009."
+    },
+    {
+      "name": "the two spellings of one instant agree",
+      "query": "ts:>2026-08-18 22:30:00",
+      "baseline": "ts:>2026-08-18T22:30:00Z",
+      "compare": "eq",
+      "note": "The space-separated spelling is the one the compiler's own error message for a bare ts: value recommends, and it used to split at the space: the date became the bound and the clock became a separate full-text phrase, so the query returned 0 rows AND spent the statement's single search function on the literal 22:30:00. Emitted before the fix: (ts > '2026-08-18' AND query('msg:\"22:30:00\"')) = 0. After: 70,681 in the frozen window, identical to the ISO spelling. The lexer glues a HH:MM(:SS(.fff))(zone) run onto a bound that opens with a comparison operator and ends in a date - purely lexical, since the parser package cannot ask whether the field is a timestamp."
+    },
+    {
+      "name": "a quoted timestamp bound is the same instant",
+      "query": "ts:>\"2026-08-18 22:30:00\"",
+      "baseline": "ts:>2026-08-18T22:30:00Z",
+      "compare": "eq",
+      "note": "The other spelling the error message recommends, and it silently compiled to 1=1 before this pass: the operator ended the word at the opening quote, parseFieldValue saw an empty bound and returned nil, and the whole filter disappeared. Any remediation a compiler prints has to be a remediation that compiles."
     },
     {
       "name": "a regex is narrower than the unordered AND",

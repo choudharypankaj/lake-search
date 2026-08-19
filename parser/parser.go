@@ -72,7 +72,17 @@ func (p *parser) parseAnd() Node {
 		}
 		n := p.parseUnary()
 		if n == nil {
-			break
+			// A leaf that produced nothing — `field:` with no value yet, a
+			// bare `*`, a dangling negation — must not truncate the rest of
+			// the conjunction. It used to: `level:> peer` compiled to 1=1,
+			// silently returning the whole table because the half-typed
+			// bound took the real search term with it. Every nil path other
+			// than end-of-input has consumed at least one token, so skipping
+			// is always progress.
+			if p.atEnd() {
+				break
+			}
+			continue
 		}
 		children = append(children, n)
 	}
@@ -109,6 +119,14 @@ func (p *parser) parsePrimary() Node {
 
 	case tokQuoted:
 		t := p.next()
+		// A quoted token followed immediately by a colon is a field name, not
+		// a phrase. The generous-parser policy is to drop punctuation it
+		// cannot place, never to drop a filter, and dropping the `:value`
+		// after a quoted name was doing exactly the latter.
+		if p.peek().kind == tokColon {
+			p.next()
+			return p.parseFieldValue(t.val)
+		}
 		return p.phrase("", t.val)
 
 	case tokRegex:
@@ -229,7 +247,15 @@ func (p *parser) parseFieldValue(field string) Node {
 		// Range: field:>1000, field:>=1000, field:<1000, field:<=1000
 		if op, rest := splitRangeOp(v); op != "" {
 			if rest == "" {
-				// `field:>` with the number not yet typed.
+				// `field:>"2026-08-18 22:30:00"` — quoting the bound is the
+				// other way to keep a space inside one value, and it is a
+				// spelling the compiler recommends, so it has to work. The
+				// operator ends the word at the opening quote, leaving the
+				// value in the next token.
+				if p.peek().kind == tokQuoted {
+					return &Range{Field: field, Op: op, Value: p.next().val}
+				}
+				// `field:>` with the value not yet typed.
 				return nil
 			}
 			return &Range{Field: field, Op: op, Value: rest}
@@ -249,12 +275,13 @@ func (p *parser) parseFieldValue(field string) Node {
 }
 
 // buildTerm interprets the two pieces of Lucene syntax that live inside a word:
-// a trailing fuzziness marker and leading/trailing wildcards.
+// a trailing fuzziness marker, and wildcards anywhere in the value.
 //
 // Both are the traps documented in LOG_PIPELINE_FINDINGS.md §5.10: typed into
-// Databend's query() they return zero rows and raise no error. Recognising them
-// here is the entire point of this project — the emitter maps them onto the
-// forms that do work (fuzziness=N and LIKE).
+// Databend's query() a fuzzy term returns zero rows and a wildcard is truncated
+// at the star, in both cases with no error. Recognising them here is the entire
+// point of this project — the emitter maps them onto the forms that do work
+// (fuzziness=N and LIKE).
 func buildTerm(field, raw string, phrase bool) Node {
 	t := &Term{Field: field, Phrase: phrase}
 
@@ -270,21 +297,26 @@ func buildTerm(field, raw string, phrase bool) Node {
 		t.Boost = boost
 	}
 
-	if strings.HasPrefix(raw, "*") {
-		t.Suffix = true
-		raw = strings.TrimPrefix(raw, "*")
-	}
-	if strings.HasSuffix(raw, "*") {
-		t.Prefix = true
-		raw = strings.TrimSuffix(raw, "*")
+	// Wildcards anywhere, not only at the ends. A star in the middle of a
+	// word is the trap: forwarded into the engine's search syntax it is
+	// truncated at the star, so `reg*on` becomes a search for `reg` and
+	// returns registration lines with a straight face. The value keeps its
+	// stars and question marks and the emitter turns them into a pattern.
+	if strings.ContainsAny(raw, "*?") {
+		if strings.Trim(raw, "*") == "" {
+			// Nothing but stars: an existence test, not a pattern. A lone
+			// `?` is left as a pattern, because it does constrain — it asks
+			// for exactly one character.
+			if field != "" {
+				return &Term{Field: field, Exists: true}
+			}
+			return nil
+		}
+		t.Wildcard = true
 	}
 
 	t.Value = raw
 	if t.Value == "" {
-		// The word was nothing but wildcards.
-		if field != "" {
-			return &Term{Field: field, Exists: true}
-		}
 		return nil
 	}
 	return t

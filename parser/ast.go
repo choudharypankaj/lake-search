@@ -61,11 +61,15 @@ type Term struct {
 	// Regex records that Value is the body of a `/pattern/` term.
 	Regex bool
 
-	// Prefix and Suffix record wildcards: `foo*` sets Prefix, `*foo` sets
-	// Suffix, `*foo*` sets both. A wildcard-only value (`field:*`) sets
-	// Exists instead.
-	Prefix bool
-	Suffix bool
+	// Wildcard records that Value carries Lucene's wildcards — `*` for any
+	// run of characters, `?` for exactly one — anywhere in the value, not
+	// only at its ends. They are left in Value as typed, because where they
+	// sit is what the emitter has to translate: `reg*on` is a different
+	// pattern from `reg*` and from `*on`, and collapsing them all into a
+	// pair of end flags is how a mid-word star ends up silently discarded.
+	//
+	// A value that is nothing but stars (`field:*`) sets Exists instead.
+	Wildcard bool
 
 	// Exists is set by `field:*`, asking whether the field has any value.
 	Exists bool

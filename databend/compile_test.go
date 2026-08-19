@@ -65,10 +65,42 @@ func TestCompile(t *testing.T) {
 			`match(msg, 'snapshoot', 'fuzziness=1')`},
 		{"bare tilde defaults to one edit", "snapshoot~",
 			`match(msg, 'snapshoot', 'fuzziness=1')`},
-		{"prefix wildcard maps to LIKE", "snapsh*",
-			`lower(msg) LIKE lower('snapsh%')`},
-		{"substring wildcard maps to LIKE", "*napsho*",
-			`lower(msg) LIKE lower('%napsho%')`},
+		// `snapsh*` asks for a TOKEN beginning with snapsh. Anchoring the
+		// pattern at character 0 of the whole message answers a different
+		// question (1,019 rows against 17,595 for the bare token) and so does
+		// opening both ends of a LIKE, which lets the star run across word
+		// boundaries: as '%reg%on%', `reg*on` is exactly RLIKE 'reg.*on' —
+		// 21,278 rows against 17,082 for the token reading, and 899 of them
+		// contain no word matching reg…on at all.
+		{"a token prefix is a token, not a substring", "snapsh*",
+			`lower(msg) RLIKE '(^|[^a-z0-9])snapsh[a-z0-9]*([^a-z0-9]|$)'`},
+		{"a token suffix is not the same pattern as a prefix", "*egion",
+			`lower(msg) RLIKE '(^|[^a-z0-9])[a-z0-9]*egion([^a-z0-9]|$)'`},
+		{"stars on both ends stay inside one token", "*napsho*",
+			`lower(msg) RLIKE '(^|[^a-z0-9])[a-z0-9]*napsho[a-z0-9]*([^a-z0-9]|$)'`},
+		{"a mid-token wildcard is a pattern, not a truncation", "reg*on",
+			`lower(msg) RLIKE '(^|[^a-z0-9])reg[a-z0-9]*on([^a-z0-9]|$)'`},
+		{"a question mark inside a token is one token character", "snapsh?t",
+			`lower(msg) RLIKE '(^|[^a-z0-9])snapsh[a-z0-9]t([^a-z0-9]|$)'`},
+		// A pattern carrying characters the tokenizer splits on cannot be one
+		// token, so the token reading would be meaningless and the substring
+		// reading is kept — with a warning that says which one was used.
+		{"a pattern that spans tokens stays a substring", "*0.0.0.0:8686/playground*",
+			`lower(msg) LIKE lower('%0.0.0.0:8686/playground%')`},
+		{"a hyphenated pattern spans tokens too", "tikv-tikv-*",
+			`lower(msg) LIKE lower('%tikv-tikv-%')`},
+		// A plain column is a different question: `pod:tikv*` really does mean
+		// "the value starts with tikv", so it stays anchored.
+		{"a wildcard on a plain column stays anchored", "pod:tikv*",
+			`lower(pod) LIKE lower('tikv%')`},
+		{"a question mark is one character", "pod:a?b",
+			`lower(pod) LIKE lower('a_b')`},
+		// The ordering that makes the two distinguishable: escaping first,
+		// then the wildcard translation.
+		{"a literal underscore is not a single-character wildcard", "pod:a_b",
+			`lower(pod) = lower('a_b')`},
+		{"wildcard and literal underscore in one value", "pod:a?b_c",
+			`lower(pod) LIKE lower('a_b\\_c')`},
 
 		// --- existence and ranges ---
 		{"existence", "pod:*", `(pod IS NOT NULL AND pod <> '')`},
@@ -136,8 +168,16 @@ func TestCompile(t *testing.T) {
 		{"half-open range", "ts:[2026-08-18 TO *}", `ts >= '2026-08-18'`},
 		{"numeric range casts through the VARIANT", "store_id:[1 TO 100]",
 			`kv['store_id']::VARCHAR::DOUBLE BETWEEN 1 AND 100`},
+		// A bag key present with an empty value still exists, so an existence
+		// test on a VARIANT key asks about the key and not about the value.
+		// `<> ''` on kv['rest'] denies 100,635 rows that do have the key.
 		{"unbounded both ways is existence", "store_id:[* TO *]",
-			`(kv['store_id']::VARCHAR IS NOT NULL AND kv['store_id']::VARCHAR <> '')`},
+			`kv['store_id'] IS NOT NULL`},
+		{"existence on a bag key ignores the empty value", "rest:*",
+			`kv['rest'] IS NOT NULL`},
+		// A real column keeps the other reading: an empty level is not a level.
+		{"existence on a real column excludes the empty string", "level:*",
+			`(level IS NOT NULL AND level <> '')`},
 
 		// --- regex and boost ---
 		{"regex compiles to RLIKE", "msg:/peer.*status/", `msg RLIKE 'peer.*status'`},
@@ -168,7 +208,7 @@ func TestCompile(t *testing.T) {
 		// literal, then the SQL literal doubles the backslash. The final
 		// trailing `%` is the wildcard from the user's `*`.
 		{"literal percent is not a wildcard", "100%*",
-			`lower(msg) LIKE lower('100\\%%')`},
+			`lower(msg) LIKE lower('%100\\%%')`},
 	}
 
 	for _, tc := range cases {
@@ -202,38 +242,38 @@ func TestEmptySearchEmitsNoMatch(t *testing.T) {
 	}
 }
 
-// score() is rejected without a match(), so a relevance panel must return no
-// rows on an empty box rather than every row.
+// score() is rejected without a search function, so the score expression — not
+// the predicate — is what has to become conditional. The predicate must survive
+// intact whatever the search was.
 func TestCompileScore(t *testing.T) {
 	s := K8sLogs()
 
-	// `1=0` is NOT sufficient: the binder looks for a search function anywhere
-	// in the statement, and score() sits in the select list. Verified live —
-	// `SELECT score() ... WHERE 1=0` still returns [1065]. So an empty search
-	// must emit a search function that matches nothing.
-	want := "match(msg, '" + ScoreSentinel + "')"
+	for _, q := range []string{"", "level:error", "component:tikv", "snapsh*", "-tiflash"} {
+		pred, err := CompileScore(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		plain, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		// The defect this replaces: CompileScore overwrote SQL with a
+		// match-nothing sentinel, so the whole filter was discarded and the
+		// panel came back empty for every structured-only search.
+		if pred.SQL != plain.SQL {
+			t.Errorf("CompileScore(%q) changed the predicate: %s, want %s", q, pred.SQL, plain.SQL)
+		}
 
-	empty, err := CompileScore("", s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if empty.SQL != want {
-		t.Errorf("empty score predicate = %s, want %s", empty.SQL, want)
-	}
-	if !empty.UsesMatch {
-		t.Error("empty score predicate must still count as using a search function")
-	}
-
-	// A structured-only query has no search function either, so it takes the
-	// same path.
-	structured, err := CompileScore("level:error", s)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if structured.SQL != want {
-		t.Errorf("structured-only score predicate = %s, want %s", structured.SQL, want)
+		expr, err := CompileScoreExpr(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if expr.SQL != "0" {
+			t.Errorf("CompileScoreExpr(%q) = %s, want 0 — there is no search function to rank", q, expr.SQL)
+		}
 	}
 
+	// With a full-text term the ranking is real and both halves say so.
 	withText, err := CompileScore("snapshot", s)
 	if err != nil {
 		t.Fatal(err)
@@ -241,33 +281,220 @@ func TestCompileScore(t *testing.T) {
 	if withText.SQL != `query('msg:snapshot')` {
 		t.Errorf("text score predicate = %s", withText.SQL)
 	}
+	expr, err := CompileScoreExpr("snapshot", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expr.SQL != "score()" {
+		t.Errorf("score expression = %s, want score()", expr.SQL)
+	}
+
+	// A fuzzy term ranks, but every row scores exactly 1.0, so the ordering is
+	// meaningless and the only honest response is to say so.
+	fuzzy, err := CompileScoreExpr("snapshoot~1", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fuzzy.SQL != "score()" {
+		t.Errorf("fuzzy score expression = %s", fuzzy.SQL)
+	}
+	if !hasWarning(fuzzy.Warnings, "constant 1.0") {
+		t.Errorf("a fuzzy ranking must warn that it is constant: %v", fuzzy.Warnings)
+	}
+}
+
+func TestWarningComment(t *testing.T) {
+	if got := WarningComment(nil); got != "" {
+		t.Errorf("no warnings must render no comment, got %q", got)
+	}
+	// A warning that closed the comment early would splice the rest of itself
+	// into the statement.
+	got := WarningComment([]string{"a */ DROP TABLE x --", "b"})
+	if strings.Contains(got, "*/ DROP") {
+		t.Errorf("comment terminator not neutralised: %s", got)
+	}
+	if !strings.HasPrefix(got, "/* lake-search: ") || !strings.HasSuffix(got, " */") {
+		t.Errorf("malformed comment: %s", got)
+	}
+
+	// The opener is the other half, and it was open. On an engine that nests
+	// block comments the inner `/*` swallows the first `*/`, leaving the outer
+	// comment unclosed and eating the rest of the statement.
+	got = WarningComment([]string{"a /* b"})
+	if strings.Contains(got, "/* b") {
+		t.Errorf("nested comment opener not neutralised: %s", got)
+	}
+	if strings.Count(got, "/*") != 1 || strings.Count(got, "*/") != 1 {
+		t.Errorf("a rendered comment must open and close exactly once: %s", got)
+	}
+	if strings.ContainsAny(WarningComment([]string{"a\r\nb"}), "\r\n") {
+		t.Error("a warning must render on one line")
+	}
+
+	// Both sequences are reachable from the search box, which is the point:
+	// warning text quotes the user's value verbatim. `msg:"/*"` is a phrase
+	// the analyzer keeps no tokens of, so the collapsed-phrase warning quotes
+	// it straight back.
+	for _, q := range []string{`msg:"/*"`, `msg:"*/"`, `msg:"a */ b /* c"`} {
+		r, err := CompileString(q, K8sLogs())
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		c := WarningComment(r.Warnings)
+		if c == "" {
+			// Nothing to render. `a */ b /* c` keeps the tokens a, b and c, so
+			// it compiles through query() and the user's text is never quoted
+			// back into a warning — the sequences never reach a comment at all.
+			continue
+		}
+		if strings.Count(c, "/*") != 1 || strings.Count(c, "*/") != 1 {
+			t.Errorf("%q produced an escapable comment: %s", q, c)
+		}
+	}
+
+	// Assert commentSafe's property directly as well, so the test does not
+	// depend on which constructs happen to quote the user's value back today.
+	// Any future warning that embeds hostile text is covered by this.
+	//
+	// The interleaved spellings are the ones that pin the ORDER of the two
+	// replacements. `*/` is neutralised first and `/*` second, so a `/*`
+	// created by the first pass is still caught: `*/*` becomes `* /*` after
+	// pass one and `* / *` after pass two. Swap the passes and `*/*` renders
+	// as `* /*` with a live comment opener in it. Each of these carries the
+	// two sequences overlapping in a different arrangement.
+	for _, w := range []string{
+		`a */ b /* c`, `*/*`, `/*/`, `*//*`, `/**/`, `**//`, `*/ /*`,
+	} {
+		c := WarningComment([]string{w})
+		if strings.Count(c, "/*") != 1 || strings.Count(c, "*/") != 1 {
+			t.Errorf("hostile warning text %q escaped the comment: %s", w, c)
+		}
+		if inner := strings.TrimSuffix(strings.TrimPrefix(c, "/* lake-search: "), " */"); strings.Contains(inner, "*/") || strings.Contains(inner, "/*") {
+			t.Errorf("hostile warning text %q left a live sequence in the body: %s", w, c)
+		}
+	}
+}
+
+// The VARIANT key-case warning states an asymmetry, and it used to state it
+// with a number: "kv['tableid'] is 0 rows where kv['tableID'] is 1,365". The
+// table only grows, so that constant was true at one bound on one afternoon
+// and measured 4,403 two hours later — and the sentence's plain reading, how
+// many rows carry the key at all, was a different quantity again. A warning
+// that ships a decaying count is wrong by construction.
+func TestVariantKeyWarningCarriesNoCount(t *testing.T) {
+	s := K8sLogs()
+	for _, q := range []string{"tableID:574", "tableID:>1", "tableID:[1 TO 9]"} {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if !hasWarning(r.Warnings, "matched EXACTLY, case included") {
+			t.Errorf("%q must warn about the key case: %v", q, r.Warnings)
+		}
+		for _, w := range r.Warnings {
+			if !strings.Contains(w, "VARIANT") {
+				continue
+			}
+			if strings.ContainsAny(w, "0123456789") {
+				t.Errorf("the VARIANT warning must carry no row count: %q", w)
+			}
+		}
+	}
+}
+
+// hasWarning reports whether any warning contains the given fragment.
+func hasWarning(warnings []string, fragment string) bool {
+	for _, w := range warnings {
+		if strings.Contains(w, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func TestWarnings(t *testing.T) {
 	s := K8sLogs()
 
-	// The reference table carries an NGRAM index on msg, so a wildcard there is
-	// index-backed and warning about a full scan would be false.
+	// A token wildcard compiles to a word-boundary RLIKE, which neither the
+	// inverted nor the NGRAM index serves, so the full-scan warning is true
+	// here whatever indexes are declared — and the semantic half must say
+	// which reading was taken, because the two readings differ by 21% of the
+	// window on `reg*on`.
 	r, err := CompileString("snapsh*", s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Warnings) != 0 {
-		t.Errorf("no warning expected while an NGRAM index is declared, got %v", r.Warnings)
+	if !hasWarning(r.Warnings, "matched as ONE token") {
+		t.Errorf("a token wildcard must say it is a token match, got %v", r.Warnings)
+	}
+	if !hasWarning(r.Warnings, "full scan") {
+		t.Errorf("RLIKE is served by no index here and must say so, got %v", r.Warnings)
 	}
 
-	// Undeclaring the index brings the warning back, but changes no SQL.
-	sql := r.SQL
-	s.Fields["msg"] = Field{Column: "msg", Kind: Text}
-	r, err = CompileString("snapsh*", s)
+	// A pattern that cannot be one token keeps the substring reading, and the
+	// warning has to name *that* reading rather than the token one — the
+	// complaint the old text drew was that it disclosed only the widening at
+	// the left edge and never that the match can span the whole line.
+	r, err = CompileString("tikv-tikv-*", s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(r.Warnings) == 0 {
+	if !hasWarning(r.Warnings, "UNANCHORED SUBSTRING") {
+		t.Errorf("a substring wildcard must say it is a substring, got %v", r.Warnings)
+	}
+	if !hasWarning(r.Warnings, "crosses word boundaries") {
+		t.Errorf("the substring warning must name the over-match, got %v", r.Warnings)
+	}
+	// The reference table carries an NGRAM index, which does serve LIKE.
+	if hasWarning(r.Warnings, "full scan") {
+		t.Errorf("no full-scan warning expected on the LIKE path while NGRAM is declared, got %v", r.Warnings)
+	}
+
+	// Undeclaring the index brings the full-scan warning back, but changes no SQL.
+	sql := r.SQL
+	s.Fields["msg"] = Field{Column: "msg", Kind: Text}
+	r, err = CompileString("tikv-tikv-*", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasWarning(r.Warnings, "full scan") {
 		t.Error("wildcard on a column with no NGRAM index should warn about the full scan")
 	}
 	if r.SQL != sql {
 		t.Errorf("declaring an index must not change the SQL:\n got %s\nwant %s", r.SQL, sql)
+	}
+}
+
+// A token wildcard and a substring wildcard are different questions, and the
+// syntax has to be able to tell them apart. Emitted as LIKE with both ends
+// open, `*region`, `region*` and `*region*` were all '%region%': three
+// spellings, one answer, and no way to ask for a suffix. Measured over the
+// frozen window the three readings are 16,886 / 20,147 / 20,158.
+func TestWildcardReadingsAreDistinct(t *testing.T) {
+	s := K8sLogs()
+	seen := map[string]string{}
+	for _, q := range []string{"*region", "region*", "*region*", "reg*on"} {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if prev, ok := seen[r.SQL]; ok {
+			t.Errorf("%q and %q compile to the same predicate %s", prev, q, r.SQL)
+		}
+		seen[r.SQL] = q
+	}
+
+	// tokenWildcard is the guard that keeps tokenPattern from emitting live
+	// regex metacharacters. If it ever admits one, `a.b*` would match "axb".
+	for _, v := range []string{"reg*on", "snapsh?t", "abc", "A1*"} {
+		if !tokenWildcard(v) {
+			t.Errorf("%q is a token pattern", v)
+		}
+	}
+	for _, v := range []string{"a.b*", "tikv-tikv-*", "100%*", "*0.0.0.0:8686/x*", "", "a b*"} {
+		if tokenWildcard(v) {
+			t.Errorf("%q is not a token pattern", v)
+		}
 	}
 }
 
@@ -350,14 +577,15 @@ func TestAntiJoinSearchFunctionIsNotTheOuterOne(t *testing.T) {
 		t.Errorf("got %s", r.SQL)
 	}
 
-	// score() is bound against the outer scan only, so a purely negative
-	// search still needs the sentinel.
-	neg, err := CompileScore("-tiflash", s)
+	// score() is bound against the outer scan only — the binder does not see
+	// through the anti-join subquery — so a purely negative search ranks 0
+	// rather than erroring, and keeps its predicate.
+	neg, err := CompileScoreExpr("-tiflash", s)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if neg.SQL != "match(msg, '"+ScoreSentinel+"')" {
-		t.Errorf("score() over a purely negative search must fall back to the sentinel: %s", neg.SQL)
+	if neg.SQL != "0" {
+		t.Errorf("score() over a purely negative search must be a constant: %s", neg.SQL)
 	}
 }
 
@@ -500,6 +728,441 @@ func TestTrailingMarkers(t *testing.T) {
 		}
 		if got.SQL != want {
 			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, got.SQL, want)
+		}
+	}
+}
+
+// The index on msg declares `filters = 'english_stop'`, and the filter runs
+// over the query as well as the document: the word is deleted before the index
+// is consulted, so the clause matches nothing and nothing is raised. All 33
+// words were checked individually against the live index — every one returns 0
+// through query() — while the two controls that are not on the list return real
+// counts, `from` 93,645 and `replica` 1,743.
+func TestStopWords(t *testing.T) {
+	s := K8sLogs()
+	const noPattern = `lower(msg) RLIKE '(^|[^a-z0-9])no([^a-z0-9]|$)'`
+
+	cases := map[string]string{
+		// 130,002 rows contain the word `to`; query('msg:to') returns 0.
+		"to":   `lower(msg) RLIKE '(^|[^a-z0-9])to([^a-z0-9]|$)'`,
+		"no":   noPattern,
+		"NO":   noPattern, // the set is matched case-insensitively
+		`"no"`: noPattern, // a one-word phrase is the token
+		// An ordinary word must keep going through the index, or every query
+		// containing one becomes a needless full scan.
+		"from": `query('msg:from')`,
+		// A pattern is not analyzed, so a stopword with a wildcard stays a
+		// pattern — a token pattern, which is the same word-boundary device
+		// with a token-character run on the end. As a substring it was 177,913
+		// rows over the frozen window against 136,162 for the token reading.
+		"to*": `lower(msg) RLIKE '(^|[^a-z0-9])to[a-z0-9]*([^a-z0-9]|$)'`,
+	}
+	for q, want := range cases {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL != want {
+			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, r.SQL, want)
+		}
+	}
+
+	// The negative case needs no code of its own: once a stopword leaf is a
+	// SQL fragment, compiler.not already null-safes it. Measured, `replica -no`
+	// is 87 rows and `replica no` is 1,656, which add to the 1,743 of
+	// `replica`; before the fix the negated clause evaporated and `replica -no`
+	// returned all 1,743.
+	r, err := CompileString("replica -no", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := `(query('msg:replica') AND COALESCE(NOT (` + noPattern + `), TRUE))`
+	if r.SQL != want {
+		t.Errorf("excluding a stopword\n got: %s\nwant: %s", r.SQL, want)
+	}
+	if !hasWarning(r.Warnings, "stopword") {
+		t.Errorf("a stopword rewrite must say so: %v", r.Warnings)
+	}
+
+	// A column with no declared filter must not take the branch at all.
+	plain := Schema{Default: "msg", Fields: map[string]Field{"msg": {Column: "msg", Kind: Text}}}
+	r, err = CompileString("to", plain)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.SQL != `query('msg:to')` {
+		t.Errorf("no declared stopword filter means no rewrite: %s", r.SQL)
+	}
+}
+
+// A value is a value whatever it spells. Lexed as an operator, `msg:not` had
+// nowhere to go: parseFieldValue has no case for tokNot, the leaf vanished and
+// the whole query compiled to match-everything — 449,893 rows against a true
+// 22,850. It has to land with the stopword fix, because `and`, `or` and `not`
+// are all on the stop list too and fixing either alone still returns a wrong
+// answer.
+func TestOperatorWordInValuePosition(t *testing.T) {
+	s := K8sLogs()
+	const wbNot = `lower(msg) RLIKE '(^|[^a-z0-9])not([^a-z0-9]|$)'`
+	const wbAnd = `lower(msg) RLIKE '(^|[^a-z0-9])and([^a-z0-9]|$)'`
+	const wbOr = `lower(msg) RLIKE '(^|[^a-z0-9])or([^a-z0-9]|$)'`
+
+	cases := map[string]string{
+		"msg:not":   wbNot,
+		"msg:and":   wbAnd,
+		"level:not": `lower(level) = lower('not')`,
+
+		// --- the forms the colon rule cannot reach ---
+		//
+		// A field-scoped group is value position too, and a query that is
+		// nothing but an operator word has no operator position at all. Every
+		// one of these used to lose its only filter: `msg:(not)`, `msg:(and)`
+		// and a bare `not` all compiled to 1=1 — 449,893 rows over the frozen
+		// window against 22,850 — and `msg:(peer AND not)` dropped the second
+		// clause, returning `peer`'s 109,950 against a true 297. Worst of all,
+		// `msg:(not ready)` became an anti-join over `ready` and returned the
+		// COMPLEMENT of what was asked, 447,573 rows against 1,855.
+		//
+		// The rule is context-sensitive, not case-driven: a boolean word is
+		// an operator only where an operator of its arity is GRAMMATICAL —
+		// infix `and`/`or`/`&&`/`||` need an operand on their left, prefix
+		// NOT needs one on its right — and NOT alone additionally needs the
+		// uppercase spelling, because it INVERTS the term it takes while the
+		// others only join terms that keep their own meaning either way.
+		"msg:(not)":          wbNot,
+		"msg:(and)":          wbAnd,
+		"msg:(NOT)":          wbNot,
+		"msg:(AND)":          wbAnd,
+		"not":                wbNot,
+		"NOT":                wbNot,
+		"and":                wbAnd,
+		"AND":                wbAnd,
+		"or":                 wbOr,
+		"OR":                 wbOr,
+		"msg:(peer AND not)": `(query('msg:peer') AND ` + wbNot + `)`,
+		"msg:(peer AND NOT)": `(query('msg:peer') AND ` + wbNot + `)`,
+		"msg:(not ready)":    `(` + wbNot + ` AND query('msg:ready'))`,
+		"not ready":          `(` + wbNot + ` AND query('msg:ready'))`,
+
+		// The operators themselves must keep working in operator position.
+		"a NOT b": `(lower(msg) RLIKE '(^|[^a-z0-9])a([^a-z0-9]|$)' AND ` +
+			`COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('msg:b')), TRUE))`,
+		"peer AND status":       `query('(msg:peer) AND (msg:status)')`,
+		"peer OR status":        `query('(msg:peer) OR (msg:status)')`,
+		"peer && status":        `query('(msg:peer) AND (msg:status)')`,
+		"peer || status":        `query('(msg:peer) OR (msg:status)')`,
+		"NOT tiflash":           `COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('msg:tiflash')), TRUE)`,
+		"level:(error OR warn)": `(lower(level) = lower('error') OR lower(level) = lower('warn'))`,
+		// A trailing AND is someone mid-keystroke: drop it, keep the term.
+		// A trailing NOT has no such reading — there is nothing to negate, so
+		// the word is what was typed.
+		"peer AND": `query('msg:peer')`,
+		"peer OR":  `query('msg:peer')`,
+
+		// --- the case half of the rule, both directions ---
+		//
+		// Lowercase `and` and `or` in infix position are operators. Making
+		// them values instead is Lucene's documented rule and it is wrong
+		// here: it turned `snapshot or peer` into a three-word conjunction
+		// and `level:(error or warn)` into level='error' AND level='or' AND
+		// level='warn', which is a structural contradiction on a
+		// single-valued column and returns 0 rows forever.
+		"peer or status":        `query('(msg:peer) OR (msg:status)')`,
+		"peer and status":       `query('(msg:peer) AND (msg:status)')`,
+		"peer Or status":        `query('(msg:peer) OR (msg:status)')`,
+		"peer aNd status":       `query('(msg:peer) AND (msg:status)')`,
+		"level:(error or warn)": `(lower(level) = lower('error') OR lower(level) = lower('warn'))`,
+		"msg:(peer or status)":  `query('(msg:peer) OR (msg:status)')`,
+
+		// Lowercase `not` in the SAME grammatical position is a value,
+		// because a negation read off an ambiguous English word hands back
+		// the complement of the table. The uppercase spelling still negates.
+		"peer not status": `(query('(msg:peer) AND (msg:status)') AND ` + wbNot + `)`,
+		"peer NOT status": `query('(msg:peer) NOT (msg:status)')`,
+		"msg:(NOT ready)": `COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('msg:ready')), TRUE)`,
+
+		// A leading infix operator will never acquire a left operand, so it
+		// is the word; a trailing one is mid-keystroke, so it is dropped.
+		"or peer":       `(` + wbOr + ` AND query('msg:peer'))`,
+		"and peer":      `(` + wbAnd + ` AND query('msg:peer'))`,
+		"peer or":       `query('msg:peer')`,
+		"peer and":      `query('msg:peer')`,
+		"msg:(or peer)": `(` + wbOr + ` AND query('msg:peer'))`,
+
+		// The symbols have no case, so only position can disqualify them.
+		// (`peer && status` and `peer || status` are pinned above, in the
+		// operator-position block.)
+		"&& peer": `query('(msg:"&&") AND (msg:peer)')`,
+		"|| peer": `query('(msg:"||") AND (msg:peer)')`,
+
+		// Quotes are unconditional: neither position nor spelling applies.
+		`"not" ready`: `(` + wbNot + ` AND query('msg:ready'))`,
+		`"or" peer`:   `(` + wbOr + ` AND query('msg:peer'))`,
+	}
+	for q, want := range cases {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL != want {
+			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, r.SQL, want)
+		}
+		if r.SQL == MatchAll {
+			t.Errorf("%q compiled to match-everything: the filter is gone, not wrong", q)
+		}
+	}
+
+	// Silence was half the defect: the row count was wrong AND nothing said
+	// the word had been read as anything other than what was typed.
+	for _, q := range []string{"not", "msg:(and)", "msg:(peer AND not)"} {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if !hasWarning(r.Warnings, "not applied as a boolean operator") {
+			t.Errorf("%q must say the word was searched for, not applied: %v", q, r.Warnings)
+		}
+	}
+}
+
+func TestPhraseThatLosesItsTokens(t *testing.T) {
+	s := K8sLogs()
+	cases := map[string]string{
+		// One token survives: the token keeps the index (and its stemming),
+		// the residual scan checks the adjacency the quotes asked for.
+		`"not ready"`:   `(query('msg:ready') AND lower(msg) LIKE lower('%not ready%'))`,
+		`"the leader"`:  `(query('msg:leader') AND lower(msg) LIKE lower('%the leader%'))`,
+		`"[pd]"`:        `(query('msg:pd') AND lower(msg) LIKE lower('%[pd]%'))`,
+		`"not ready"~2`: `(query('msg:ready') AND lower(msg) LIKE lower('%not ready%'))`,
+		// No token survives: nothing for the index to match, so the scan is
+		// the whole answer and no search function is spent.
+		`"not the"`: `lower(msg) LIKE lower('%not the%')`,
+		// Two or more surviving tokens and the phrase works as written.
+		`"peer status"`:      `query('msg:"peer status"')`,
+		`"fail to get peer"`: `query('msg:"fail to get peer"')`,
+		// Not a phrase, so not this branch — one token is what a term IS.
+		"peer": `query('msg:peer')`,
+
+		// --- the branch must not fire on a phrase the analyzer leaves alone ---
+		//
+		// This is where the token-count test was wrong. `"snapshots"` keeps
+		// its one token and lost nothing, so the index answers it correctly
+		// and stems it: query('msg:"snapshots"') is 17,595 rows over the
+		// frozen window where lower(msg) LIKE '%snapshots%' is 9, a 1,955x
+		// under-match. `""` destroys nothing either, and as '%%' it returned
+		// the whole table against a correct 0.
+		`"snapshots"`: `query('msg:"snapshots"')`,
+		`"regions"`:   `query('msg:"regions"')`,
+		`"region"`:    `query('msg:"region"')`,
+		`""`:          `query('msg:""')`,
+	}
+	for q, want := range cases {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL != want {
+			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, r.SQL, want)
+		}
+	}
+
+	// A phrase the analyzer leaves intact must raise nothing about being cut
+	// down — the old text said `"snapshots"` "loses all but 1 token" when it
+	// lost none, which is a false statement of fact shipped to the reader.
+	r, err := CompileString(`"snapshots"`, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "token") {
+			t.Errorf("an intact phrase must not be described as losing tokens: %q", w)
+		}
+	}
+
+	// A star inside quotes is not a wildcard and the silence was the defect:
+	// the analyzer splits the phrase at the star, so `"peer stat*"` becomes the
+	// phrase "peer stat" and returns 0 rows on two disjoint windows where
+	// `peer status` returns 88,441 and 38,076. A `?` is punctuation the same
+	// way and is harmless — query('msg:"peer status?"') is 88,441, identical to
+	// the clean phrase — so it must not raise anything.
+	r, err = CompileString(`"peer stat*"`, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasWarning(r.Warnings, "inside quotes is not a wildcard") {
+		t.Errorf("a star inside a phrase must be explained: %v", r.Warnings)
+	}
+	r, err = CompileString(`"peer status?"`, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasWarning(r.Warnings, "inside quotes is not a wildcard") {
+		t.Errorf("a question mark in a phrase is harmless punctuation: %v", r.Warnings)
+	}
+
+	// The collapsed one says which token survived and what is checking the rest.
+	r, err = CompileString(`"not ready"`, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasWarning(r.Warnings, `cut down to the single token "ready"`) {
+		t.Errorf("a collapsed phrase must name the surviving token: %v", r.Warnings)
+	}
+
+	// The residual is sound under every boolean, which is what lets the token
+	// ride along at all. Under AND it merges into the one query() call; under
+	// OR and under a negation it would wrongly filter the other side, so the
+	// leaf falls back to the scan alone — measured, the same rows either way.
+	shapes := map[string]string{
+		`"not ready" peer`:     `(query('(msg:ready) AND (msg:peer)') AND lower(msg) LIKE lower('%not ready%'))`,
+		`"not ready" -tiflash`: `(query('(msg:ready) NOT (msg:tiflash)') AND lower(msg) LIKE lower('%not ready%'))`,
+		`"not ready" OR peer`:  `(lower(msg) LIKE lower('%not ready%') OR query('msg:peer'))`,
+		`-"not ready"`:         `COALESCE(NOT (lower(msg) LIKE lower('%not ready%')), TRUE)`,
+	}
+	for q, want := range shapes {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL != want {
+			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, r.SQL, want)
+		}
+	}
+}
+
+// One instant is one value even though it contains a space, and a bound that is
+// not a complete instant is refused rather than rounded off. Both halves have
+// to land together: a half-consumed value would otherwise become a silently
+// widened window instead of an error.
+func TestTimestampBounds(t *testing.T) {
+	s := K8sLogs()
+	ok := map[string]string{
+		"ts:>2026-08-18 22:30:00":           `ts > '2026-08-18 22:30:00'`,
+		`ts:>"2026-08-18 22:30:00"`:         `ts > '2026-08-18 22:30:00'`,
+		"ts:>=2026-08-18 22:30":             `ts >= '2026-08-18 22:30'`,
+		"ts:>2026-08-18 22:30:00.123+05:30": `ts > '2026-08-18 22:30:00.123+05:30'`,
+		"ts:>2026-08-18 22:30:00Z":          `ts > '2026-08-18 22:30:00Z'`,
+		"ts:>2026-08-18T22:30:00Z":          `ts > '2026-08-18T22:30:00Z'`,
+		"ts:>2026-08-18":                    `ts > '2026-08-18'`,
+		// No comparison operator and no date in front of it, so the clock is
+		// an ordinary term: both conditions that keep the glue narrow are
+		// doing work.
+		"error 22:30:00": `query('(msg:error) AND (msg:"22:30:00")')`,
+	}
+	for q, want := range ok {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL != want {
+			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, r.SQL, want)
+		}
+	}
+
+	// `ts > '2026-08-18T22'` is accepted by the engine and read as 22:00:00 —
+	// measured 129,009 rows against 70,681 for the 22:30 being typed. There is
+	// no safe guess between "they meant 22:00" and "the lexer ate the rest".
+	//
+	// The space spellings matter more than the T ones, because the space form
+	// is what the compiler's own error message recommends — and it was the one
+	// the guard could not see. `ts:>2026-08-18 22` split at the space and
+	// compiled to `(ts > '2026-08-18' AND query('msg:22'))`: 3,779 rows over
+	// the frozen window against the 129,009 of the bound being typed, with the
+	// statement's one search function spent on a fragment of a timestamp. Both
+	// spellings now take the same route to the same error.
+	for _, q := range []string{
+		"ts:>2026-08-18T22", "ts:>2026-08-18T22:3", "ts:>2026-08",
+		"ts:>2026-08-18 22", "ts:>2026-08-18 22:3", "ts:>2026-08-18 22:30:0",
+		// A run that does not end at a word boundary is not a clock either,
+		// and gluing it on is what turns it into a refusal rather than a
+		// silently different query.
+		"ts:>2026-08-18 22:30:00abc",
+		"ts:>garbage", "ts:[2026-08-18T22 TO *]", "ts:[2026-08-18 22 TO 2026-08-19]",
+	} {
+		if _, err := CompileString(q, s); err == nil {
+			t.Errorf("%q: a bound that is not a complete instant must be refused", q)
+		}
+	}
+
+	// The glue must not reach past a clock-shaped run. A word after a date
+	// bound is an ordinary term, and both terms have to survive.
+	r, err := CompileString("ts:>2026-08-18 peer", s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.SQL != `(ts > '2026-08-18' AND query('msg:peer'))` {
+		t.Errorf("a word after a date bound is a term, not a clock: %s", r.SQL)
+	}
+}
+
+// TimeZone is off by default, because pinning the input while the engine still
+// renders ts in the session zone trades one mismatch for another. When it is
+// set, a bare date has to be expanded to midnight first: the engine parses
+// '2026-08-18 00:00:00+00:00' and rejects '2026-08-18+00:00'.
+func TestTimeZonePinning(t *testing.T) {
+	s := K8sLogs()
+	if r, _ := CompileString("ts:>2026-08-18", s); r.SQL != `ts > '2026-08-18'` {
+		t.Errorf("the default must leave literals as typed: %s", r.SQL)
+	}
+
+	s.TimeZone = "+00:00"
+	cases := map[string]string{
+		"ts:>2026-08-18":                `ts > '2026-08-18 00:00:00+00:00'`,
+		"ts:>2026-08-18 22:30:00":       `ts > '2026-08-18 22:30:00+00:00'`,
+		"ts:>2026-08-18T22:30:00Z":      `ts > '2026-08-18T22:30:00Z'`, // already zoned, left alone
+		"ts:>2026-08-18T22:30:00+05:30": `ts > '2026-08-18T22:30:00+05:30'`,
+	}
+	for q, want := range cases {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL != want {
+			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, r.SQL, want)
+		}
+	}
+}
+
+// A quoted token followed immediately by a colon is a field name. Nine keys in
+// the reference table contain a space, and no syntax reached any of them:
+// `"msg type":MsgRequestVote` became a phrase plus a search for the literal
+// token `:MsgRequestVote`, 0 rows, filter gone.
+func TestQuotedFieldName(t *testing.T) {
+	s := K8sLogs()
+	cases := map[string]string{
+		`"msg type":MsgRequestVote`: `lower(kv['msg type']::VARCHAR) = lower('MsgRequestVote')`,
+		`"msg type":*`:              `kv['msg type'] IS NOT NULL`,
+		// A quoted token with no colon after it is still a phrase.
+		`"peer status"`: `query('msg:"peer status"')`,
+		// A space before the colon means it is not a separator.
+		`"peer status" component:tikv`: `(query('msg:"peer status"') AND lower(component) = lower('tikv'))`,
+	}
+	for q, want := range cases {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL != want {
+			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", q, r.SQL, want)
+		}
+	}
+}
+
+// A leaf that produces nothing must not truncate the conjunction around it.
+// `level:> peer` compiled to 1=1 — the whole table, silently — because the
+// half-typed bound took the real search term with it.
+func TestEmptyLeafDoesNotTruncateTheConjunction(t *testing.T) {
+	s := K8sLogs()
+	for _, q := range []string{"level:> peer", "* peer", "peer level:>", "peer * status"} {
+		r, err := CompileString(q, s)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if r.SQL == MatchAll {
+			t.Errorf("%q compiled to match-everything; the surviving terms were dropped", q)
+		}
+		if !strings.Contains(r.SQL, "msg:peer") {
+			t.Errorf("%q lost its search term: %s", q, r.SQL)
 		}
 	}
 }

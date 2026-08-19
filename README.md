@@ -78,11 +78,25 @@ returns nothing:
 | What you type | What Databend does | What you conclude |
 | --- | --- | --- |
 | `snapshot~1` | `~1` is not understood; **0 rows** | "there are no matches" |
-| `snapsh*` | `*` is silently ignored; **0 rows** | "prefix search is broken" |
-| `snapshot*` | `*` ignored, stem matches; **full result set** | "prefix search works!" |
+| `snapsh*` | the term is **truncated at the star**, and `snapsh` is not a token; **0 rows** | "prefix search is broken" |
+| `snapshot*` | truncated to `snapshot`, which *is* a token; **full result set** | "prefix search works!" |
+| `reg*on` | truncated at the star, so this searches for `reg`; **36 rows, none about regions** | "there were 36 region events" |
+| `pod:tikv-??????` | `?` is not a wildcard, it is compared literally; **0 rows** | "no pods match" |
+| `no`, `not`, `to`, `is` | 33 English stopwords are deleted from the query; **0 rows** | "the word isn't in the logs" |
+| `"not ready"` | the phrase loses `not` and stops being a phrase; **9x too many rows** | "there are 2,320 of these" |
+| `"peer stat*"` | inside quotes the star is punctuation: the phrase splits there and `stat` is not a token; **0 rows** against 88,441 for `peer status` | "there are no peer status lines" |
+| `msg:not` | the value is read as an operator and the filter disappears; **every row** | "everything matches" |
 | `http://a.com` | the colon reads as a field selector; **0 rows** | "that URL isn't in the logs" |
 | `-absent_term` | the search function prunes the scan; **0 rows** | "nothing survives the exclusion" |
 | *(empty box)* | `match(col,'')` matches nothing; **0 rows** | "there are no logs" |
+
+Every row above is rewritten into SQL that answers the question that was asked, with one
+exception, and the exception is marked: `"peer stat*"` is **explained rather than rewritten**.
+Quotes and a wildcard ask for contradictory things — one says "these exact characters in this
+order", the other says "any token shaped like this" — and guessing which one was meant would be
+inventing a query nobody typed. The compiler says what the engine will do with it instead:
+measured on two disjoint windows, `"peer stat*"` returns 0 both times where `peer status` returns
+88,441 and 38,076.
 
 The exclusion row is the most quietly wrong, and it is the one a responder is most likely to hit:
 excluding a noise pattern that has stopped being emitted in the selected window empties the screen
@@ -107,15 +121,23 @@ and their disjunction 118,896 — the union to the row.
 | `-a -b` | De Morgan to `(col:a) OR (col:b)`, then excluded by anti-join — **not** a bare `NOT` |
 | `a OR -b` | De Morgan to `(b) NOT (a)`, then excluded the same way |
 | `term~2` | `match(col, 'term', 'fuzziness=2')` |
-| `pref*`, `*sub*` | `lower(col) LIKE lower('pref%')` |
+| `pref*`, `*sub*`, `a*b`, `a?b` on the text column | one **token**: `lower(col) RLIKE '(^\|[^a-z0-9])pref[a-z0-9]*([^a-z0-9]\|$)'`, `*` being any run of token characters and `?` exactly one. A star does not cross a word boundary — served as `LIKE '%reg%on%'`, `reg*on` is exactly `RLIKE 'reg.*on'` and 4,196 of its rows contain no word matching reg…on at all. It does not stem either, so the bare token still finds inflections the pattern does not |
+| a wildcard the tokenizer would split (`tikv-tikv-*`, `*0.0.0.0:8686/x*`) | `LIKE` — it cannot describe one token, so the substring reading is kept and the warning says which one was used |
+| `pod:tikv*`, `pod:a?b` on a plain column | `LIKE 'tikv%'`, `LIKE 'a_b'` — anchored, because on a value column a prefix really does mean "the value starts with" |
+| a stopword (`no`, `not`, `to`, …) | `lower(col) RLIKE '(^\|[^a-z0-9])no([^a-z0-9]\|$)'` — the index deletes these 33 words, so they are matched by scan |
+| `"a b"` the analyzer cuts to one token | `query('col:b')` **and** `lower(col) LIKE lower('%a b%')` — the token keeps the index and its stemming, the scan checks the adjacency the quotes asked for. A phrase the analyzer leaves alone, `"snapshots"` included, is untouched: it is 17,595 rows through the index against 9 as a substring, because the index stems |
+| `"a b"` the analyzer empties | `lower(col) LIKE lower('%a b%')` — nothing left for the index to match |
+| `and`, `or`, `not` — any case | an operator only where an operator is **grammatical**: `and`, `or`, `&&` and `\|\|` between two terms, `NOT` before a term. Anywhere else — the whole query, a field's value, the only thing inside a `field:(…)` group, leading with nothing to its left — it is the word the user typed, matched by a word-boundary scan; read as an operator there, `msg:(not)` and a bare `not` compiled to a filter that matched everything. `NOT` is the one that must be capitalised, because it **inverts** the term it takes while `and`/`or` only join terms that keep their own meaning either way: `msg:(not ready)` is the two words, `msg:(NOT ready)` is the complement of `ready` — 3,537 rows against 711,157 over `ts < '2026-08-19 08:00:00'` (715,185 rows). A *trailing* `and`/`or` is dropped rather than demoted — `region or` is someone mid-keystroke, so it still returns `region`. The cost of the word reading, stated rather than hidden: on a single-valued column `level:(error not warn)` is three ANDed equalities and can never match — write `level:(error -warn)` or `level:(error NOT warn)` |
 | `term^2` | `(col:term)^2` inside the one `query()` — reorders `score()`, matches the same rows |
 | `/re/`, `field:/re/` | `col RLIKE 're'` — not a search function, but no index serves it |
 | `field:value` | `lower(field) = lower('value')` — there is no case-insensitive `=` here |
 | `field:(a OR b)` | the group compiles under the field: SQL on a plain column, one `query()` on the text one |
 | `-field:value` | `COALESCE(NOT (…), TRUE)` — so `x` and `-x` partition the table |
 | `field:>100` | `field > 100` |
+| `ts:>2026-08-18 22:30:00` | one instant, space and all; a bound that is not a complete instant is a compile error, because the engine rounds it up to the top of the unit in silence |
 | `field:[a TO b]`, `{a TO b}`, `[a TO *]` | `field BETWEEN a AND b`, `>`/`<` — plain SQL, never inside `query()` |
-| `field:*` | `field IS NOT NULL AND field <> ''` |
+| `field:*` | `field IS NOT NULL AND field <> ''` on a real column; plain `kv['field'] IS NOT NULL` on a bag key, where a key present with an empty value still exists |
+| `"key with space":value` | a quoted name is a field name, so a bag key containing a space is reachable |
 | `+term` | consumed — adjacency already means AND, and the literal `+term` matches nothing |
 | `"a b"~N` | `query('col:"a b"~N')` — real proximity, `N` honoured |
 | `http://a.com`, `localhost:3000` | whole-term searches: a colon before `//`, or a port, is not a field selector |

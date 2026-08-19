@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"github.com/choudharypankaj/lake-search/parser"
 )
@@ -96,42 +97,160 @@ func CompileString(q string, s Schema) (Result, error) {
 	return Compile(parser.Parse(q), s)
 }
 
-// ScoreSentinel is a token chosen to match nothing. It exists so that a
-// relevance panel with an empty search box still contains a search function.
-const ScoreSentinel = "zzqqnolakesearchmatchqqzz"
-
-// CompileScore renders a predicate for a panel that also selects score().
+// CompileScore renders the *predicate* for a panel that also selects score().
+//
+// It is the same predicate CompileString produces. That is the whole fix: this
+// function used to overwrite it with a sentinel token chosen to match nothing,
+// so that `component:tikv` — a perfectly good filter with no full-text term in
+// it — reached the warehouse as `match(msg, 'zzqq…')` and the panel came back
+// empty with the user's filter discarded. Every structured-only search hit it:
+// `snapsh*`, `level:ERROR`, `pod:*`.
+//
+// # Why the fix cannot live in the predicate
 //
 // Databend rejects score() unless a search function is present in the same
 // statement: `[1065] [SQL-BINDER] Score function must be used together with
-// match or query function`.
+// match or query function`. Re-measured live, `SELECT score() … WHERE
+// lower(component) = lower('tikv')` still returns exactly that.
 //
-// The obvious workaround — emitting `1=0` when the box is empty — does **not**
-// work, and this was verified against a live warehouse rather than assumed.
-// The binder looks for a search function *anywhere in the statement*, so
-// `SELECT score() … WHERE 1=0` still fails. Since the score() call sits in the
-// select list, no predicate can rescue it.
+// No predicate rescues it. A search function that matches nothing satisfies
+// the binder and then prunes the scan, in both directions — measured against a
+// truth of 1,019 rows:
 //
-// What does work is a search function that matches nothing: the binder is
-// satisfied, the panel returns zero rows, and no error reaches the user.
+//	lower(msg) LIKE lower('snapsh%') OR  match(msg,'<sentinel>')      0
+//	lower(msg) LIKE lower('snapsh%') AND NOT match(msg,'<sentinel>')  0
+//	lower(msg) LIKE lower('snapsh%')                               1,019
+//
+// So the select list is the only place left, which is what CompileScoreExpr is
+// for. The two must be used together: this one for the WHERE clause, that one
+// for the score column.
 func CompileScore(q string, s Schema) (Result, error) {
 	r, err := CompileString(q, s)
 	if err != nil {
 		return r, err
 	}
 	if !r.UsesMatch {
-		col := s.Default
-		if f, ok := s.Fields[strings.ToLower(s.Default)]; ok {
-			col = f.Column
-		}
-		r.SQL = fmt.Sprintf("match(%s, '%s')", col, ScoreSentinel)
-		r.UsesMatch = true
 		r.Warnings = append(r.Warnings,
-			"score() needs a search function even when the search is empty; matching a sentinel token "+
-				"so the panel returns no rows instead of [1065]")
+			"this search compiles to structured SQL with no full-text term in it, so there is "+
+				"nothing for score() to rank: select $__search_score_expr(...) rather than score() "+
+				"and the column will be a constant 0 instead of [1065]")
 	}
 	return r, nil
 }
+
+// CompileScoreExpr renders the *select-list* expression that goes beside the
+// predicate from CompileScore: `score()` when the compiled predicate contains a
+// search function, and the constant `0` when it does not.
+//
+// Both were measured live rather than reasoned about: `SELECT score() … WHERE
+// query('msg:snapshot')` ranks 17,595 rows top score 4.76, and `SELECT 0 …
+// WHERE lower(msg) LIKE lower('%snapsh%')` returns all 17,616 with a constant
+// column. The alternative — leaving score() in the select list unconditionally
+// — is the [1065] above, which is at least loud, but it takes out the panel for
+// every structured-only search rather than merely leaving it unranked.
+//
+// A search function inside an anti-join subquery does not count, and that is
+// not a guess: `SELECT score() … WHERE msg NOT IN (SELECT msg … WHERE query(…))`
+// fails [1065] too, because the binder does not see through the subquery. So a
+// purely negative search ranks 0, which is the honest answer for a query with
+// no positive clause.
+func CompileScoreExpr(q string, s Schema) (Result, error) {
+	r, err := CompileString(q, s)
+	if err != nil {
+		return r, err
+	}
+	expr := "0"
+	if r.UsesMatch {
+		expr = "score()"
+		if strings.Contains(r.SQL, "fuzziness=") {
+			// Measured: the same 4,080 rows come back either way, but with
+			// fuzziness set the scores collapse from 4 distinct values
+			// spanning 1.49-5.66 to a single 1.0. The row set is right and
+			// only the ordering is meaningless, which is exactly the kind of
+			// panel that keeps looking like it works. No SQL gives both, so
+			// the honest move is to say so rather than silently drop either
+			// the typo tolerance or the ranking.
+			r.Warnings = append(r.Warnings,
+				"score() is a constant 1.0 for a fuzzy term: fuzziness reaches the engine through "+
+					"match()'s option argument, and the engine does not rank an expanded match. "+
+					"The rows are right; the order is not. Drop the ~N to get a real ranking")
+		}
+	}
+	r.SQL = expr
+	return r, nil
+}
+
+// WarningComment renders a Result's warnings as one SQL comment, safe to splice
+// beside the predicate.
+//
+// It exists because of the gap M11 names: the compiler is careful to produce
+// exactly the right advisory — "field \"to\" is not a column", "wildcard served
+// as a substring match" — and a Grafana macro returns a string, so every one of
+// them dies at that boundary and the reader is left with an unexplained panel.
+// A comment is not as good as a frame notice, but it is a channel this library
+// can fill on its own: it reaches the query inspector's generated SQL, and it is
+// inert. Measured, `… AND ((lower(msg) LIKE lower('%snapsh%')) /* … */)` returns
+// the same 17,616 rows as the predicate alone.
+//
+// Empty when there is nothing to say, so the caller can concatenate blindly.
+func WarningComment(warnings []string) string {
+	if len(warnings) == 0 {
+		return ""
+	}
+	return "/* lake-search: " + commentSafe(strings.Join(warnings, " | ")) + " */"
+}
+
+// commentSafe neutralises every sequence that can take text out of a `/* … */`
+// comment and back into the statement.
+//
+// Warning text is not the library's own prose: it quotes the user's search
+// value verbatim, so anything typable in the search box can reach it. Three
+// sequences matter, and all three are typable:
+//
+//	*/  ends the comment early, so the rest of the advisory becomes SQL.
+//	    Reachable as msg:"*/" — and also as msg:*/ once the wildcard warning
+//	    quotes the pattern back.
+//	/*  opens a nested comment on any engine that nests block comments
+//	    (PostgreSQL does; the SQL standard leaves it open), which makes the
+//	    first */ close the inner one and leaves the outer comment unclosed —
+//	    swallowing the rest of the statement. Reachable as msg:"/*".
+//	CR/LF ends a line, which matters if the comment is ever rendered into a
+//	    `--` context by a caller; a newline inside `/* */` is legal but the
+//	    one-line rendering is what makes the comment safe to append anywhere.
+//
+// Each is broken with a space rather than dropped, so the advisory still reads
+// as what the user typed.
+func commentSafe(s string) string {
+	s = strings.ReplaceAll(s, "*/", "* /")
+	s = strings.ReplaceAll(s, "/*", "/ *")
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	return s
+}
+
+// variantKeyWarning is the advisory both VARIANT sites raise: `term` for an
+// equality and `rangeField` for a comparison. One string, because the two used
+// to drift apart and the trap is identical either way.
+//
+// It carries no row counts, and that is the fix rather than an omission. The
+// text it replaced said "kv['tableid'] is 0 rows where kv['tableID'] is 1,365".
+// Both halves were wrong by the time anyone read them: the table only grows, so
+// the 1,365 was true at one bound on one afternoon and measured 4,403 two hours
+// later; and the sentence compares two *key* lookups while the number was
+// actually a key-plus-value predicate (kv['tableID'] = '574'), so the reading a
+// user would check — how many rows carry the key at all — was off by a further
+// order of magnitude. A warning that ships a decaying constant is wrong by
+// construction. The asymmetry itself needs no number to be true, and it is
+// pinned by two conformance cases instead: `tableid:*` must be zero while
+// `tableID:*` must not.
+//
+// The key names are examples of the shape, not counts: Go's structured loggers
+// emit camelCase keys, and this table carries tableID, reconcileID,
+// controllerKind and TiFlash among others.
+const variantKeyWarning = "field %q is not a column, so it is read from the %s VARIANT: no index, " +
+	"a full scan, and the key is matched EXACTLY, case included. A mis-cased key is silently " +
+	"empty rather than an error — kv['tableid'] and kv['tableID'] are different keys — and Go " +
+	"loggers emit camelCase names like tableID, reconcileID, controllerKind and TiFlash"
 
 // fragment is a partially compiled subtree, in one of two languages.
 //
@@ -150,6 +269,25 @@ type fragment struct {
 	// applied so that `a -b` stays inside one query() call instead of becoming
 	// `query(a) AND NOT query(b)`, which would be two search functions.
 	negated bool
+
+	// residual is SQL that must be ANDed with the query() call this text
+	// fragment ends up inside. One construct sets it: a quoted phrase the
+	// analyzer collapses to a single token, which needs the token (so the
+	// index and its stemming still do the work) *and* a literal scan for the
+	// text between the tokens (so the adjacency the quotes asked for is
+	// actually checked).
+	//
+	// It rides on the fragment rather than being spent at the leaf because
+	// spending it there would cost the statement's one search function and
+	// turn `"not ready" peer` into a compile error. Carried, it merges into
+	// the same query() call as every other text leaf.
+	residual string
+
+	// plain is the same leaf rendered as pure SQL, for the two places a
+	// residual cannot travel: under an OR, where the residual would wrongly
+	// filter the other disjunct, and under a negation, where it cannot be
+	// hoisted past the NOT. See degrade.
+	plain string
 }
 
 func (f fragment) isText() bool { return f.text != "" }
@@ -234,7 +372,42 @@ func (c *compiler) wrapText(f fragment) (string, error) {
 		return c.antiJoin(f)
 	}
 	c.searchFuncs++
-	return "query('" + escapeString(f.text) + "')", nil
+	sql := "query('" + escapeString(f.text) + "')"
+	if f.residual != "" {
+		// The residual of a collapsed phrase. It is ANDed here, at the one
+		// point where the whole text expression becomes SQL, so it applies to
+		// the conjunction the leaf is part of and never to a disjunction —
+		// degrade() has already taken the OR and NOT cases away.
+		sql = "(" + sql + " AND " + f.residual + ")"
+	}
+	return sql, nil
+}
+
+// degrade renders a residual-carrying text fragment as plain SQL.
+//
+// A residual is only sound under AND. Under `a OR "not ready"` it would filter
+// the `a` disjunct as well, and under a negation it would have to be hoisted
+// past a NOT that does not distribute over it. In both places the leaf falls
+// back to its pure-SQL form, which is the substring scan alone: measured on two
+// disjoint frozen windows, that returns exactly the same rows as the token and
+// the scan together (250 = 250 and 1,682 = 1,682 for `"not ready"`), so the
+// fallback loses nothing but the index.
+//
+// A fragment that has already been combined with others has no `plain` of its
+// own; it is spent as SQL instead, which costs a search function and therefore
+// behaves exactly as it did before this residual existed.
+func (c *compiler) degrade(f fragment) (fragment, error) {
+	if f.residual == "" || !f.isText() {
+		return f, nil
+	}
+	if f.plain != "" {
+		return fragment{sql: f.plain}, nil
+	}
+	sql, err := c.wrapText(f)
+	if err != nil {
+		return fragment{}, err
+	}
+	return fragment{sql: sql}, nil
 }
 
 // antiJoin renders the complement of a full-text expression.
@@ -292,6 +465,11 @@ func (c *compiler) not(child parser.Node) (fragment, error) {
 	if err != nil {
 		return fragment{}, err
 	}
+	// A residual cannot be hoisted past a NOT: `NOT (token AND scan)` is not
+	// `NOT token AND NOT scan`. The leaf falls back to its pure-SQL form.
+	if f, err = c.degrade(f); err != nil {
+		return fragment{}, err
+	}
 	if f.isText() {
 		// Carried, not applied — see fragment.negated.
 		f.negated = !f.negated
@@ -316,6 +494,14 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 		f, err := c.render(ch)
 		if err != nil {
 			return fragment{}, err
+		}
+		if op == "OR" {
+			// A residual ANDed onto a disjunction would filter the other
+			// disjuncts too, so the leaf that carries one is rendered as
+			// plain SQL here instead.
+			if f, err = c.degrade(f); err != nil {
+				return fragment{}, err
+			}
 		}
 		frags = append(frags, f)
 		if !f.isText() {
@@ -389,12 +575,19 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 // So negatives must be bare (never `AND NOT`), must come last, and cannot
 // appear under OR at all.
 func (c *compiler) textBoolean(frags []fragment, op string) (fragment, error) {
-	var positives, negatives []string
+	var positives, negatives, residuals []string
 	for _, f := range frags {
 		if f.negated {
 			negatives = append(negatives, "("+f.text+")")
 		} else {
 			positives = append(positives, "("+f.text+")")
+		}
+		if f.residual != "" {
+			// Only reachable on the AND path: not() degrades a negated
+			// residual and boolean() degrades an ORed one, so by the time a
+			// residual arrives here every fragment in the group is ANDed and
+			// the residuals conjoin with them.
+			residuals = append(residuals, f.residual)
 		}
 	}
 
@@ -439,7 +632,7 @@ func (c *compiler) textBoolean(frags []fragment, op string) (fragment, error) {
 		// Deliberately no operator: `AND NOT` returns zero rows.
 		expr += " NOT " + n
 	}
-	return fragment{text: expr}, nil
+	return fragment{text: expr, residual: strings.Join(residuals, " AND ")}, nil
 }
 
 func (c *compiler) term(t *parser.Term) (fragment, error) {
@@ -452,8 +645,7 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 		return fragment{}, fmt.Errorf("unknown field %q and no VARIANT column configured", name)
 	}
 	if !known && t.Field != "" {
-		c.warn("field %q is not a column; reading it from the %s VARIANT (no index, full scan)",
-			t.Field, c.schema.Variant)
+		c.warn(variantKeyWarning, t.Field, c.schema.Variant)
 	}
 
 	if t.Exists {
@@ -462,6 +654,28 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 
 	if t.Regex {
 		return c.regexTerm(f, t, name)
+	}
+
+	if isBooleanWord(t.Value) {
+		// `and`, `or` and `not` are ordinary English words that occur in log
+		// lines, and every one of them used to reach the parser as an operator
+		// and then evaporate: `msg:(not)` and a bare `not` compiled to `1=1`,
+		// the whole table, with nothing said. They are values here, and saying
+		// so is the difference between "the tool searched for the word" and
+		// "the tool decided the query was empty".
+		//
+		// The text has to state the whole rule, because the rule is
+		// context-sensitive and the same word is an operator two characters
+		// away. An earlier version said "only the uppercase spellings AND, OR
+		// and NOT are operators" — false in the very statement it was printed
+		// beside, which applied `&&`, and false again once lowercase `or` went
+		// back to joining terms.
+		c.warn("%q is searched for as a word here, not applied as a boolean operator. A boolean "+
+			"word is an operator only where an operator is grammatical: and, or, && and || "+
+			"between two terms, NOT before a term. NOT must be capitalised because it INVERTS "+
+			"the term it takes, while and/or only join terms that keep their own meaning "+
+			"either way. As a field's value (msg:not), inside quotes, or anywhere the position "+
+			"is not grammatical, it is a value", t.Value)
 	}
 
 	if t.Boost != "" && f.Kind != Text {
@@ -474,7 +688,7 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 	case Text:
 		return c.textTerm(f, t)
 	case Number:
-		if t.Prefix || t.Suffix || t.Fuzz > 0 {
+		if t.Wildcard || t.Fuzz > 0 {
 			c.warn("wildcards and fuzziness are not meaningful on numeric field %q; comparing for equality", name)
 		}
 		if _, err := strconv.ParseFloat(t.Value, 64); err != nil {
@@ -493,26 +707,137 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 	}
 }
 
+// isBooleanWord reports whether a value spells one of the boolean operators,
+// in any case. It decides only whether to explain, never what to emit.
+func isBooleanWord(v string) bool {
+	switch {
+	case strings.EqualFold(v, "and"), strings.EqualFold(v, "or"), strings.EqualFold(v, "not"):
+		return true
+	case v == "&&", v == "||":
+		return true
+	}
+	return false
+}
+
 // textTerm produces either a text fragment (merged into the single query()
 // call) or a SQL fragment (wildcards, which LIKE handles and which cost no
 // search function).
 func (c *compiler) textTerm(f Field, t *parser.Term) (fragment, error) {
-	switch {
-	case t.Prefix || t.Suffix:
-		// `*` inside query() is silently ignored — every starred query equals
-		// its unstarred form — so a wildcard has to become LIKE. Measured:
-		// `snapsh*` gives 0 through query() but 1,019 through LIKE 'snapsh%'.
+	if t.Phrase && strings.Contains(t.Value, "*") {
+		// Quotes turn a wildcard off, and the way they turn it off is worth
+		// spelling out because the result is a silent zero rather than a
+		// literal match. The analyzer treats `*` as punctuation, so it SPLITS
+		// the phrase there and each fragment becomes a token of its own.
+		// Measured over ts < '2026-08-19 00:00:00' and again over
+		// [2026-08-19 00:00, 05:00):
 		//
-		// LIKE is not a search function, so this composes freely with the one
+		//	query('msg:"peer status"')   88,441   38,076
+		//	query('msg:"peer* status"')  88,441   38,076   <- star dropped, phrase intact
+		//	query('msg:"peer stat*"')         0        0   <- now the phrase "peer stat"
+		//	query('msg:"peer stat"')          0        0   <- and `stat` is not a token
+		//	query('msg:"peer stat*us"')       0        0   <- three tokens now
+		//
+		// A `?` is punctuation too and is harmless for the same reason:
+		// query('msg:"peer status?"') is 88,441, identical to the clean
+		// phrase, so it raises nothing.
+		c.warn("`*` inside quotes is not a wildcard: the analyzer reads it as punctuation and "+
+			"splits %q there, so the phrase becomes the tokens on either side of the star and "+
+			"a fragment that is not a whole token in the index makes the phrase match nothing "+
+			"at all, silently. Drop the quotes if a wildcard is what was meant", t.Value)
+	}
+
+	switch {
+	case t.Wildcard:
+		// A wildcard cannot be forwarded into query(): the engine does not
+		// ignore the star, it *truncates the term at it*, which is worse
+		// because the answer is plausible rather than empty. Measured,
+		// frozen window: query('msg:"reg*on"') returns 36 rows, none of
+		// which contain "region" — they are `/registration/ebs.csi...`
+		// lines matching the truncated token `reg` — against 20,144 for the
+		// token itself.
+		//
+		// # Which question a wildcard asks
+		//
+		// `region*` means "a TOKEN beginning with region", and on a tokenised
+		// column that is not the same request as "the line contains region
+		// somewhere". The difference is not academic. Emitted as
+		// LIKE '%reg%on%', `reg*on` is exactly RLIKE 'reg.*on' — measured,
+		// both 21,278 over the frozen window — so the star runs across word
+		// boundaries and over whole lines: 4,196 of those rows contain no word
+		// matching reg…on at all (1,628 over a second, disjoint window), and
+		// the token set is a strict subset of the substring one, 0 rows the
+		// other way. It also collapses the syntax, because
+		// `*region`, `region*` and `*region*` all become '%region%' and a
+		// suffix wildcard stops being distinguishable from a prefix one.
+		//
+		// So a pattern that can describe one token is compiled as one token:
+		// a word-boundary regex, the same device the stopword branch uses and
+		// the same one the conformance suite trusts as ground truth. Measured
+		// over the frozen window, `reg*on` is 17,082 that way against 21,278
+		// as a substring, `*region` is 16,886 against `region*`'s 20,147, and
+		// `to*` is 136,162 against 177,913.
+		//
+		// A pattern that *cannot* describe one token — one containing any
+		// character the tokenizer splits on, like `*0.0.0.0:8686/playground*`
+		// or `tikv-tikv-*` — is not a token wildcard in the first place, and
+		// asking for word boundaries around it would be meaningless. Those
+		// keep the substring reading, and the warning says which one was used.
+		//
+		// Neither is a search function, so both compose freely with the one
 		// query() call the statement is allowed.
+		if t.Fuzz > 0 {
+			c.warn("fuzziness is ignored when a wildcard is present on %q", f.Column)
+		}
+		if f.Kind == Text && tokenWildcard(t.Value) {
+			pat := c.tokenPattern(f, t.Value)
+			c.warn("wildcard %q on the full-text column %q is matched as ONE token, with the "+
+				"word-boundary regex %s: `*` and `?` stop at the token boundary, so it will not "+
+				"span words the way a substring match does, and it does not stem — the bare "+
+				"token finds inflections that the pattern does not. RLIKE is served by neither "+
+				"the inverted nor the NGRAM index, so this is a full scan",
+				t.Value, f.Column, pat)
+			return fragment{sql: c.wordBoundaryPattern(f, pat)}, nil
+		}
+		sql := c.like(f, t.Value)
+		if f.Kind == Text {
+			c.warn("wildcard %q on the full-text column %q contains characters the tokenizer "+
+				"splits on, so it cannot describe a single token: it is matched as an "+
+				"UNANCHORED SUBSTRING — %s — which crosses word boundaries and can span the "+
+				"whole line. It does not stem either", t.Value, f.Column, sql)
+		}
 		if !f.Ngram {
 			c.warn("wildcard on %q falls back to LIKE; without an NGRAM index this is a full scan "+
 				"(CREATE NGRAM INDEX ... ON <table>(%s))", f.Column, f.Column)
 		}
-		if t.Fuzz > 0 {
-			c.warn("fuzziness is ignored when a wildcard is present on %q", f.Column)
+		return fragment{sql: sql}, nil
+
+	case f.IsStopWord(t.Value):
+		// The index carries `filters = 'english_stop'`, and the filter runs
+		// over the *query* as well as the document: the word is deleted
+		// before the index is consulted, so the clause matches nothing and
+		// nothing is raised. Measured over the frozen window, all 33 words in
+		// the set return 0 through query() — `to` 0 against a true 130,002,
+		// `not` 0 against 22,850, `no` 0 against 5,060.
+		//
+		// A word-boundary scan is the honest substitute. It is not a search
+		// function, so it costs nothing against the one-call budget and
+		// composes with a positive query() exactly: measured,
+		// query('msg:replica') = 1,743, the scan for `no` = 5,060, their AND
+		// = 1,656 and their OR = 5,147 = 1,743 + 5,060 - 1,656.
+		//
+		// Rejecting the word instead would be the worse answer: 5,060 rows
+		// contain "no", and telling someone it cannot be searched for is a
+		// lie where telling them it is slow is merely unwelcome.
+		if t.Fuzz > 0 || t.Boost != "" || t.Slop > 0 {
+			c.warn("fuzziness, boost and proximity all reach the engine through the search "+
+				"function, which never sees the stopword %q; matching it literally instead",
+				t.Value)
 		}
-		return fragment{sql: c.like(f, t.Value, t.Prefix, t.Suffix)}, nil
+		c.warn("%q is a stopword of the index on %q: the analyzer deletes it from the query "+
+			"before the index is read, so a token search for it returns zero rows and no error. "+
+			"Matching it with a word-boundary scan instead — exact, but a full scan, and it does "+
+			"not stem the way the index would", t.Value, f.Column)
+		return fragment{sql: c.wordBoundary(f, t.Value)}, nil
 
 	case t.Fuzz > 0:
 		// Fuzziness exists only as an option argument to match(); inside
@@ -527,6 +852,83 @@ func (c *compiler) textTerm(f Field, t *parser.Term) (fragment, error) {
 		c.searchFuncs++
 		return fragment{sql: fmt.Sprintf("match(%s, '%s', 'fuzziness=%d')",
 			f.Column, escapeString(t.Value), t.Fuzz)}, nil
+
+	case t.Phrase && analyzerCollapses(f, t.Value):
+		// A phrase is a constraint on *positions*, and positions only exist
+		// between tokens. The analyzer strips punctuation and stopwords from
+		// the phrase before the index sees it, so a phrase the analyzer cuts
+		// down to fewer than two tokens has no adjacency left to check — and
+		// rather than say so, the engine drops the phrase constraint and
+		// matches the survivor everywhere. Measured, frozen window
+		// ts < '2026-08-19 00:00:00':
+		//
+		//	query('msg:"not ready"')          2,320
+		//	query('msg:ready')                2,320   <- identical
+		//	lower(msg) LIKE '%not ready%'       250   <- the truth
+		//	msg RLIKE 'not ready'               250   <- independent oracle
+		//	query('msg:"the leader"')         9,716 against a true 4
+		//
+		// # What this branch must NOT fire on
+		//
+		// The test is whether the analyzer *destroyed* something, not how many
+		// tokens are left. A one-word phrase that survives the analyzer intact
+		// — `"snapshots"` — lost nothing, and its index path is exactly right:
+		// query('msg:"snapshots"') is 17,595 rows over the frozen window
+		// because the index stems, where lower(msg) LIKE '%snapshots%' is 9.
+		// Routing it here was a 1,955x under-match, and `""` — which destroys
+		// nothing because there was nothing there — became `LIKE '%%'`, the
+		// whole table, against a correct 0. So the guard compares the phrase
+		// against the tokens that survive it: equal means untouched, and
+		// untouched phrases keep the index.
+		//
+		// # The two survivors
+		//
+		// One surviving token: the token goes into query() so the index and
+		// its stemming still do the work, and a literal scan for the whole
+		// phrase rides along as a residual so the adjacency the quotes asked
+		// for is actually checked. The residual is carried on the fragment
+		// rather than spent here, which is what keeps `"not ready" peer` a
+		// working one-search-function query instead of a compile error.
+		//
+		// Zero surviving tokens — `"not the"`, `"[!]"` — leave nothing for the
+		// index to match, so the scan is the whole answer.
+		//
+		// Where either differs from a true phrase is whitespace and case
+		// folding: the scan wants exactly the characters typed, so a doubled
+		// space will not match and "cannot ready" will. The warning says so.
+		toks := phraseTokens(f, t.Value)
+		if t.Slop > 0 {
+			c.warn("proximity ~%d is dropped on %q: after the analyzer removes stopwords and "+
+				"punctuation this phrase keeps fewer than two tokens, so there are no positions "+
+				"left to measure a distance between", t.Slop, t.Value)
+		}
+		if t.Boost != "" {
+			c.warn("boost ^%s is dropped on %q, which is matched by scan rather than by the "+
+				"index and therefore has no relevance score to weight", t.Boost, t.Value)
+		}
+		if !f.Ngram {
+			c.warn("phrase %q falls back to LIKE; without an NGRAM index this is a full scan "+
+				"(CREATE NGRAM INDEX ... ON <table>(%s))", t.Value, f.Column)
+		}
+		like := c.contains(f, t.Value)
+		if len(toks) == 1 {
+			c.warn("phrase %q is cut down to the single token %q by the analyzer on %q — the "+
+				"rest is stopwords or punctuation, which the index does not store — and a "+
+				"one-token phrase has no positions left to constrain, so a phrase query for it "+
+				"silently matches that token everywhere. Compiling it as the token AND a literal "+
+				"scan for the whole phrase instead: the scan is exact about spacing and case "+
+				"where a phrase query is not", t.Value, toks[0], f.Column)
+			c.noteTextCol(f.Column)
+			return fragment{
+				text:     f.Column + ":" + quoteQueryValue(toks[0], false),
+				residual: like,
+				plain:    like,
+			}, nil
+		}
+		c.warn("phrase %q keeps no tokens at all after the analyzer on %q removes stopwords and "+
+			"punctuation, so there is nothing left for the index to match. Matching the literal "+
+			"text with a scan instead", t.Value, f.Column)
+		return fragment{sql: like}, nil
 
 	case t.Phrase:
 		// Positions are stored: "peer status" returns 72,601 where the
@@ -605,6 +1007,146 @@ func (c *compiler) regexTerm(f Field, t *parser.Term, name string) (fragment, er
 	return fragment{sql: f.Column + " RLIKE '" + escapeString(t.Value) + "'"}, nil
 }
 
+// phraseTokens returns the tokens of a phrase that survive the column's
+// analyzer: the text split on everything that is not a letter or a digit,
+// with the index's stopwords removed.
+//
+// It is an approximation of the engine's tokenizer, and it only has to be
+// right about the *count*, because the count is the whole decision: two or
+// more surviving tokens and the phrase works as written, fewer and it has to
+// be compiled some other way. Erring towards fewer tokens — which is what
+// splitting on punctuation does — errs towards the scan, which is correct but
+// slower, never towards the silent over-match.
+func phraseTokens(f Field, phrase string) []string {
+	var out []string
+	for _, tok := range strings.FieldsFunc(phrase, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if f.IsStopWord(tok) {
+			continue
+		}
+		out = append(out, tok)
+	}
+	return out
+}
+
+// analyzerCollapses reports whether the column's analyzer destroys part of a
+// phrase — the question that decides whether the phrase can keep its index
+// path.
+//
+// It is deliberately not "how many tokens survive". `"snapshots"` survives with
+// one token and lost nothing: the index stems it, query('msg:"snapshots"')
+// finds 17,595 rows over the frozen window, and the substring scan the
+// token-count test routed it to finds 9. `""` survives with none and also lost
+// nothing. What matters is whether the tokens the index will see still spell
+// the phrase that was typed: if they do, the phrase is a phrase and the index
+// answers it correctly; if they do not, the engine has silently dropped a
+// constraint and something else has to check it.
+//
+// Two or more surviving tokens always keep the index, because positions between
+// them are stored and the phrase works as written — that is the case
+// `"fail to get peer"` exercises, where the stopword gap is bridged by
+// position.
+func analyzerCollapses(f Field, phrase string) bool {
+	toks := phraseTokens(f, phrase)
+	if len(toks) >= 2 {
+		return false
+	}
+	return strings.Join(toks, " ") != phrase
+}
+
+// contains matches a literal substring. Unlike like() it does no wildcard
+// translation: this renders text the user quoted, where a `*` is a star.
+func (c *compiler) contains(f Field, value string) string {
+	lit := "'" + escapeString("%"+escapeLike(value)+"%") + "'"
+	if c.schema.CaseInsensitive {
+		return fmt.Sprintf("lower(%s) LIKE lower(%s)", f.Column, lit)
+	}
+	return fmt.Sprintf("%s LIKE %s", f.Column, lit)
+}
+
+// wordBoundary matches one word as a token would be matched, without the
+// index: the word surrounded by anything that is not a word character.
+//
+// It is the substitute for a term the analyzer would delete, and the reason to
+// trust it is a control rather than an argument. For `from`, which is *not* a
+// stopword, the index and this regex agree exactly — query('msg:from') and
+// lower(msg) RLIKE '(^|[^a-z0-9])from([^a-z0-9]|$)' both return 93,645 over
+// the frozen window. So the form is the right ground truth for a token search,
+// and it is also the guard that this branch is not firing on ordinary words.
+//
+// RLIKE is case-insensitive on this engine whatever the schema says — measured
+// again here, the lower() and bare spellings return the same 130,002 for `to`
+// — but the lower() is written out anyway when the schema asks for it, so the
+// predicate does not depend on an undocumented engine default.
+func (c *compiler) wordBoundary(f Field, word string) string {
+	return c.wordBoundaryPattern(f, "(^|[^a-z0-9])"+escapeString(strings.ToLower(word))+"([^a-z0-9]|$)")
+}
+
+// wordBoundaryPattern renders an already-built token regex against the column.
+// Split out of wordBoundary so the stopword branch and the wildcard branch
+// spell the boundary the same way and cannot drift apart — the conformance
+// suite treats this exact form as ground truth for what a token search means.
+func (c *compiler) wordBoundaryPattern(f Field, pat string) string {
+	if c.schema.CaseInsensitive {
+		return fmt.Sprintf("lower(%s) RLIKE '%s'", f.Column, pat)
+	}
+	return fmt.Sprintf("%s RLIKE '%s'", f.Column, pat)
+}
+
+// tokenWildcard reports whether a wildcard value can describe a single
+// analyzer token: every literal character in it is a token character.
+//
+// The 'english' tokenizer breaks on everything that is not a letter or a
+// digit, which is the same rule wordBoundary's `[^a-z0-9]` encodes. So
+// `region*` and `reg*on` are token patterns and `tikv-tikv-*`,
+// `*0.0.0.0:8686/playground*` and `100%*` are not — the last three describe a
+// run of text that spans several tokens, and a token reading of them would
+// answer a question nobody asked.
+func tokenWildcard(v string) bool {
+	if v == "" {
+		return false
+	}
+	for _, r := range v {
+		switch {
+		case r == '*' || r == '?':
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// tokenPattern renders a token wildcard as a word-boundary regex.
+//
+//	region*   ->  (^|[^a-z0-9])region[a-z0-9]*([^a-z0-9]|$)
+//	*region   ->  (^|[^a-z0-9])[a-z0-9]*region([^a-z0-9]|$)
+//	reg*on    ->  (^|[^a-z0-9])reg[a-z0-9]*on([^a-z0-9]|$)
+//	regio?    ->  (^|[^a-z0-9])regio[a-z0-9]([^a-z0-9]|$)
+//
+// `*` becomes "any run of token characters" and `?` exactly one, so both stop
+// where the token stops. No regex escaping is needed and none is done:
+// tokenWildcard has already established that every literal character is
+// alphanumeric, which is the guard that makes this safe — call one without the
+// other and a `.` or a `(` in the value would be live regex.
+func (c *compiler) tokenPattern(f Field, value string) string {
+	var b strings.Builder
+	b.WriteString("(^|[^a-z0-9])")
+	for _, r := range strings.ToLower(value) {
+		switch r {
+		case '*':
+			b.WriteString("[a-z0-9]*")
+		case '?':
+			b.WriteString("[a-z0-9]")
+		default:
+			b.WriteRune(r)
+		}
+	}
+	b.WriteString("([^a-z0-9]|$)")
+	return b.String()
+}
+
 func (c *compiler) stringTerm(f Field, t *parser.Term) (fragment, error) {
 	if t.Fuzz > 0 {
 		c.warn("fuzziness needs an inverted index; %q is a plain column, matching exactly instead", f.Column)
@@ -613,8 +1155,8 @@ func (c *compiler) stringTerm(f Field, t *parser.Term) (fragment, error) {
 		c.warn("phrase proximity needs an inverted index to have positions to measure; %q is a "+
 			"plain column, matching the phrase exactly instead", f.Column)
 	}
-	if t.Prefix || t.Suffix {
-		return fragment{sql: c.like(f, t.Value, t.Prefix, t.Suffix)}, nil
+	if t.Wildcard {
+		return fragment{sql: c.like(f, t.Value)}, nil
 	}
 
 	lit := "'" + escapeString(t.Value) + "'"
@@ -628,13 +1170,34 @@ func (c *compiler) stringTerm(f Field, t *parser.Term) (fragment, error) {
 	return fragment{sql: f.Column + " = " + lit}, nil
 }
 
-func (c *compiler) like(f Field, value string, prefix, suffix bool) string {
-	pat := escapeLike(value)
-	if suffix {
-		pat = "%" + pat
-	}
-	if prefix {
-		pat = pat + "%"
+// like renders a wildcard value as a LIKE predicate.
+//
+// # Anchoring depends on what the column is
+//
+// A LIKE pattern is anchored at both ends: `'region%'` means "the *value*
+// starts with region". On a plain column that is exactly what `pod:tikv*`
+// asks for, and it is right. On the full-text column it is a different
+// question from the one that was typed — `region*` means "a *token* starting
+// with region, anywhere in the line", and a whole log message practically
+// never starts with the word being searched for. Measured, frozen window:
+//
+//	lower(msg) LIKE lower('region%')     5,133   anchored at character 0
+//	query('msg:region')                 20,144   the token search
+//	lower(msg) LIKE lower('%region%')   20,158   unanchored
+//
+// So 74.5% of the answer was missing, and every row that came back was
+// correct — which is precisely why a "returns rows" assertion could not see
+// it. For a Text field both ends are therefore opened unless the user's own
+// pattern already opens them; every other kind stays anchored.
+func (c *compiler) like(f Field, value string) string {
+	pat := likePattern(value)
+	if f.Kind == Text {
+		if !strings.HasPrefix(value, "*") {
+			pat = "%" + pat
+		}
+		if !strings.HasSuffix(value, "*") {
+			pat = pat + "%"
+		}
 	}
 	lit := "'" + escapeString(pat) + "'"
 	if c.schema.CaseInsensitive {
@@ -643,7 +1206,29 @@ func (c *compiler) like(f Field, value string, prefix, suffix bool) string {
 	return fmt.Sprintf("%s LIKE %s", f.Column, lit)
 }
 
+// exists compiles `field:*`.
+//
+// On a real column the useful reading of "has a value" excludes the empty
+// string: an empty `level` is not a level. On a VARIANT key it is the opposite,
+// and the difference is large. The `[k=v]` extractor writes an empty value
+// whenever a log line says `key=` with nothing after it, so `<> ”` throws away
+// exactly the rows that prove the key is there. Measured, frozen window:
+//
+//	kv['rest'] IS NOT NULL              433,901
+//	kv['rest']::VARCHAR IS NOT NULL     433,901
+//	kv['rest']::VARCHAR <> ''           333,266   <- 100,635 rows denied
+//	kv['store_id'] IS NOT NULL            1,376   <- control, no empty values
+//	kv['store_id']::VARCHAR <> ''         1,376      both readings agree
+//
+// The cast is innocent on this table — the two IS NOT NULL forms agree to the
+// row, because no bag value here is a JSON null — but it is dropped anyway,
+// because a JSON null *is* distinguishable from a missing key before the cast
+// and not after it, and existence is precisely the question that distinction
+// answers.
 func (c *compiler) exists(f Field) string {
+	if f.Presence != "" {
+		return f.Presence + " IS NOT NULL"
+	}
 	switch f.Kind {
 	case Number, Timestamp:
 		return f.Column + " IS NOT NULL"
@@ -730,8 +1315,7 @@ func (c *compiler) rangeField(name string) (Field, error) {
 		return Field{}, fmt.Errorf("unknown field %q and no VARIANT column configured", name)
 	}
 	if !known {
-		c.warn("field %q is not a column; reading it from the %s VARIANT (no index, full scan)",
-			name, c.schema.Variant)
+		c.warn(variantKeyWarning, name, c.schema.Variant)
 	}
 	if f.Kind == Text {
 		return Field{}, fmt.Errorf("field %q is full-text indexed; ranges are not meaningful on it", name)
@@ -764,6 +1348,24 @@ func (c *compiler) bounds(f Field, name string, vals ...string) (col string, lit
 		return f.Column, vals, nil
 
 	case Timestamp:
+		// The one place in this compiler where a loud error is the right
+		// answer. Databend accepts a truncated literal and resolves it to the
+		// top of whatever unit was left off: measured, `ts > '2026-08-18T22'`
+		// returns 129,009 rows, exactly what `ts > '2026-08-18 22:00:00'`
+		// returns, where the 22:30 the user was typing is 70,681. The window
+		// silently widens by 58,328 rows and nothing says so. There is no safe
+		// guess between "they meant 22:00" and "the lexer ate the rest", so
+		// refuse rather than choose.
+		for i, v := range vals {
+			if !completeInstant(v) {
+				return "", nil, fmt.Errorf(
+					"a timestamp bound must be a complete instant, and %q is not: this engine "+
+						"accepts it and reads it as the top of the unit, which silently widens the "+
+						"window. Write the whole value, for example %s:>2026-08-18T22:30:00Z or "+
+						"%s:>\"2026-08-18 22:30:00\"", v, name, name)
+			}
+			vals[i] = c.pinZone(v)
+		}
 		return f.Column, quoteAll(vals), nil
 
 	default:
@@ -774,6 +1376,125 @@ func (c *compiler) bounds(f Field, name string, vals ...string) (col string, lit
 		}
 		return f.Column, quoteAll(vals), nil
 	}
+}
+
+// pinZone attaches the schema's fixed UTC offset to a bare literal, so the
+// bound means the same instant whatever time zone the session is set to.
+//
+// Nothing happens unless Schema.TimeZone is set, which is the default. When it
+// is, a bare date has to be expanded to midnight first: the engine parses
+// `'2026-08-18 00:00:00+00:00'` and rejects `'2026-08-18+00:00'` with
+// `[1006] cannot parse to type TIMESTAMP`, so appending the offset to a date is
+// not a smaller version of the same change, it is a broken statement.
+//
+// A literal that already carries a zone is left alone — the user said what they
+// meant, and overriding it would be the same class of silent rewrite this
+// library exists to remove.
+func (c *compiler) pinZone(v string) string {
+	if c.schema.TimeZone == "" || hasZone(v) {
+		return v
+	}
+	if len(v) == 10 { // a bare YYYY-MM-DD
+		v += " 00:00:00"
+	}
+	return v + c.schema.TimeZone
+}
+
+// hasZone reports whether an instant already names its offset.
+func hasZone(v string) bool {
+	if strings.HasSuffix(v, "Z") || strings.HasSuffix(v, "z") {
+		return true
+	}
+	// The offset sign can only appear after the clock, so anything before
+	// position 11 is part of the date.
+	return strings.LastIndexAny(v, "+-") > 10
+}
+
+// completeInstant reports whether v names a single point in time rather than a
+// prefix of one.
+//
+//	2026-08-18                     a whole day, and unambiguous — accepted
+//	2026-08-18T22:30               a whole minute — accepted
+//	2026-08-18 22:30:00.123+05:30  accepted, in every spelling of the zone
+//	2026-08-18T22                  a *prefix* — refused
+//	2026-08                        a prefix — refused
+//
+// A bare date is deliberately allowed: "on the 18th" is what someone means by
+// it, and the existing bracket-range spellings depend on it. What is refused
+// is a clock the user began and did not finish, which is the shape a lexer
+// bug or a fat finger produces and the shape the engine rounds off in silence.
+func completeInstant(v string) bool {
+	p := scanner{s: v}
+	if !(p.digits(4) && p.byte('-') && p.digits(2) && p.byte('-') && p.digits(2)) {
+		return false
+	}
+	if p.done() {
+		return true // a bare date
+	}
+	if !(p.byte('T') || p.byte('t') || p.byte(' ')) {
+		return false
+	}
+	if !(p.digits(2) && p.byte(':') && p.digits(2)) {
+		return false
+	}
+	if p.byte(':') && !p.digits(2) {
+		return false
+	}
+	if p.byte('.') && !p.someDigits() {
+		return false
+	}
+	if p.done() {
+		return true
+	}
+	if p.byte('Z') || p.byte('z') {
+		return p.done()
+	}
+	if !(p.byte('+') || p.byte('-')) {
+		return false
+	}
+	if !p.digits(2) {
+		return false
+	}
+	p.byte(':') // the colon in the offset is optional
+	return p.digits(2) && p.done()
+}
+
+// scanner is a byte cursor whose predicates consume on success and leave the
+// cursor alone on failure, so completeInstant reads as the grammar it checks.
+type scanner struct {
+	s string
+	i int
+}
+
+func (p *scanner) done() bool { return p.i >= len(p.s) }
+
+func (p *scanner) byte(c byte) bool {
+	if p.i < len(p.s) && p.s[p.i] == c {
+		p.i++
+		return true
+	}
+	return false
+}
+
+func (p *scanner) digits(n int) bool {
+	if p.i+n > len(p.s) {
+		return false
+	}
+	for k := 0; k < n; k++ {
+		if c := p.s[p.i+k]; c < '0' || c > '9' {
+			return false
+		}
+	}
+	p.i += n
+	return true
+}
+
+func (p *scanner) someDigits() bool {
+	start := p.i
+	for p.i < len(p.s) && p.s[p.i] >= '0' && p.s[p.i] <= '9' {
+		p.i++
+	}
+	return p.i > start
 }
 
 func quoteAll(vals []string) []string {
@@ -830,6 +1551,35 @@ func escapeLike(s string) string {
 	s = strings.ReplaceAll(s, `%`, `\%`)
 	s = strings.ReplaceAll(s, `_`, `\_`)
 	return s
+}
+
+// likePattern turns a search value carrying Lucene's wildcards into a LIKE
+// pattern: `*` becomes `%`, `?` becomes `_`.
+//
+// The order is the whole point, and it is why this is not two ReplaceAll
+// calls over the finished string. escapeLike turns a user's literal `_` into
+// `\_`; the wildcard `?` has to become `_` *after* that, or the two are
+// indistinguishable and `pod:a_b` starts matching `axb`. So the literal runs
+// between wildcards are escaped first, one run at a time, and the wildcards
+// are written out as themselves — a translation that cannot be reordered by
+// accident.
+func likePattern(s string) string {
+	var b strings.Builder
+	lit := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '*':
+			b.WriteString(escapeLike(s[lit:i]))
+			b.WriteByte('%')
+			lit = i + 1
+		case '?':
+			b.WriteString(escapeLike(s[lit:i]))
+			b.WriteByte('_')
+			lit = i + 1
+		}
+	}
+	b.WriteString(escapeLike(s[lit:]))
+	return b.String()
 }
 
 // escapeQueryPhrase escapes the double quotes that delimit a phrase inside the

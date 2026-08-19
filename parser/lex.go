@@ -62,6 +62,18 @@ func lex(s string) []token {
 			i = next
 			continue
 
+		case c == ':' && i > 0 && s[i-1] == '"' && len(out) > 0 && out[len(out)-1].kind == tokQuoted:
+			// A colon touching a closing quote is a field separator, which is
+			// the only way to name a bag key containing a space — and nine
+			// keys in the reference table do, `msg type` among them. Without
+			// this the colon falls into the word scanner, which cannot open a
+			// field on an empty name, so `"msg type":MsgRequestVote` became a
+			// phrase plus a search for the literal token `:MsgRequestVote`.
+			// Zero rows either way, and the filter the user typed was gone.
+			out = append(out, token{tokColon, ":", i})
+			i++
+			continue
+
 		case (c == '[' || c == '{') && i > 0 && s[i-1] == ':':
 			// A bracket range, and only ever directly after a field colon.
 			// `{` in particular is ordinary text elsewhere — log lines are
@@ -116,12 +128,62 @@ func lex(s string) []token {
 			continue
 		}
 
-		switch strings.ToUpper(w) {
-		case "AND", "&&":
+		// A word in value position is a value, whatever it spells. `msg:not`
+		// names a field and a word; classified as an operator instead, the
+		// value has nowhere to go, `parseFieldValue` returns nil, the leaf
+		// vanishes and the whole query compiles to match-everything — the
+		// filter is not wrong, it is *gone*. Measured: `msg:not` returned all
+		// 449,893 rows of the frozen window against a true 22,850.
+		if len(out) > 0 && out[len(out)-1].kind == tokColon {
+			// One instant is one value even though it contains a space.
+			// Without this, `ts:>2026-08-18 22:30:00` — the spelling the
+			// compiler's own error message recommends — splits at the space:
+			// the date becomes the bound and the clock becomes a separate
+			// full-text phrase, so the query returns 0 rows *and* spends the
+			// statement's single search function on the literal `22:30:00`.
+			if n := clockRun(s, i, w); n > 0 {
+				w += s[i : i+n]
+				i += n
+			}
+			out = append(out, token{tokWord, w, start})
+			continue
+		}
+
+		// A boolean word is a *candidate* operator here, in any case it was
+		// typed. Whether it is actually applied is decided by position, in
+		// demoteDanglingOperators below, and — for NOT alone — by spelling.
+		//
+		// Case cannot be the whole rule. Making only the uppercase spellings
+		// operators is Lucene's own rule, but on this grammar it silently
+		// turns `snapshot or peer` into a three-word conjunction and
+		// `level:(error or warn)` into `level='error' AND level='or' AND
+		// level='warn'` — a structural contradiction on a single-valued
+		// column, 0 rows where 199,583 were asked for. Case cannot be no part
+		// of the rule either: `msg:(not ready)` read as a negation returns the
+		// *complement* of `ready`.
+		//
+		// The line between them is what the operator does to its operands.
+		// `and`, `or`, `&&` and `||` only ever say how operands COMBINE — each
+		// operand still means what it meant on its own — so mistaking the
+		// English word for one of them costs a join shape, never a polarity.
+		// `NOT` INVERTS the operand it takes: it turns "must match" into "must
+		// not match", and getting that wrong hands back the complement of the
+		// table. An inverting operator therefore needs the unambiguous
+		// spelling; a combining one does not.
+		//
+		// So: `and`/`or` (any case) and `&&`/`||` are operators wherever an
+		// infix operator is grammatical; `NOT` is an operator only in capitals
+		// and only before an operand; every other occurrence is the word the
+		// user typed, and the compiler says so.
+		//
+		// The colon rule above has already claimed everything in field-value
+		// position, so `msg:not` never reaches this switch at all.
+		switch {
+		case w == "&&", strings.EqualFold(w, "AND"):
 			out = append(out, token{tokAnd, w, start})
-		case "OR", "||":
+		case w == "||", strings.EqualFold(w, "OR"):
 			out = append(out, token{tokOr, w, start})
-		case "NOT":
+		case w == "NOT":
 			out = append(out, token{tokNot, w, start})
 		default:
 			out = append(out, token{tokWord, w, start})
@@ -129,7 +191,70 @@ func lex(s string) []token {
 	}
 
 	out = append(out, token{tokEOF, "", len(s)})
-	return out
+	return demoteDanglingOperators(out)
+}
+
+// demoteDanglingOperators turns an operator token with nothing to operate on
+// back into the word it was typed as.
+//
+// This is the positional half of the operator rule; the switch in lex is the
+// spelling half. A word can be unambiguously an operator and still have
+// nothing to operate on: `NOT` on its own, `msg:(AND)`, `(or peer)`, `msg:(not
+// ready)`. In each of these the keyword switch produced an operator token that
+// the parser then dropped, taking the user's only filter with it and leaving
+// `1=1`. Returning the whole table for a one-word search is the failure this
+// library exists to remove, and it does not become acceptable because the word
+// was capitalised.
+//
+// Grammatical position is the whole test, and it differs by arity: an infix
+// `and`/`or`/`&&`/`||` needs a token that can END an operand on its left, and
+// a prefix `NOT` needs a token that can START an operand on its right.
+//
+// Two passes, and the order matters. NOT is resolved first, because a NOT that
+// demotes to a word gives the AND in front of it the right-hand operand it
+// needs: in `peer AND NOT` the NOT becomes a word and the AND stays an
+// operator, which is the reading that finds the rows containing both.
+//
+// A *trailing* AND or OR is deliberately left alone. `peer AND` is someone
+// mid-keystroke, and the generous reading — drop the dangling operator, keep
+// `peer` — is what a search box needs; demoting it instead would make the
+// result set collapse between two keystrokes. A *leading* one has no such
+// reading: there is nothing to the left to keep, and nothing the user is on
+// their way to typing will ever put something there.
+func demoteDanglingOperators(toks []token) []token {
+	for i := len(toks) - 1; i >= 0; i-- {
+		if toks[i].kind == tokNot && !startsOperand(toks[i+1].kind) {
+			toks[i].kind = tokWord
+		}
+	}
+	for i := range toks {
+		k := toks[i].kind
+		if k != tokAnd && k != tokOr {
+			continue
+		}
+		if i == 0 || !endsOperand(toks[i-1].kind) {
+			toks[i].kind = tokWord
+		}
+	}
+	return toks
+}
+
+// startsOperand reports whether a token can begin the thing an operator acts on.
+func startsOperand(k tokKind) bool {
+	switch k {
+	case tokWord, tokQuoted, tokLParen, tokRange, tokRegex, tokNot, tokMinus:
+		return true
+	}
+	return false
+}
+
+// endsOperand reports whether a token can end the thing to an operator's left.
+func endsOperand(k tokKind) bool {
+	switch k {
+	case tokWord, tokQuoted, tokRParen, tokRange, tokRegex:
+		return true
+	}
+	return false
 }
 
 // lexWord reads one word, deciding for each colon it meets whether that colon
@@ -336,6 +461,86 @@ func lexRegex(s string, i int) (val string, next int, ok bool) {
 		j++
 	}
 	return "", i, false
+}
+
+// clockRun reports the length of a ` HH:MM(:SS(.fff))(zone)` run at s[i:] that
+// belongs to the word already read, or 0 when there is none.
+//
+// It is a purely lexical rule, because this package knows nothing about
+// schemas and cannot ask whether the field is a timestamp. Two conditions
+// keep it from gluing anything else: the word must open with a comparison
+// operator, and it must end with a `YYYY-MM-DD` date. `error 22:30:00` and
+// `msg:foo 12:00` are both left alone.
+//
+// # Why a half-typed clock is glued on too
+//
+// The run is taken whole — every byte up to the next space or special
+// character — rather than only when it parses as a complete clock. That looks
+// like the more permissive rule and is in fact the stricter one, because the
+// value then reaches the compiler's complete-instant check, which refuses it
+// loudly.
+//
+// Refusing to glue is what made the guard unreachable for the spelling it was
+// written for. `ts:>2026-08-18 22` split at the space: the date became the
+// bound and `22` became a full-text term, so the query compiled to
+// `(ts > '2026-08-18' AND query('msg:22'))` — 3,779 rows over the frozen
+// window against the 129,009 of the `ts > '2026-08-18 22:00:00'` that was
+// being typed, *and* it spent the statement's single search function on a
+// fragment of a timestamp. The `T`-joined spelling `ts:>2026-08-18T22` errored
+// correctly all along, because there is no space to split at. Gluing the run
+// makes both spellings take the same route to the same error.
+//
+// The run still has to start with a digit, which is what keeps
+// `ts:>2026-08-18 peer` two terms.
+func clockRun(s string, i int, word string) int {
+	if op, rest := splitRangeOp(word); op == "" || !endsWithDate(rest) {
+		return 0
+	}
+	if i >= len(s) || s[i] != ' ' {
+		return 0
+	}
+	j := i + 1
+	if digits(s, j) == 0 {
+		// Not a clock and not a half-typed one either: a word after a date
+		// bound is an ordinary term. `ts:>2026-08-18 peer` stays two terms.
+		return 0
+	}
+	// A zone written with a space before it, `22:30:00 +05:30`, is a third run
+	// and is still left alone: it does not start with a digit, so the loop
+	// below never reaches it and the clock in front of it is complete on its
+	// own.
+	for j < len(s) && !isSpace(s[j]) && !isSpecial(s[j]) {
+		j++
+	}
+	return j - i
+}
+
+func digits(s string, i int) int {
+	n := 0
+	for i+n < len(s) && s[i+n] >= '0' && s[i+n] <= '9' {
+		n++
+	}
+	return n
+}
+
+// endsWithDate reports whether v ends in `YYYY-MM-DD`.
+func endsWithDate(v string) bool {
+	if len(v) < 10 {
+		return false
+	}
+	d := v[len(v)-10:]
+	for k, c := range []byte(d) {
+		if k == 4 || k == 7 {
+			if c != '-' {
+				return false
+			}
+			continue
+		}
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // startsTerm reports whether the byte at i begins a new term, which is what

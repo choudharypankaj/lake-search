@@ -4,9 +4,10 @@
 Two things change from v3:
 
   1. The three hidden predicate-building variables (pred, predscore, scoreexpr)
-     are gone. Panels call $__search / $__search_score, which expand in the
-     datasource backend. That removes the leaked predicates from shareable URLs
-     and makes Lucene syntax work instead of failing silently.
+     are gone. Panels call $__search / $__search_score / $__search_score_expr,
+     which expand in the datasource backend. That removes the leaked predicates
+     from shareable URLs and makes Lucene syntax work instead of failing
+     silently.
 
   2. Three panels are added for the discovery questions the search box cannot
      answer and this engine can: event deltas, and two facet tables. Live tail
@@ -210,19 +211,32 @@ panels.append(panel(32, "table", "Top nodes", 18, 31, 6, 11,
                     "GROUP BY node ORDER BY events DESC LIMIT 20"))
 
 # ------------------------------------------------------------- relevance
+# score() is legal only alongside a search function, so the ranking expression
+# is a macro too: $__search_score_expr expands to score() when the search
+# compiled to a full-text term and to the constant 0 when it did not.
+#
+# Selecting score() unconditionally is [1065] for every structured-only search
+# — component:tikv, level:ERROR, snapsh*, pod:* — and the previous way out was
+# worse than the error: $__search_score overwrote the whole predicate with a
+# token chosen to match nothing, so the panel came back empty with the user's
+# filter discarded. Measured, the component:tikv filter is 189,623 rows in the
+# frozen window and that panel showed 0 of them.
 panels.append(panel(4, "table", "Best matches — BM25 relevance", 0, 42, 24, 10,
-                    "SELECT score() AS relevance, ts, component, level, msg, pod\n"
+                    "SELECT $__search_score_expr(msg, ${search:sqlstring}) AS relevance,\n"
+                    "       ts, component, level, msg, pod\n"
                     f"FROM {TABLE}\n"
                     "WHERE $__timeFilter(ts)\n"
                     "  AND component IN (${component:sqlstring})\n"
                     "  AND level IN (${level:sqlstring})\n"
                     "  AND $__search_score(msg, ${search:sqlstring})\n"
-                    "ORDER BY relevance DESC\nLIMIT 50",
+                    "ORDER BY relevance DESC, ts DESC\nLIMIT 50",
                     fieldConfig={"defaults": {}, "overrides": [wrap("msg")]},
-                    desc="Ranked by BM25, straight from the inverted index. "
-                         "Empty search returns no rows by design: score() requires a search "
-                         "function anywhere in the statement, so the macro emits one that "
-                         "matches nothing rather than letting the panel error."))
+                    desc="Ranked by BM25, straight from the inverted index — whenever there is "
+                         "something to rank. A search with no full-text term in it (a field "
+                         "filter, a wildcard, an exclusion on its own) has no relevance to "
+                         "compute, so the column is a constant 0 and the panel falls back to "
+                         "newest-first. The rows are always the same rows the other panels "
+                         "show; only the ordering changes."))
 
 dash = {
     "uid": "tidb-logs-explorer",

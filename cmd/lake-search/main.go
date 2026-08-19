@@ -46,8 +46,12 @@ func main() {
 func usage() {
 	fmt.Fprint(os.Stderr, `lake-search — Lucene-style search compiled to Databend SQL
 
-  compile [-score] [-quiet] <query>     print the WHERE predicate
-  sql [-table T] [-limit N] <query>     print a complete SELECT
+  compile [-score] [-score-expr] [-quiet] <query>
+                                        print the WHERE predicate, or with
+                                        -score-expr the select-list ranking
+                                        expression that goes beside it
+  sql [-table T] [-limit N] [-score] <query>
+                                        print a complete SELECT
   conform [-file F] [-table T]          print the row-count conformance script
 
 Warnings go to stderr, SQL to stdout, so output can be piped safely.
@@ -78,10 +82,11 @@ func takeFlags(args []string, flags map[string]*bool) []string {
 }
 
 func cmdCompile(args []string) int {
-	var scoreV, quietV bool
-	score, quiet := &scoreV, &quietV
+	var scoreV, exprV, quietV bool
+	score, expr, quiet := &scoreV, &exprV, &quietV
 	rest := takeFlags(args, map[string]*bool{
 		"-score": score, "--score": score,
+		"-score-expr": expr, "--score-expr": expr,
 		"-quiet": quiet, "--quiet": quiet,
 	})
 
@@ -92,9 +97,15 @@ func cmdCompile(args []string) int {
 		r   databend.Result
 		err error
 	)
-	if *score {
+	switch {
+	case *expr:
+		// The select-list half of a relevance panel. It is a separate call
+		// rather than a second field on one result because the two expand in
+		// different places in the statement, through different macros.
+		r, err = databend.CompileScoreExpr(q, schema)
+	case *score:
 		r, err = databend.CompileScore(q, schema)
-	} else {
+	default:
 		r, err = databend.CompileString(q, schema)
 	}
 	if err != nil {
@@ -112,14 +123,20 @@ func cmdSQL(args []string) int {
 	fs := flag.NewFlagSet("sql", flag.ExitOnError)
 	table := fs.String("table", "logs.k8s_logs", "table to query")
 	limit := fs.Int("limit", 100, "row limit")
+	score := fs.Bool("score", false, "select a BM25 relevance column and order by it")
 	fs.Parse(args)
 
 	// The schema carries the table too: excluding a full-text term compiles to
 	// an anti-join, which has to name the same table the SELECT reads.
 	schema := databend.K8sLogs()
 	schema.Table = *table
+	q := strings.Join(fs.Args(), " ")
 
-	r, err := databend.CompileString(strings.Join(fs.Args(), " "), schema)
+	if *score {
+		return sqlScore(q, schema, *table, *limit)
+	}
+
+	r, err := databend.CompileString(q, schema)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -133,6 +150,53 @@ ORDER BY ts DESC
 LIMIT %d;
 `, *table, r.SQL, *limit)
 	return 0
+}
+
+// sqlScore prints the relevance-panel shape, which is the only shape where the
+// select list and the predicate have to be compiled together.
+//
+// score() is legal only alongside a search function, so a search that compiles
+// to structured SQL — `component:tikv`, `snapsh*`, `level:ERROR` — must select
+// a constant instead. Selecting score() unconditionally is [1065]; discarding
+// the predicate instead, which is what this tool used to do, is an empty panel
+// with the user's filter silently thrown away.
+func sqlScore(q string, schema databend.Schema, table string, limit int) int {
+	pred, err := databend.CompileScore(q, schema)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	expr, err := databend.CompileScoreExpr(q, schema)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	printWarnings(pred)
+	printWarnings(databend.Result{Warnings: extraWarnings(pred.Warnings, expr.Warnings)})
+
+	fmt.Printf(`SELECT %s AS relevance, ts, level, component, pod, msg
+FROM %s
+WHERE %s
+ORDER BY relevance DESC, ts DESC
+LIMIT %d;
+`, expr.SQL, table, pred.SQL, limit)
+	return 0
+}
+
+// extraWarnings returns the warnings the score expression raised that the
+// predicate did not, so the same advisory is not printed twice.
+func extraWarnings(already, all []string) []string {
+	seen := make(map[string]bool, len(already))
+	for _, w := range already {
+		seen[w] = true
+	}
+	var out []string
+	for _, w := range all {
+		if !seen[w] {
+			out = append(out, w)
+		}
+	}
+	return out
 }
 
 // conformance mirrors testdata/conformance.json.
@@ -298,6 +362,27 @@ func condition(compare string, hasBaseline, hasWitness bool) (string, error) {
 			return "", err
 		}
 		return "b.baseline > 0 AND a.actual > 0 AND a.actual <= b.baseline", nil
+	case "shrinks":
+		// "narrows" with the equality taken away, which is the difference
+		// between an assertion and a formality wherever the two searches are
+		// meant to ask *different* questions.
+		//
+		// It exists because of a case that could not fail. `pod:tikv-tikv-??????`
+		// was asserted to narrow `pod:tikv-tikv-*`, and the two are provably
+		// the same 189,623 rows on this table — every pod with that prefix has
+		// exactly six characters after it — so "narrows" degenerated to
+		// "nonzero" and would have passed just as well if `?` had compiled to
+		// `%`. The same shape hid the wildcard over-match: a token wildcard
+		// bounded only from below by `ge` passes for any superset, `1=1`
+		// included.
+		//
+		// So: strictly fewer rows than the baseline, and not zero. Both halves
+		// are load-bearing — `lt` alone is satisfied by the empty result this
+		// engine returns for a mistranslated query.
+		if err := needsBaseline(); err != nil {
+			return "", err
+		}
+		return "b.baseline > 0 AND a.actual > 0 AND a.actual < b.baseline", nil
 	case "partitions":
 		// The strongest form available: actual and witness must be exactly
 		// complementary halves of the baseline, so `a -b` is checked against
