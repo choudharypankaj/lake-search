@@ -1222,7 +1222,15 @@ func TestBagKeySpellingIsPreserved(t *testing.T) {
 // The other direction of the same fact: a hand-written descriptor that declares
 // the wrong case is a real and silent mistake, and it deserves its own sentence
 // rather than being reported as a key that vanished.
-func TestBagKeyCaseMismatchIsAHazard(t *testing.T) {
+//
+// It is DRIFT rather than a hazard, and the distinction is the exit status. A
+// hazard is a standing condition the descriptor still answers correctly -- a
+// shadowing bag key loses to the declared field by documented precedence, so
+// nothing is wrong and exit 0 is honest. A mis-cased declaration reaches zero
+// rows, so every comparison typed for it is silently empty; filing that at
+// exit 0 would leave automation green over a declaration that does nothing,
+// which is the same silence this check exists to break, only friendlier.
+func TestBagKeyCaseMismatchIsDrift(t *testing.T) {
 	def := Def{
 		Table: "t", Default: "body", Time: "ts",
 		Indexes: []IndexDef{{Name: "i", Kind: "inverted", Columns: []string{"body"}}},
@@ -1253,19 +1261,25 @@ func TestBagKeyCaseMismatchIsAHazard(t *testing.T) {
 	}
 	rep := DriftDetail(sh, s, "")
 
-	// Not drift: the key did not vanish, it was misspelled.
+	// Drift, because the declaration reaches nothing -- but NOT the vanished-key
+	// sentence, because the key did not vanish, it was misspelled, and the two
+	// mistakes have different fixes.
+	haz := strings.Join(rep.Drift, "\n")
 	for _, d := range rep.Drift {
 		if strings.Contains(d, "outlived it") {
 			t.Errorf("a case mismatch must not be reported as a vanished key: %s", d)
 		}
 	}
-	haz := strings.Join(rep.Hazards, "\n")
+	if len(rep.Hazards) != 0 {
+		t.Errorf("a dead declaration must not be filed as a standing hazard, "+
+			"or automation stays green over it: %v", rep.Hazards)
+	}
 	for _, want := range []string{
 		"kv['tableid'] is absent", "different case: kv['tableID'] on 300 rows",
 		"case-sensitive", `Re-declare it as "tableID"`,
 	} {
 		if !strings.Contains(haz, want) {
-			t.Errorf("the hazard should mention %q; got:\n%s", want, haz)
+			t.Errorf("the finding should mention %q; got:\n%s", want, haz)
 		}
 	}
 
@@ -1278,13 +1292,13 @@ func TestBagKeyCaseMismatchIsAHazard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	hazBoth := strings.Join(DriftDetail(shBoth, s, "").Hazards, "\n")
+	hazBoth := strings.Join(DriftDetail(shBoth, s, "").Drift, "\n")
 	for _, want := range []string{
 		"kv['TableID'] on 7 rows", "kv['tableID'] on 300 rows",
 		"There are 2 of them", "nothing can choose for you",
 	} {
 		if !strings.Contains(hazBoth, want) {
-			t.Errorf("with two candidate spellings the hazard should mention %q; got:\n%s",
+			t.Errorf("with two candidate spellings the finding should mention %q; got:\n%s",
 				want, hazBoth)
 		}
 	}
@@ -1487,5 +1501,77 @@ func TestMalformedBagWindowIsRefused(t *testing.T) {
 	// Control: the unmutated fixture parses.
 	if _, err := ParseShape(string(raw), "logs.a2_bagdrift"); err != nil {
 		t.Fatalf("the valid fixture must still parse: %v", err)
+	}
+}
+
+// A STORED computed column must never reach a descriptor as a plain one.
+//
+// This invariant was prose in `Column.Derived`'s own comment -- "a computed
+// column must never be proposed as a plain column, because a writer cannot set
+// it" -- and prose is exactly how the case-folding bug survived: the advisory
+// had stated the rule since round 4 and the code broke it in round 6. The
+// parsing layer WAS tested (TestParseShape asserts `line` carries Derived and
+// `raw` does not), which is the trap: an invariant tested in one layer and
+// assumed in the next is untested where it matters. Build is where the mistake
+// would actually be made, so it is asserted here, and generically over every
+// column the shape reports rather than for `line` alone, so a second computed
+// column added later cannot slip through.
+//
+// Both directions, because half of this invariant is the boring half: a plain
+// column must not acquire a derived expression either, or a migration written
+// from the descriptor would try to compute a column the writer is meant to set.
+func TestComputedColumnsAreNeverProposedAsPlain(t *testing.T) {
+	for _, tc := range []struct{ fixture, table string }{
+		{"../testdata/shape-k8s-logs.txt", "logs.k8s_logs"},
+		{"../testdata/shape-k8s-logs-v2.txt", "logs.k8s_logs_v2"},
+		{"../testdata/shape-awkward.txt", "logs.a2_awkward"},
+	} {
+		t.Run(tc.table, func(t *testing.T) {
+			shape := mustShape(t, tc.fixture, tc.table)
+			def, _, err := Build(shape, Profile{}, BuildOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			// Index the descriptor by the column each field reads, since a
+			// field's name need not be its column.
+			byCol := map[string]FieldDef{}
+			for _, fd := range def.Fields {
+				col := fd.Column
+				if col == "" {
+					col = fd.Name
+				}
+				byCol[col] = fd
+			}
+
+			computed := 0
+			for _, c := range shape.Columns {
+				fd, declared := byCol[c.Name]
+				if !declared {
+					continue // not every column has to be a field
+				}
+				switch {
+				case c.Derived != "" && fd.Derived == "":
+					t.Errorf("%s is a STORED computed column but the descriptor declares it "+
+						"plain: a writer cannot set it, and a migration built from this "+
+						"descriptor would try to", c.Name)
+				case c.Derived == "" && fd.Derived != "":
+					t.Errorf("%s is a plain column but the descriptor gives it derived=%q, "+
+						"so a migration would compute a column the writer is meant to set",
+						c.Name, fd.Derived)
+				}
+				if c.Derived != "" {
+					computed++
+				}
+			}
+
+			// Guard the guard: a fixture with no computed column would let this
+			// test pass while asserting nothing, and two of these three tables
+			// have one.
+			if tc.table != "logs.a2_awkward" && computed == 0 {
+				t.Fatalf("%s has no computed column in its shape, so this test proved nothing",
+					tc.table)
+			}
+		})
 	}
 }

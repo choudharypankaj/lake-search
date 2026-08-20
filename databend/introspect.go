@@ -1032,7 +1032,23 @@ func bagDrift(rep *DriftReport, shape Shape, s Schema) {
 						which = fmt.Sprintf("There are %d of them, so nothing can choose for "+
 							"you — declare the one you mean", len(actual))
 					}
-					rep.Hazards = append(rep.Hazards, fmt.Sprintf(
+					// Drift, not a hazard, and the sentence itself is the
+					// argument: a declaration that "reaches nothing" is broken,
+					// not ambiguous. The split holds that a hazard is a
+					// standing condition where the descriptor still gets a
+					// right answer -- a shadowing key loses to the declared
+					// field by documented precedence, so nothing is wrong. Here
+					// the declared spelling matches zero rows, so every
+					// comparison typed for it is silently empty and no
+					// precedence saves it. Reporting that at exit 0 would let
+					// automation stay green over a dead declaration, which is
+					// the same silence this check exists to break -- only
+					// friendlier, which makes it worse.
+					//
+					// It keeps the hazard's wording, because knowing the
+					// spelling that does exist is the whole value: this is the
+					// one drift finding that comes with its own fix.
+					rep.Drift = append(rep.Drift, fmt.Sprintf(
 						"declared key %s['%s'] is absent, but the data has the same name in a "+
 							"different case: %s. VARIANT keys are case-sensitive on this engine, "+
 							"so the declaration reaches nothing and `%s:value` queries a key "+
