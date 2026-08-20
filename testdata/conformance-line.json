@@ -107,6 +107,63 @@
       "note": "The general form of a defect that reached production. A real column the descriptor does not declare is not merely missing: with a bag configured, every query naming it is routed into the bag, where it matches nothing, and the advisory says the name \"is not a column\" — which is false. Measured on this table, `source_file IS NOT NULL AND source_file <> ''` is 795,924 rows while `kv['source_file'] IS NOT NULL` is 0, so this case returns 795,924 while declared and 0 the moment the declaration is dropped. It caught `raw` on the live table: 5,112 rows in the column, 0 under the bag key. The regression guard for the specific column is TestPresetDeclaresEveryLiveColumn, which compares the shipped presets against a captured table shape."
     },
     {
+      "name": "a disjunction mixing full text with a field filter keeps both branches",
+      "query": "RemoteStopped OR level:ERROR",
+      "baseline": "level:ERROR",
+      "compare": "gt",
+      "note": "The defect was worse than a typo hazard. A search function inside a disjunction makes the scan visit only the blocks the index says contain matches, and the other branch is evaluated only in those blocks — so what is lost is the other branch's rows in the blocks the text term never touched. On this 5-block copy, with level=ERROR spread over all five: `peer`/`snapshot` touch 5 blocks and lose nothing, `rejections` touches 4 and loses 20.0%, `RemoteStopped` touches 4 and loses 26.2%. So this case is discriminating: the old shape answers 253,587 where the union is 343,695, which is BELOW the baseline and fails `gt`. Compiled as a row-key semi-join it is exact."
+    },
+    {
+      "name": "a disjunction whose full-text branch matches nothing keeps the other branch",
+      "query": "zzzznotpresentzzzz OR level:ERROR",
+      "baseline": "level:ERROR",
+      "compare": "eq",
+      "note": "The limit of the same mechanism: zero matches means zero blocks visited, so the other branch is lost entirely. Measured on this table the old shape returns 0 against a truth of 343,090, and on the live table `query(...) OR 1=1` returns 0 of 1,063,259 — the whole table discarded because one branch matched nothing. Branch order is irrelevant. Keyed on the row the answer is exactly the other branch, so this must equal the field filter alone."
+    },
+    {
+      "name": "a three-branch disjunction loses no branch",
+      "query": "zzzznotpresentzzzz OR level:ERROR OR level:WARN",
+      "baseline": "level:(error OR warn)",
+      "compare": "eq",
+      "note": "The loss is not limited to a pair. Measured live, `query(NO-MATCH) OR level=ERROR OR level=WARN` returned 0 against a truth of 463,701 — two branches gone — because pruning is a property of the scan, not of an operand pair. On this table the old shape answers 0 against 400,021."
+    },
+    {
+      "name": "an excluded term ORed with a field filter still returns everything it should",
+      "query": "-zzzznotpresentzzzz OR level:ERROR",
+      "baseline": "ts:*",
+      "compare": "eq",
+      "note": "This shape was ALREADY correct before the fix, and it is why the fix looks the way it does: a negated branch compiles to an anti-join, so its search function already sat inside a subquery and pruned only there. Measured live it returns 1,063,259, the whole table, correctly. It is asserted here as a regression guard rather than as a discriminator — an earlier attempt at this change routed negated branches into the new semi-join and broke exactly this case."
+    },
+    {
+      "name": "a full-text term ANDed with a field filter is unchanged",
+      "query": "RemoteStopped level:ERROR",
+      "baseline": "RemoteStopped",
+      "compare": "le",
+      "note": "The AND path is genuinely correct rather than accidentally so — `query(NO-MATCH) AND level=ERROR` is 0 and 0 is the truth, because pruning the scan to nothing is the right answer for a conjunction. It keeps a bare query() and no subquery. A regression guard, so the disjunction fix does not spread to the conjunction where it would cost a needless second scan."
+    },
+    {
+      "name": "excluding a term is exact, not merely close",
+      "query": "-RemoteStopped",
+      "baseline": "ts:*",
+      "witness": "RemoteStopped",
+      "compare": "partitions",
+      "note": "An exactness assertion, and an honest note about what it does NOT discriminate. `partitions` demands that the excluded and included halves add up to the table exactly. That holds under BOTH the old text-keyed anti-join and the new row-keyed one, and the reason is structural: the anti-join keys on the column it searched, and two rows with identical text match or miss the index together, so expanding the match set by shared text is idempotent — measured, `query('msg:snapshot')` is 17,661 rows and `msg IN (SELECT msg WHERE query('msg:snapshot'))` is also 17,661. Verified across 14 term/preset combinations on a 1,063,259-row table, every one identical. So the negation was already exact; the row key is a simplification there (no COALESCE) and insurance against the keying and the search ever diverging, which is the one arrangement that IS wrong: keying on msg while searching line gives 1,035,332 against a truth of 1,036,932."
+    },
+    {
+      "name": "a full-text term inside a conjunction inside a disjunction keeps both branches",
+      "query": "level:ERROR OR (level:WARN RemoteStopped)",
+      "baseline": "level:ERROR",
+      "compare": "gt",
+      "note": "The shape the previous round missed. A conjunction collapses its full-text child into ordinary SQL, so by the time the surrounding disjunction is assembled nothing can see that a search function is inside that branch - and it prunes the scan for the whole predicate exactly as a bare one would. Measured on this table the old form returns 253,002 where the truth is 343,110, losing 90,108 rows (26.3%); on the live table `level:WARN OR (level:ERROR RemoteStopped)` returned 27,502 of a true 60,727, losing 54.7%. `RemoteStopped` is deliberately the term here: it touches 4 of this table's 5 blocks, so it misses one. A common term like `region` touches all five and would make this case pass under the defect, proving nothing. The fix hoists the whole branch into a row-key subquery, giving 343,110 = 343,090 + 20."
+    },
+    {
+      "name": "two branches each combining full text with a filter both survive",
+      "query": "(RemoteStopped level:INFO) OR (peer level:WARN)",
+      "baseline": "RemoteStopped level:INFO",
+      "compare": "gt",
+      "note": "This used to be a compile error - two search functions in one statement, which the engine allows only one of. Each branch now goes into its own subquery, which is its own scan, so it compiles and is exact: 53,212 = 585 + 52,627 with no overlap, and on the live table the equivalent is 379,169 = 375,692 + 3,477. So the fix removes a refusal as well as a wrong answer. Under the old compiler this case fails by failing to compile at all."
+    },
+    {
       "name": "a bare word still finds nothing that is not there",
       "query": "zzzznotpresentzzzz",
       "compare": "zero",

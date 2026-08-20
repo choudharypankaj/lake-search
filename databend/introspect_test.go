@@ -1580,3 +1580,321 @@ func TestComputedColumnsAreNeverProposedAsPlain(t *testing.T) {
 		})
 	}
 }
+
+// A search function inside a disjunction must sit in a subquery.
+//
+// The engine visits only the blocks its index says contain matches and
+// evaluates the other branch only in those blocks, so a bare query() under OR
+// loses the other branch's rows everywhere the text term did not reach. On a
+// 5-block copy with level=ERROR spread over all five: a term touching 4 blocks
+// lost 20-26%, and a term matching nothing lost 100% — `query(...) OR 1=1`
+// returned 0 of 1,063,259 rows.
+func TestDisjunctionUsesARowKeySubquery(t *testing.T) {
+	s, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const sub = "_row_id IN (SELECT _row_id FROM logs.k8s_logs WHERE query('line:snapshot'))"
+
+	// Both orders, because branch order is irrelevant to the defect.
+	for _, q := range []string{"snapshot OR level:ERROR", "level:ERROR OR snapshot"} {
+		got := mustCompile(t, q, s)
+		if !strings.Contains(got, sub) {
+			t.Errorf("CompileString(%q) must put the search in a subquery, got: %s", q, got)
+		}
+		if strings.Contains(got, "OR query(") || strings.Contains(got, "query('line:snapshot') OR") {
+			t.Errorf("CompileString(%q) still has a bare search function under OR: %s", q, got)
+		}
+	}
+
+	// Three branches: the loss scaled with the number of them, so every
+	// non-text branch must survive.
+	got := mustCompile(t, "snapshot OR level:ERROR OR level:WARN", s)
+	for _, want := range []string{sub, "lower(level) = lower('ERROR')", "lower(level) = lower('WARN')"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("three-branch disjunction lost %s: %s", want, got)
+		}
+	}
+
+	// The AND path is genuinely correct and must NOT acquire a subquery: a
+	// conjunction pruned to nothing is the right answer, and a subquery there
+	// would buy a second scan for nothing.
+	got = mustCompile(t, "snapshot level:ERROR", s)
+	if strings.Contains(got, "SELECT _row_id") {
+		t.Errorf("the conjunction must keep a bare search function: %s", got)
+	}
+	if got != "(query('line:snapshot') AND lower(level) = lower('ERROR'))" {
+		t.Errorf("conjunction changed shape: %s", got)
+	}
+
+	// An all-text disjunction stays one query() call — it never leaves the
+	// index, so there is nothing to prune away.
+	if got := mustCompile(t, "snapshot OR peer", s); got != "query('(line:snapshot) OR (line:peer)')" {
+		t.Errorf("an all-text OR must stay one search function: %s", got)
+	}
+}
+
+// A NEGATED branch in a disjunction was already correct, because the negation
+// compiled to an anti-join whose search function already sat in a subquery.
+// Generalising the fix to the positive branch must not disturb it — an earlier
+// attempt routed negated branches into the new semi-join and broke this.
+func TestNegatedBranchInDisjunctionStillWorks(t *testing.T) {
+	s, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, q := range []string{"-zzzznosuchtoken OR level:ERROR", "-snapshot OR level:ERROR"} {
+		got := mustCompile(t, q, s)
+		if !strings.Contains(got, "_row_id NOT IN (SELECT _row_id") {
+			t.Errorf("CompileString(%q) should be an anti-join ORed with the filter, got: %s", q, got)
+		}
+		if !strings.Contains(got, "lower(level) = lower('ERROR')") {
+			t.Errorf("CompileString(%q) lost the other branch: %s", q, got)
+		}
+	}
+}
+
+// With no row key, each shape gets the strongest thing that is still EXACT, and
+// only the shape with no exact option is refused.
+//
+//   - a pure text fragment is keyed on its own text column. That is exact, not
+//     approximate: the subquery's predicate is a function of that one column, so
+//     rows sharing a value match or miss together. Measured,
+//     `query('line:region')` is 228,209 and
+//     `line IN (SELECT line WHERE query('line:region'))` is also 228,209.
+//   - the negation likewise, which is why it always worked.
+//   - a COMPOSITE branch is refused, because keying it on text is not
+//     idempotent — the branch constrains other columns too, and on the live
+//     table `level:ERROR tso` over-counts 1,728 rows as 1,884.
+func TestNoRowKeyKeepsWhatIsExactAndRefusesWhatIsNot(t *testing.T) {
+	s, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.RowKey = ""
+
+	// A pure text fragment: exact text-keyed fallback, with a warning about cost
+	// rather than about correctness.
+	r, err := CompileString("snapshot OR level:ERROR", s)
+	if err != nil {
+		t.Fatalf("a pure text disjunct has an exact fallback: %v", err)
+	}
+	if !strings.Contains(r.SQL, "line IN (SELECT line FROM logs.k8s_logs WHERE query('line:snapshot'))") {
+		t.Errorf("expected a text-keyed semi-join: %s", r.SQL)
+	}
+	if strings.Contains(r.SQL, "OR query(") {
+		t.Errorf("a bare search function must not remain under OR: %s", r.SQL)
+	}
+	var warn string
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "compiled as a subquery") {
+			warn = w
+		}
+	}
+	if warn == "" {
+		t.Fatalf("the fallback should warn; got %v", r.Warnings)
+	}
+	if !strings.Contains(warn, "exact but compares whole values") {
+		t.Errorf("the warning should be about cost, not correctness: %s", warn)
+	}
+	for _, gone := range []string{"15.6", "44,891", "TOO FEW"} {
+		if strings.Contains(warn, gone) {
+			t.Errorf("this warning once cited a figure that does not reproduce (%s): %s", gone, warn)
+		}
+	}
+
+	// A composite branch has no exact fallback, so it is refused and the
+	// refusal names why.
+	_, err = CompileString("level:WARN OR (level:ERROR snapshot)", s)
+	if err == nil {
+		t.Fatal("a composite branch with no row key must be refused")
+	}
+	for _, want := range []string{"row key", "27,502", "60,727", "constrains other columns"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("the refusal should mention %q: %v", want, err)
+		}
+	}
+
+	// The negation still compiles, keyed on the searched column, exact.
+	r, err = CompileString("-snapshot", s)
+	if err != nil {
+		t.Fatalf("the negation must still compile without a row key: %v", err)
+	}
+	if !strings.Contains(r.SQL, "COALESCE(line NOT IN (SELECT line") {
+		t.Errorf("expected the text-keyed anti-join: %s", r.SQL)
+	}
+	for _, w := range r.Warnings {
+		if strings.Contains(w, "TOO FEW") || strings.Contains(w, "5.41") {
+			t.Errorf("this warning once claimed a nonexistent error range: %s", w)
+		}
+	}
+}
+
+// The two subquery shapes are one mechanism, opposite polarity. Asserted on the
+// emitted SQL so the two cannot drift into similar-looking but different code.
+func TestRowKeyMembershipIsOneMechanism(t *testing.T) {
+	s, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pos := mustCompile(t, "snapshot OR level:ERROR", s)
+	neg := mustCompile(t, "-snapshot", s)
+
+	const in = "_row_id IN (SELECT _row_id FROM logs.k8s_logs WHERE query('line:snapshot'))"
+	const notIn = "_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('line:snapshot'))"
+	if !strings.Contains(pos, in) {
+		t.Errorf("positive polarity: %s", pos)
+	}
+	if neg != notIn {
+		t.Errorf("negative polarity: %s", neg)
+	}
+	// No COALESCE on the row-key path: the key is never NULL, verified over
+	// 1,063,259 rows and over the 967,912-row frozen copy.
+	if strings.Contains(neg, "COALESCE") {
+		t.Errorf("the row-keyed anti-join needs no COALESCE: %s", neg)
+	}
+}
+
+// The row key is a PSEUDO-column, so DESCRIBE cannot see it and it has to be
+// probed for by name, with evidence of uniqueness rather than mere existence.
+func TestRowKeyProbeAndProposal(t *testing.T) {
+	sql := ShapeProbe("logs.k8s_logs")
+	if !strings.Contains(sql, "rowkey|_row_id") {
+		t.Error("the shape probe must ask for the row key by name")
+	}
+	if !strings.Contains(sql, "count(DISTINCT _row_id)") || !strings.Contains(sql, "IS NULL") {
+		t.Error("it must sample uniqueness and nullability, not just binding")
+	}
+
+	base := "lsprobe|v1|section|columns|t\nbody\tVARCHAR\tYES\tNULL\t\nts\tTIMESTAMP\tYES\tNULL\t\n" +
+		"lsprobe|v1|section|create|t\nt\t\"CREATE TABLE t (\n  body VARCHAR NULL,\n" +
+		"  ts TIMESTAMP NULL,\n  SYNC INVERTED INDEX i (body)\n) ENGINE=FUSE\"\n"
+
+	for _, tc := range []struct {
+		name, marker, wantKey, wantSaid string
+	}{
+		{"usable", "lsprobe|v1|rowkey|_row_id|10000|10000|0\n", "_row_id", "probe-confirmed"},
+		{"not unique", "lsprobe|v1|rowkey|_row_id|10000|9000|0\n", "", "not usable"},
+		{"nullable", "lsprobe|v1|rowkey|_row_id|10000|10000|5\n", "", "not usable"},
+		{"absent", "", "", "no candidate bound"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sh, err := ParseShape(base+tc.marker, "t")
+			if err != nil {
+				t.Fatal(err)
+			}
+			def, _, err := Build(sh, Profile{}, BuildOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if def.RowKey != tc.wantKey {
+				t.Errorf("RowKey = %q, want %q", def.RowKey, tc.wantKey)
+			}
+			said := def.Introspect.Roles["row_key"] + "\n" + strings.Join(def.Introspect.Refused, "\n")
+			if !strings.Contains(said, tc.wantSaid) {
+				t.Errorf("provenance should mention %q; got:\n%s", tc.wantSaid, said)
+			}
+			if tc.wantKey == "" && !strings.Contains(said, "REFUSED") {
+				t.Errorf("without a row key the refusal must name what is lost:\n%s", said)
+			}
+		})
+	}
+}
+
+// Both shipped presets must declare the row key, or the shape they exist to
+// support is refused on the shipped path.
+func TestPresetsDeclareARowKey(t *testing.T) {
+	for _, name := range PresetNames() {
+		s, _, err := Preset(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.RowKey != "_row_id" {
+			t.Errorf("preset %q declares row_key %q, want _row_id", name, s.RowKey)
+		}
+		if _, err := CompileString("snapshot OR level:ERROR", s); err != nil {
+			t.Errorf("preset %q cannot compile a mixed disjunction: %v", name, err)
+		}
+	}
+}
+
+// A conjunction collapses its full-text child into ordinary SQL, so by the time
+// a surrounding disjunction is assembled nothing can see that a search function
+// is inside that branch. Guarding on `text` therefore missed it entirely, and
+// `level:WARN OR (level:ERROR RemoteStopped)` returned 27,502 of a true 60,727 —
+// 54.7% lost, silently, in a predicate byte-identical to the one the previous
+// round shipped.
+//
+// The term matters. `RemoteStopped` touches 4 of the reference table's 5 blocks
+// so it misses one; `region` touches all five and would make this pass under the
+// defect. A test built on a common term proves nothing here.
+func TestSearchFunctionInsideAConjunctionUnderDisjunction(t *testing.T) {
+	s, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const branch = "(lower(level) = lower('ERROR') AND query('line:RemoteStopped'))"
+
+	got := mustCompile(t, "level:WARN OR (level:ERROR RemoteStopped)", s)
+	if !strings.Contains(got, "_row_id IN (SELECT _row_id FROM logs.k8s_logs WHERE "+branch+")") {
+		t.Errorf("the whole branch must be hoisted into a subquery, got: %s", got)
+	}
+	// The tell-tale of the defect: a search function still sitting directly in
+	// the disjunction.
+	if strings.Contains(got, "OR "+branch) {
+		t.Errorf("a search function remains under OR: %s", got)
+	}
+	if !strings.Contains(got, "lower(level) = lower('WARN')") {
+		t.Errorf("the other branch was lost: %s", got)
+	}
+
+	// Both branches composite: this used to be refused for needing two search
+	// functions, and now compiles because each is its own scan.
+	got = mustCompile(t, "(peer level:error) OR (status level:warn)", s)
+	if n := strings.Count(got, "SELECT _row_id"); n != 2 {
+		t.Errorf("expected two subqueries, got %d: %s", n, got)
+	}
+
+	// A text fragment ORed with a composite branch: one plain semi-join and one
+	// hoisted branch, neither of them bare.
+	got = mustCompile(t, "snapshot OR (level:ERROR RemoteStopped)", s)
+	if n := strings.Count(got, "SELECT _row_id"); n != 2 {
+		t.Errorf("expected two subqueries, got %d: %s", n, got)
+	}
+	if strings.Contains(got, "OR query(") {
+		t.Errorf("a bare search function remains: %s", got)
+	}
+
+	// AND is untouched — pruning to nothing is the right answer there, and a
+	// subquery would buy a second scan for nothing.
+	got = mustCompile(t, "level:ERROR RemoteStopped", s)
+	if strings.Contains(got, "SELECT _row_id") {
+		t.Errorf("the conjunction must not acquire a subquery: %s", got)
+	}
+}
+
+// The fragment must CARRY the fact that its SQL contains a search function,
+// rather than the disjunction path inspecting the SQL it is about to join. A
+// compiler that greps its own output is one that will be wrong again later.
+func TestFragmentCarriesItsSearchFunctionCount(t *testing.T) {
+	s, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Nested two deep: the count has to survive more than one assembly step.
+	got := mustCompile(t, "level:INFO OR ((level:ERROR RemoteStopped) pod:*)", s)
+	if strings.Contains(got, "OR (lower(level) = lower('ERROR')") {
+		t.Errorf("the nested branch was not hoisted: %s", got)
+	}
+	if !strings.Contains(got, "SELECT _row_id") {
+		t.Errorf("expected a subquery: %s", got)
+	}
+	if !strings.Contains(got, "lower(level) = lower('INFO')") {
+		t.Errorf("the other branch was lost: %s", got)
+	}
+	// And the hoist moved the search function out of the outer scan, so the
+	// statement is not over its one-per-statement budget.
+	if _, err := CompileString("level:INFO OR ((level:ERROR RemoteStopped) pod:*)", s); err != nil {
+		t.Errorf("should compile: %v", err)
+	}
+}

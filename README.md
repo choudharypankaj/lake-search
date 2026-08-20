@@ -92,6 +92,7 @@ returns nothing:
 | `http://a.com` | the colon reads as a field selector; **0 rows** | "that URL isn't in the logs" |
 | `-absent_term` | the search function prunes the scan; **0 rows** | "nothing survives the exclusion" |
 | *(empty box)* | `match(col,'')` matches nothing; **0 rows** | "there are no logs" |
+| `RemoteStopped OR level:ERROR` | a search function under `OR` prunes the scan to the blocks its index says match, and the other branch is evaluated only there; **253,587 rows against a true 343,695** — and **0** if the text term matches nothing | "that is all the errors there are" |
 | a word the collector parsed out of the message | `err=RemoteStopped` is moved into the `kv` bag, so `RemoteStopped` is not in `msg` any more; **0 rows** against 605 for the same word in the reconstructed line | "that error never happened" |
 | `latency_ms:>30` on a bag key | one non-numeric value anywhere in that key fails the **whole statement**: `[1006] invalid float literal ... to_float64('Some(25)')`, where the truth is 39,140 rows | "the query is broken" |
 | `err:RemoteStopped` through the index alone | `query()` is tokenised and stemmed, so it matches a value merely *containing* a token that stems to the term: `kv.request:command` is **501 rows** whose value is `batch_commands`, where the equality is 0 | "501 requests were `command`" |
@@ -153,7 +154,15 @@ and their disjunction 118,896 — the union to the row.
 ## The one-search-function rule
 
 Verified on a live warehouse (Databend v0.34.0), and it shapes the whole design:
-**a statement may contain at most one search function per table.**
+**a statement may contain at most one BARE search function per table.** The qualifier is
+load-bearing and was measured later: the limit binds a search function sitting directly in the scan,
+and a search function wrapped in a row-key subquery escapes it entirely — `count_if(query(…))` is
+`[1065]`, while `count_if(_row_id IN (SELECT _row_id … query(…)))` returns 737 — the same as the
+predicate alone — and two such predicates coexist in one statement returning 737 and 26,408
+(`ts < '2026-08-20 04:00:00'`, 1,072,856 rows). That is why the compiler can now
+put more than one text condition in a statement, and it is the reason the
+[row-key subquery](#why-a-schema-declares-a-row-key) works at all rather than merely being a
+workaround for block pruning.
 
 ```sql
 match(msg,'a') AND match(msg,'b')   -- [1065] duplicate search function for table 0
@@ -540,6 +549,78 @@ behaviour change every saved link will notice: `query('msg:snapshot')` is 17,649
 `msg:` typed explicitly still means exactly what it always did. This is also why it is a separate
 preset (`k8s-logs-line`) rather than a change to `k8s-logs`: the migration is a deployment decision,
 and pointing a schema at a column the table does not have is `[1065]` on the first query.
+
+## Why a schema declares a row key
+
+`row_key` names a column identifying a row uniquely — `_row_id` on this engine. It exists for one
+reason, and it is the most severe thing measured in this project.
+
+**A search function inside a disjunction prunes the scan for the whole predicate.** The index scan
+visits only the blocks the index says contain matches, and every other branch of the `OR` is evaluated
+only in those blocks. So what is lost is the other branch's rows in the blocks the text term never
+touched. Measured on the 5-block frozen copy, with `level=ERROR` spread across all five:
+
+| text term | blocks touched | emitted | truth | lost |
+| --- | --- | --- | --- | --- |
+| `peer`, `snapshot` | 5 of 5 | 364,945 | 364,945 | none |
+| `rejections` | 4 of 5 | 276,648 | 345,850 | **20.0%** |
+| `RemoteStopped` | 4 of 5 | 253,587 | 343,695 | **26.2%** |
+| `the` (a stopword, 0 matches) | 0 of 5 | 0 | 343,090 | **100%** |
+
+So `RemoteStopped OR level:ERROR` — an ordinary query, not a typo — silently lost a quarter of the
+error rows. Branch order makes no difference, and the loss scales with the number of branches: a
+three-way disjunction lost two of them.
+
+The fix is to put the search function in a subquery and test row membership in the outer scan, which
+is an ordinary comparison no optimiser rewrites:
+
+```sql
+_row_id IN (SELECT _row_id FROM logs.k8s_logs WHERE query('line:snapshot'))
+  OR lower(level) = lower('ERROR')
+```
+
+Exact in both cases — 424,841 with a matching term and 402,974 with one that matches nothing, each
+equal to its independently computed truth.
+
+**The repo already contained half of this.** A *negated* branch under `OR` was always correct, because
+a negation compiles to an anti-join and its search function therefore already sat in a subquery:
+`-zzzznosuchtoken OR level:ERROR` returns the whole table. The fix is the same move at the opposite
+polarity, so both are built from one constructor — `IN` for a positive branch, `NOT IN` for a negated
+one.
+
+**A search function ANDed with something else and then ORed is the same bug.** `level:WARN OR
+(level:ERROR RemoteStopped)` returned **27,502 where the truth is 60,727** — 54.7% lost — because the
+conjunction collapses its text child into ordinary SQL, so nothing downstream could see that a search
+function was inside that branch. The whole branch is now hoisted into the subquery, and the fragment
+carries a count of the search functions in it rather than the compiler inspecting its own output.
+
+That shape also used to be *refused* in another form: `(peer level:error) OR (status level:warn)` needed
+two search functions in one statement. Each branch now gets its own subquery, which is its own scan, so
+it compiles — verified live at 368,007, matching 368,002 + 5 computed from the branches independently.
+
+**With no row key declared, each shape falls back to the strongest option that is still exact.** A plain
+full-text term and a negation are keyed on their own text column, and that is exact rather than
+approximate: the subquery's predicate is a function of that one column, so rows sharing a value match or
+miss together. Measured — `query('line:region')` is 228,209 and `line IN (SELECT line WHERE
+query('line:region'))` is also 228,209, and the disjunction is exact for every term tried.
+
+Only the **composite** branch is refused, because there the text key is genuinely unsound: the branch
+constrains other columns too: two rows sharing a text value can differ in `level`, and expanding by
+shared text then pulls in a row the branch excluded. Measured on the live table, where exactly two
+`msg` values out of 160,802 occur at more than one level, `level:ERROR tso` is **1,728** rows
+row-keyed and **1,884** msg-keyed — 156 over. The magnitude is a property of the data rather than a
+ratio worth quoting. The row key is preferred everywhere anyway, for cost:
+comparing an 18-byte identifier beats comparing a log line that can run to 29KB.
+
+The AND path is untouched: a conjunction pruned to nothing is the *right* answer, so it keeps a bare
+`query()` and buys no second scan.
+
+`_row_id` is stable enough to key a subquery on a table taking thousands of rows a minute — one
+statement over a closed bound is one snapshot, and `_row_id IN (SELECT _row_id FROM t)` is the whole
+table while `NOT IN` of the same is 0. It is unique and never NULL over both the 1,063,259-row live
+table and the 967,912-row copy. It is schema data rather than a constant because it is engine-specific:
+`_block_name` and `_segment_name` exist here but identify a file, and `_row_number` does not exist at
+all.
 
 ## Bootstrapping a descriptor
 

@@ -42,7 +42,7 @@ func TestCompile(t *testing.T) {
 		// search function prunes the scan before the NOT is evaluated. The
 		// anti-join puts the search function in its own scan, where an empty
 		// match correctly yields an empty exclusion set.
-		{"NOT keyword", "NOT TiFlash", `COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('msg:TiFlash')), TRUE)`},
+		{"NOT keyword", "NOT TiFlash", `_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('msg:TiFlash'))`},
 		// Negatives are bare and trailing: `AND NOT` returns zero rows on this
 		// engine, in every spelling.
 		{"minus shorthand", "snapshot -TiFlash",
@@ -53,7 +53,7 @@ func TestCompile(t *testing.T) {
 		// single SQL NOT, rather than a purely negative query that matches
 		// nothing.
 		{"all negative folds", "-TiFlash -snapshot",
-			`COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('(msg:TiFlash) OR (msg:snapshot)')), TRUE)`},
+			`_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('(msg:TiFlash) OR (msg:snapshot)'))`},
 
 		// --- field predicates on plain columns ---
 		{"field equals", "level:error", `lower(level) = lower('error')`},
@@ -141,9 +141,9 @@ func TestCompile(t *testing.T) {
 		// `(a) OR NOT (b)` drops the negative silently, so the shape cannot be
 		// emitted as written — but it can be rewritten into the one that works.
 		{"or with a negation", "peer OR -status",
-			`COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('(msg:status) NOT ((msg:peer))')), TRUE)`},
+			`_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('(msg:status) NOT ((msg:peer))'))`},
 		{"or with two negations", "peer OR region OR -status",
-			`COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('(msg:status) NOT ((msg:peer) OR (msg:region))')), TRUE)`},
+			`_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('(msg:status) NOT ((msg:peer) OR (msg:region))'))`},
 
 		// --- Lucene's required-term marker is consumed, not searched for ---
 		{"plus marker", "+peer +status", `query('(msg:peer) AND (msg:status)')`},
@@ -617,10 +617,29 @@ func TestErrors(t *testing.T) {
 func TestOneSearchFunctionRule(t *testing.T) {
 	s := K8sLogs()
 
-	// Text terms in different branches of a mixed boolean cannot be merged
-	// into one query() call.
-	if _, err := CompileString("(peer level:error) OR (status level:warn)", s); err == nil {
-		t.Error("expected an error: this needs two query() calls")
+	// Text terms in different branches of a mixed boolean still cannot be
+	// MERGED into one query() call — but they no longer need to be. Each branch
+	// is hoisted into its own row-key subquery, which is a separate scan, so the
+	// one-per-statement rule is satisfied rather than violated. This used to be
+	// a compile error.
+	//
+	// Verified live over ts < '2026-08-20 03:30:00': the emitted form returns
+	// 368,007, and 368,002 + 5 - 0 is the same number computed from the two
+	// branches independently.
+	withKey := K8sLogsLine()
+	r, err := CompileString("(peer level:error) OR (status level:warn)", withKey)
+	if err != nil {
+		t.Fatalf("two branches each with a search function should now compile: %v", err)
+	}
+	if n := strings.Count(r.SQL, "SELECT _row_id"); n != 2 {
+		t.Errorf("expected two row-key subqueries, got %d: %s", n, r.SQL)
+	}
+
+	// Without a row key there is nowhere to put them, so it is still refused.
+	noKey := withKey
+	noKey.RowKey = ""
+	if _, err := CompileString("(peer level:error) OR (status level:warn)", noKey); err == nil {
+		t.Error("with no row key this must still be refused")
 	}
 
 	// Fuzziness exists only as an option to match(), so a fuzzy term is a
@@ -654,7 +673,7 @@ func TestOrWithNegationFoldsThroughDeMorgan(t *testing.T) {
 	if err != nil {
 		t.Fatalf("`a OR -b` should compile, not refuse: %v", err)
 	}
-	want := `COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('(msg:status) NOT ((msg:peer))')), TRUE)`
+	want := `_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('(msg:status) NOT ((msg:peer))'))`
 	if r.SQL != want {
 		t.Errorf("got  %s\nwant %s", r.SQL, want)
 	}
@@ -856,12 +875,12 @@ func TestOperatorWordInValuePosition(t *testing.T) {
 
 		// The operators themselves must keep working in operator position.
 		"a NOT b": `(lower(msg) RLIKE '(^|[^a-z0-9])a([^a-z0-9]|$)' AND ` +
-			`COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('msg:b')), TRUE))`,
+			`_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('msg:b')))`,
 		"peer AND status":       `query('(msg:peer) AND (msg:status)')`,
 		"peer OR status":        `query('(msg:peer) OR (msg:status)')`,
 		"peer && status":        `query('(msg:peer) AND (msg:status)')`,
 		"peer || status":        `query('(msg:peer) OR (msg:status)')`,
-		"NOT tiflash":           `COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('msg:tiflash')), TRUE)`,
+		"NOT tiflash":           `_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('msg:tiflash'))`,
 		"level:(error OR warn)": `(lower(level) = lower('error') OR lower(level) = lower('warn'))`,
 		// A trailing AND is someone mid-keystroke: drop it, keep the term.
 		// A trailing NOT has no such reading — there is nothing to negate, so
@@ -889,7 +908,7 @@ func TestOperatorWordInValuePosition(t *testing.T) {
 		// the complement of the table. The uppercase spelling still negates.
 		"peer not status": `(query('(msg:peer) AND (msg:status)') AND ` + wbNot + `)`,
 		"peer NOT status": `query('(msg:peer) NOT (msg:status)')`,
-		"msg:(NOT ready)": `COALESCE(msg NOT IN (SELECT msg FROM logs.k8s_logs WHERE msg IS NOT NULL AND query('msg:ready')), TRUE)`,
+		"msg:(NOT ready)": `_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs WHERE query('msg:ready'))`,
 
 		// A leading infix operator will never acquire a left operand, so it
 		// is the word; a trailing one is mid-keystroke, so it is dropped.
@@ -1026,8 +1045,12 @@ func TestPhraseThatLosesItsTokens(t *testing.T) {
 	shapes := map[string]string{
 		`"not ready" peer`:     `(query('(msg:ready) AND (msg:peer)') AND lower(msg) LIKE lower('%not ready%'))`,
 		`"not ready" -tiflash`: `(query('(msg:ready) NOT (msg:tiflash)') AND lower(msg) LIKE lower('%not ready%'))`,
-		`"not ready" OR peer`:  `(lower(msg) LIKE lower('%not ready%') OR query('msg:peer'))`,
-		`-"not ready"`:         `COALESCE(NOT (lower(msg) LIKE lower('%not ready%')), TRUE)`,
+		// The disjunct is a row-key membership test, not a bare query(): under
+		// OR the engine prunes the scan whenever the search matches nothing and
+		// discards the other branch with it.
+		`"not ready" OR peer`: `(lower(msg) LIKE lower('%not ready%') OR ` +
+			`_row_id IN (SELECT _row_id FROM logs.k8s_logs WHERE query('msg:peer')))`,
+		`-"not ready"`: `COALESCE(NOT (lower(msg) LIKE lower('%not ready%')), TRUE)`,
 	}
 	for q, want := range shapes {
 		r, err := CompileString(q, s)

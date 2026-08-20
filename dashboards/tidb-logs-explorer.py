@@ -569,11 +569,20 @@ panels.append(panel(4, "table", "Best matches — BM25 relevance", 0, 40, 24, 10
                     f"ORDER BY relevance DESC, {TS} DESC\nLIMIT 50",
                     fieldConfig={"defaults": {}, "overrides": [wrap(BODY)]},
                     desc="Ranked by BM25, straight from the inverted index — whenever there is "
-                         "something to rank. A search with no full-text term in it (a field "
-                         "filter, a wildcard, an exclusion on its own) has no relevance to "
-                         "compute, so the column is a constant 0 and the panel falls back to "
-                         "newest-first. The rows are always the same rows the other panels "
-                         "show; only the ordering changes."))
+                         "something to rank. Four searches have nothing to rank, and the "
+                         "column is then a constant 0 with the panel falling back to "
+                         "newest-first: one with no full-text term at all (a field filter, a "
+                         "range, an existence test, a wildcard on a plain column); one whose "
+                         "only full-text term is excluded (`-term`), which compiles to an "
+                         "anti-join; one that ORs a full-text term with anything else, which "
+                         "has to move the search into a subquery so the OR does not silently "
+                         "drop its other branch; and a fuzzy term, which scores every match "
+                         "1.0 so the order is arbitrary rather than absent. The first three "
+                         "put the search function somewhere score() cannot see it. Use AND "
+                         "rather than OR, or group the full-text terms — `(a OR b) "
+                         "level:error` ranks where `a OR level:error` cannot. The rows are "
+                         "always the same rows the other panels show; only the ordering "
+                         "changes, and the compiler says which of the four applies."))
 
 # ---------------------------------------------------------------- variables
 templating = [

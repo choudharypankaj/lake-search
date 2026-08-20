@@ -260,6 +260,70 @@ type Schema struct {
 	// against the engine and a migration be written from it.
 	Indexes []Index
 
+	// RowKey names a column that identifies a row uniquely, used to key the
+	// subquery that a search function has to sit inside.
+	//
+	// It exists because of two measured wrong answers, and it is the only fix
+	// for either. The engine pushes a search function into the index scan
+	// regardless of the surrounding boolean, so a search that matches nothing
+	// prunes the scan to nothing and takes the rest of the predicate with it.
+	// Over logs.k8s_logs, ts < 2026-08-20 03:30:00 (1,063,259 rows):
+	//
+	//	query('line:zzzznosuchtoken') OR lower(level)=lower('ERROR')        0
+	//	lower(level) = lower('ERROR')                                 402,974
+	//	query('line:zzzznosuchtoken') OR 1=1                                0
+	//	query('line:snapshot') OR 1=1                               1,063,259
+	//
+	// The mechanism is block pruning, and knowing that matters because the
+	// damage is not limited to the empty case. The index scan visits only the
+	// blocks its index says contain matches, and the other branch is evaluated
+	// only in those blocks — so what is lost is the other branch's rows in the
+	// blocks the text term did not touch. On the 5-block frozen copy, with
+	// `level=ERROR` spread across all five:
+	//
+	//	term            blocks touched   loss
+	//	peer, snapshot               5      0%
+	//	rejections                   4   20.0%
+	//	RemoteStopped                4   26.2%
+	//	the (0 matches)              0    100%
+	//
+	// So `RemoteStopped OR level:ERROR` — an ordinary query, not a typo — lost
+	// 26% of the ERROR rows. The earlier reading of this defect, that the shape
+	// "is correct whenever the text side matches at least one row", is too
+	// generous: it holds only for a term common enough to touch every block.
+	//
+	// Putting the search function in a subquery and testing membership by row
+	// key fixes it exactly — 402,974 and 424,841, both matching independently
+	// computed truths.
+	//
+	// The same key also carries the negation anti-join, which is a
+	// simplification rather than a fix: keyed on the column it searched, that
+	// anti-join was already exact, because two rows with identical text match
+	// or miss the index together. Verified across 14 term/preset combinations,
+	// every one identical to the row-keyed answer. What the row key buys there
+	// is that it stays exact if the keying and the search ever diverge — the
+	// mismatched form, keying on msg while searching line, gives 1,035,332
+	// against a truth of 1,036,932 — and that it needs no COALESCE.
+	//
+	// It is schema data rather than a constant because it is engine-specific.
+	// On this engine `_row_id` works (unique and never NULL over 1,063,259 rows
+	// and over the 967,912-row frozen copy, and stable across the subquery
+	// boundary within one statement); `_block_name` and `_segment_name` exist
+	// but identify a file, not a row; `_row_number` does not exist. A
+	// deployment on another engine names its own, or names none.
+	//
+	// Empty means none, and each shape then falls back to the strongest option
+	// that is still EXACT. A pure text fragment and a negation are keyed on
+	// their own text column, which is exact because the subquery's predicate is
+	// a function of that column alone. A COMPOSITE branch — a search function
+	// ANDed with predicates on other columns — has no exact text-keyed form and
+	// is refused: two rows sharing a text value can differ in the other columns
+	// the branch constrains, so expanding by shared text pulls in a row the
+	// branch excluded. Measured, `level:ERROR tso` is 1,728 rows row-keyed and
+	// 1,884 msg-keyed — 156 over.
+	// See antiJoin, semiJoin and hoistIntoSubquery.
+	RowKey string
+
 	// Bags are the VARIANT columns unknown field names are routed into, in
 	// resolution order: `store_id:7` becomes kv['store_id']::VARCHAR.
 	//

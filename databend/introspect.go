@@ -88,6 +88,11 @@ type Shape struct {
 	BagWindow     string
 	BagEnumWindow string
 
+	// RowKeys are the row-key candidates the probe confirmed, keyed by name.
+	// A row key is a PSEUDO-column — DESCRIBE does not list `_row_id` — so it
+	// cannot be inferred from the column list and has to be probed for by name.
+	RowKeys map[string]RowKeyStat
+
 	// BagLimited, when non-empty, says the per-key statements were capped, so a
 	// silent partial answer cannot read as a complete one.
 	BagLimited string
@@ -200,6 +205,25 @@ type BagKeyStat struct {
 	Arrays  int64
 }
 
+// RowKeyStat is a row-key candidate's sampled evidence.
+//
+// Existence is not enough. The anti-join and the disjunction semi-join both rely
+// on the key identifying a row UNIQUELY and never being NULL — a duplicate key
+// would over-exclude exactly the way keying on message text does, which is the
+// bug the row key exists to fix. So the probe samples both rather than merely
+// binding the name.
+type RowKeyStat struct {
+	Name     string
+	Sampled  int64
+	Distinct int64
+	Nulls    int64
+}
+
+// Usable reports whether the sample supports keying a subquery on this column.
+func (r RowKeyStat) Usable() bool {
+	return r.Sampled > 0 && r.Distinct == r.Sampled && r.Nulls == 0
+}
+
 // Profile is the set of profile rows, keyed by Col.
 type Profile struct {
 	Table string
@@ -233,6 +257,40 @@ func (p Profile) row(col string) (ProfileRow, bool) {
 }
 
 // ---------------------------------------------------------------- emitting
+
+// rowKeyCandidates are the pseudo-column names to try, in order.
+//
+// One entry, because one is all this engine has: measured, `_row_id` binds and
+// is unique, `_block_name` and `_segment_name` bind but identify a FILE rather
+// than a row, and `_row_number` does not exist. Another engine's name goes here,
+// and the probe tolerates a candidate that does not bind — the statement errors,
+// no marker is emitted, and the consumer reads that as "not available", which is
+// a valid answer rather than a failure.
+var rowKeyCandidates = []string{"_row_id"}
+
+// rowKeyProbe emits one statement per candidate.
+func rowKeyProbe(table string) string {
+	var b strings.Builder
+	b.WriteString(`
+-- Row key. A row key is a PSEUDO-column: DESCRIBE does not list it, so it has to
+-- be asked for by name. If a statement below ERRORS, this table has no row key
+-- under that name — that is a valid answer, so keep the rest of the output and
+-- carry on.
+--
+-- It samples uniqueness and nullability, not just existence, because the shapes
+-- that use it depend on those: a duplicate key would over-exclude exactly the
+-- way keying on message text does, which is the defect it exists to fix.
+`)
+	for _, name := range rowKeyCandidates {
+		fmt.Fprintf(&b, `SELECT '%s|%s|rowkey|%s|'
+    || to_string(count(*))                    || '|'
+    || to_string(count(DISTINCT %s))          || '|'
+    || to_string(count_if(%s IS NULL)) AS lake_search_probe
+FROM (SELECT %s FROM %s LIMIT 10000);
+`, probeMarker, ProbeVersion, escapeString(name), name, name, name, table)
+	}
+	return b.String()
+}
 
 // ShapeProbe emits the first probe: what the table is made of.
 //
@@ -268,6 +326,7 @@ SHOW CREATE TABLE %s;
 `,
 		sectionMarker("columns", table), table,
 		sectionMarker("create", table), table)
+	b.WriteString(rowKeyProbe(table))
 	return b.String()
 }
 
@@ -517,6 +576,7 @@ DESCRIBE %s;
 SHOW CREATE TABLE %s;
 `, sectionMarker("columns", s.Table), s.Table,
 		sectionMarker("create", s.Table), s.Table)
+	b.WriteString(rowKeyProbe(s.Table))
 	b.WriteString(BagDriftProbe(s, ProbeWindow{Hours: "24"}, ProbeWindow{}))
 	return b.String()
 }
@@ -1556,6 +1616,22 @@ func readBagMarker(sh *Shape, line string) {
 		} else {
 			sh.BagWindow = f[4]
 		}
+	case "rowkey":
+		if len(f) < 7 {
+			return
+		}
+		n := make([]int64, 3)
+		for k := 0; k < 3; k++ {
+			v, err := strconv.ParseInt(strings.TrimSpace(f[4+k]), 10, 64)
+			if err != nil {
+				return
+			}
+			n[k] = v
+		}
+		if sh.RowKeys == nil {
+			sh.RowKeys = map[string]RowKeyStat{}
+		}
+		sh.RowKeys[f[3]] = RowKeyStat{Name: f[3], Sampled: n[0], Distinct: n[1], Nulls: n[2]}
 	case "baglimit":
 		sh.BagLimited = f[3]
 	}
@@ -2108,6 +2184,7 @@ func Build(shape Shape, prof Profile, opts BuildOptions) (Def, []string, error) 
 			"window that contains data (this one was %q)", window)
 	}
 
+	rowKey := b.pickRowKey()
 	timeCol := b.pickTime()
 	bags := b.pickBags()
 	bodyCol := b.pickBody(bags)
@@ -2132,6 +2209,7 @@ func Build(shape Shape, prof Profile, opts BuildOptions) (Def, []string, error) 
 		Table:   shape.Table,
 		Default: bodyCol,
 		Time:    timeCol,
+		RowKey:  rowKey,
 		Indexes: indexes,
 	}
 	if sevCol != "" {
@@ -2319,6 +2397,58 @@ func (b *builder) pickTime() string {
 				"so a bound on it does not prune", col)
 	}
 	return col
+}
+
+// pickRowKey proposes a row key the probe confirmed, or records what is lost
+// without one.
+//
+// It is not decided from a name list or a type: a row key is a pseudo-column, so
+// the only evidence is that the probe bound it and that the sample was unique
+// and non-null. Existence alone is not enough — the two shapes that use it
+// depend on uniqueness, and a duplicate key would over-exclude exactly the way
+// keying on message text does.
+func (b *builder) pickRowKey() string {
+	var usable, seen []string
+	for _, name := range rowKeyCandidates {
+		st, ok := b.shape.RowKeys[name]
+		if !ok {
+			continue
+		}
+		seen = append(seen, name)
+		if st.Usable() {
+			usable = append(usable, name)
+			b.roles["row_key"] = fmt.Sprintf(
+				"probe-confirmed (%s bound, and %d of %d sampled values were distinct with %d "+
+					"nulls, which is what the anti-join and the disjunction semi-join depend on)",
+				name, st.Distinct, st.Sampled, st.Nulls)
+		} else {
+			b.refuse("row-key candidate %q bound but its sample is not usable: %d of %d values "+
+				"distinct, %d null. A key that repeats would over-exclude the same way keying "+
+				"on message text does, which is the defect a row key exists to fix",
+				name, st.Distinct, st.Sampled, st.Nulls)
+		}
+	}
+	if len(usable) > 0 {
+		return usable[0]
+	}
+	if len(seen) == 0 {
+		b.roles["row_key"] = "none: no candidate bound (" +
+			strings.Join(rowKeyCandidates, ", ") + "), so this table has no pseudo-column " +
+			"identifying a row"
+	} else {
+		b.roles["row_key"] = "none usable: " + strings.Join(seen, ", ") + " bound but sampled " +
+			"as non-unique or nullable"
+	}
+	// Both consequences, because they differ in kind and one of them is fatal.
+	b.refuse("no row key: a full-text term ORed with a non-full-text condition will be REFUSED " +
+		"at compile time. This engine visits only the blocks its index says contain matches and " +
+		"evaluates the other branch only there, so a term touching 4 of 5 blocks loses 20-26%% " +
+		"of the other branch and a term matching nothing loses all of it — `query(...) OR 1=1` " +
+		"returns 0 of 1,063,259 rows. A plain full-text term and a negation still work: they " +
+		"are keyed on their own text column, which is exact. What is REFUSED without a row key " +
+		"is a full-text term combined with something else and then ORed — keying that on text " +
+		"is not exact, because the branch constrains other columns too")
+	return ""
 }
 
 // pickBody is the one role with a rule of its own, because this deployment has

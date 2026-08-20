@@ -110,6 +110,12 @@ type Def struct {
 	// wrong for it.
 	Bags []BagDef `json:"bags,omitempty"`
 
+	// RowKey names a column identifying a row uniquely — `_row_id` on this
+	// engine. It is what lets a search function sit inside a subquery, which is
+	// the only correct compilation for a disjunction mixing a text term with
+	// anything else, and the only exact one for a negation. See Schema.RowKey.
+	RowKey string `json:"row_key,omitempty"`
+
 	// TimeZone pins bare timestamp literals to a fixed `+HH:MM` offset.
 	TimeZone string `json:"time_zone,omitempty"`
 
@@ -310,6 +316,7 @@ func (d Def) Schema() (Schema, []string, error) {
 		Default:         strings.ToLower(d.Default),
 		Time:            strings.ToLower(d.Time),
 		Severity:        strings.ToLower(d.Severity),
+		RowKey:          d.RowKey,
 		Variant:         d.Variant,
 		TimeZone:        d.TimeZone,
 		CaseInsensitive: d.CaseInsensitive == nil || *d.CaseInsensitive,

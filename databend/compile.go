@@ -82,14 +82,22 @@ func Compile(n parser.Node, s Schema) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	if c.searchFuncs > 1 {
+	// Counted off the finished statement rather than tallied on the way down.
+	// The tally had two increment sites and any new leaf emitting a search
+	// function was a third one waiting to be forgotten; the string is the
+	// truth, and a search function that ended up inside a subquery correctly
+	// does not count against the outer scan.
+	nSearch := outerSearchFuncs(sql)
+	if nSearch > 1 {
 		return Result{}, fmt.Errorf(
-			"this query needs %d search functions but Databend allows one per table: "+
+			"this query needs %d BARE search functions but Databend allows one per table "+
+				"(a search function inside a row-key subquery does not count, which is how the "+
+				"disjunction shapes compile): "+
 				"put the full-text terms in a single group so they compile to one query() call "+
 				"(for example `(a OR b) level:error` rather than `(a level:error) OR (b level:warn)`)",
-			c.searchFuncs)
+			nSearch)
 	}
-	return Result{SQL: sql, Warnings: c.warnings, UsesMatch: c.searchFuncs > 0}, nil
+	return Result{SQL: sql, Warnings: c.warnings, UsesMatch: nSearch > 0}, nil
 }
 
 // CompileString parses and compiles in one step.
@@ -138,6 +146,46 @@ func CompileScore(q string, s Schema) (Result, error) {
 	return r, nil
 }
 
+// scoreUnavailableReason says why relevance is a constant, and how to get it
+// back.
+//
+// score() is legal only beside a BARE search function in the same statement, so
+// there are three ways to lose it, and they want different advice:
+//
+//	the search has no full-text term at all — a field filter, a wildcard on a
+//	plain column, a range, an existence test — so there is nothing to rank;
+//
+//	the search is full-text but the compiler moved the search function into a
+//	row-key subquery, which is what makes a disjunction correct on this engine.
+//	That is new, and it is a real trade: `snapshot OR level:ERROR` ranks nothing
+//	where `snapshot level:ERROR` ranks normally;
+//
+//	the only full-text term was excluded (`-term`), which is an anti-join, again
+//	a subquery.
+func scoreUnavailableReason(q, sql string) string {
+	const tail = " The panel still returns the right rows and falls back to newest-first; only the " +
+		"ordering is unavailable."
+	switch {
+	case strings.Contains(sql, "NOT IN (SELECT"):
+		return "relevance is unavailable: the full-text part of this search is an exclusion, which " +
+			"compiles to an anti-join, so its search function sits in a subquery where score() " +
+			"cannot see it. Add a positive term beside the exclusion — `a -b` ranks, `-b` alone " +
+			"cannot." + tail
+	case strings.Contains(sql, "IN (SELECT"):
+		return "relevance is unavailable: this search ORs a full-text term with a non-full-text " +
+			"condition, so the search function had to move into a subquery — on this engine a " +
+			"search function left in a disjunction prunes the scan and silently drops the other " +
+			"branch. score() cannot reach into a subquery. Use AND instead of OR (`a level:error` " +
+			"ranks, `a OR level:error` cannot), or put the full-text terms in one group: " +
+			"`(a OR b) level:error`." + tail
+	default:
+		return "relevance is unavailable: this search has no full-text term to rank — a field " +
+			"filter, a range, an existence test and a wildcard on a plain column are all compared " +
+			"rather than scored, so there is no relevance to compute. Add a bare word or a quoted " +
+			"phrase to get a ranking." + tail
+	}
+}
+
 // CompileScoreExpr renders the *select-list* expression that goes beside the
 // predicate from CompileScore: `score()` when the compiled predicate contains a
 // search function, and the constant `0` when it does not.
@@ -160,6 +208,21 @@ func CompileScoreExpr(q string, s Schema) (Result, error) {
 		return r, err
 	}
 	expr := "0"
+	if !r.UsesMatch {
+		// A constant 0 is the only legal select-list expression here, because
+		// score() without a search function in the same statement is [1065] —
+		// re-measured, `SELECT score() … WHERE lower(component) = lower('tikv')`
+		// still fails. The panel therefore renders and falls back to
+		// newest-first, which is the right degradation; what was missing is any
+		// statement of WHY, so a reader sees an all-zero relevance column and no
+		// reason for it.
+		//
+		// Naming the causes matters because the list grew. It used to be "your
+		// search has no full-text term"; it now also includes a search that HAS
+		// one which the compiler had to move into a subquery, which is the price
+		// of the disjunction fix.
+		r.Warnings = append(r.Warnings, scoreUnavailableReason(q, r.SQL))
+	}
 	if r.UsesMatch {
 		expr = "score()"
 		if strings.Contains(r.SQL, "fuzziness=") {
@@ -311,18 +374,185 @@ type fragment struct {
 
 func (f fragment) isText() bool { return f.text != "" }
 
+// outerSearch counts the search functions in this fragment's SQL that sit in the
+// OUTER scan — that is, not inside a subquery.
+//
+// It is DERIVED rather than stored, and that is the whole point of this design.
+// The previous version carried an `searchFuncs int` field that each construction
+// had to remember to set, and `fragment{sql: …}` appears 47 times in this file.
+// Three of them forgot: `not()` discarded it, so
+// `NOT (level:ERROR RemoteStopped) OR level:WARN` lost 17.5%; the fuzzy leaf
+// never set it, so `level:WARN OR (level:ERROR RemoteStopped~1)` lost 54.1%; and
+// `degrade()` dropped it, so `("RemoteStopped to" rejections) OR level:WARN`
+// returned 0 against a truth of 60,727. Each was found, and fixed, one round
+// after the last — because a field some constructions remember to set is a
+// whitelist, and every new leaf or combinator is a chance to be left off it.
+//
+// Deriving it from the string cannot be forgotten. Whatever SQL a construction
+// builds, present or future, the count follows it.
+func (f fragment) outerSearch() int { return outerSearchFuncs(f.sql) }
+
+// outerSearchFuncs counts search functions in SQL, ignoring any that sit inside
+// a subquery body.
+//
+// A search function inside `(SELECT …)` prunes only that subquery's scan, which
+// is precisely why hoisting one in there is the fix; so it must not be counted
+// as living in the outer scan. Everything outside one must be, because this
+// engine pushes a search function into the index scan regardless of the
+// surrounding boolean.
+func outerSearchFuncs(sql string) int {
+	// Literals FIRST, before anything looks at structure. A search value is
+	// untrusted input that ends up inside a string literal, and a literal can
+	// contain parentheses and the word SELECT. Without masking,
+	// `level:"(SELECT ("` made stripSubqueryBodies read the literal's `(SELECT`
+	// as a real subquery and run past the closing quote, swallowing the genuine
+	// query() that followed — so `level:WARN OR (level:"(SELECT (" RemoteStopped)`
+	// was left unhoisted and returned 27,502 of a true 60,727, a 54.7% loss
+	// driven by nothing more than what somebody typed in the search box.
+	//
+	// Any pass that treats this SQL as structure has to come after the mask.
+	return countSearchCalls(stripSubqueryBodies(maskLiterals(sql)))
+}
+
+// maskLiterals overwrites the CONTENTS of every single-quoted literal with a
+// filler, leaving the quotes and the overall length in place so that later
+// passes see the same offsets.
+//
+// It handles both escapes this compiler emits — escapeString doubles a quote to
+// `”` and a backslash to `\\` — because either one, misread as the end of the
+// literal, puts the scanner back into "structure" mode inside a value.
+//
+// An UNTERMINATED literal is deliberately left untouched rather than masked to
+// the end of the string. Erasing the tail would delete real query() calls after
+// it and UNDER-count, which is the direction that silently loses rows; leaving it
+// alone can only over-count, which costs a needless subquery or a refusal.
+func maskLiterals(sql string) string {
+	b := []byte(sql)
+
+	// Check every literal is terminated BEFORE masking any of them. Bailing out
+	// part-way through is not good enough: with an odd number of quotes the
+	// scanner pairs them wrongly from the start, and `x = 'ab AND query('line:y')`
+	// then had its `query(` masked away — an UNDER-count, which is the direction
+	// that silently loses rows. This compiler never emits an unbalanced literal
+	// (escapeString doubles every quote), so the case is defensive; it just has
+	// to fail towards over-counting rather than under.
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\'' {
+			continue
+		}
+		end, ok := literalEnd(b, i)
+		if !ok {
+			return sql
+		}
+		i = end
+	}
+
+	for i := 0; i < len(b); i++ {
+		if b[i] != '\'' {
+			continue
+		}
+		end, _ := literalEnd(b, i)
+		for j := i + 1; j < end; j++ {
+			b[j] = 'x'
+		}
+		i = end
+	}
+	return string(b)
+}
+
+// literalEnd returns the index of the quote that closes the literal opened at
+// `open`, skipping `”` and backslash escapes.
+func literalEnd(b []byte, open int) (int, bool) {
+	for j := open + 1; j < len(b); j++ {
+		switch {
+		case b[j] == '\\' && j+1 < len(b):
+			j++ // the escaped byte cannot close the literal
+		case b[j] == '\'':
+			if j+1 < len(b) && b[j+1] == '\'' {
+				j++ // a doubled quote is one escaped quote, not the end
+				continue
+			}
+			return j, true
+		}
+	}
+	return 0, false
+}
+
+// stripSubqueryBodies removes `(SELECT … )` spans, matching parentheses so a
+// nested subquery goes with its parent.
+func stripSubqueryBodies(sql string) string {
+	var b strings.Builder
+	for i := 0; i < len(sql); {
+		if sql[i] == '(' && startsSelect(sql[i+1:]) {
+			depth := 0
+			j := i
+			for ; j < len(sql); j++ {
+				switch sql[j] {
+				case '(':
+					depth++
+				case ')':
+					depth--
+				}
+				if depth == 0 {
+					break
+				}
+			}
+			if j >= len(sql) {
+				// Unbalanced `(SELECT` with no closing paren: keep the rest
+				// rather than dropping it, so the count comes out too HIGH
+				// rather than too low. Over-counting costs a needless subquery
+				// or a refusal; under-counting loses rows in silence.
+				//
+				// That direction only actually holds because literals are
+				// masked before this runs. It did not hold before: a literal
+				// containing `(SELECT` and an unmatched `(` made this run past
+				// the closing quote and swallow the real query() after it,
+				// which is an UNDER-count and exactly the losing direction.
+				break
+			}
+			i = j + 1
+			continue
+		}
+		b.WriteByte(sql[i])
+		i++
+	}
+	return b.String()
+}
+
+func startsSelect(s string) bool {
+	for len(s) > 0 && (s[0] == ' ' || s[0] == '\n' || s[0] == '\t') {
+		s = s[1:]
+	}
+	return len(s) >= 6 && strings.EqualFold(s[:6], "SELECT")
+}
+
+// countSearchCalls counts `query(` and `match(` at an identifier boundary, so a
+// column or function whose name merely ends in one of them is not miscounted.
+func countSearchCalls(sql string) int {
+	n := 0
+	for _, name := range []string{"query(", "match("} {
+		for i := 0; ; {
+			j := strings.Index(sql[i:], name)
+			if j < 0 {
+				break
+			}
+			at := i + j
+			if at == 0 || !isIdentByte(sql[at-1]) {
+				n++
+			}
+			i = at + len(name)
+		}
+	}
+	return n
+}
+
+func isIdentByte(b byte) bool {
+	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
 type compiler struct {
 	schema   Schema
 	warnings []string
-
-	// searchFuncs counts search functions in the *outer* scan, which is what
-	// the one-per-table rule and score() both care about. A search function
-	// inside an anti-join subquery is a separate scan and is not counted:
-	// measured, `match(msg,…) AND msg NOT IN (SELECT msg … WHERE query(…))`
-	// runs and returns 17,608 rows, while `SELECT score() … ` with only the
-	// subquery's search function still fails [1065] — the binder does not see
-	// through the subquery either.
-	searchFuncs int
 
 	// textCols records every column that reached a text fragment, so a
 	// negated fragment knows which column its anti-join keys on.
@@ -633,7 +863,6 @@ func (c *compiler) wrapText(f fragment) (string, error) {
 	if f.negated {
 		return c.antiJoin(f)
 	}
-	c.searchFuncs++
 	sql := "query('" + escapeString(f.text) + "')"
 	if f.residual != "" {
 		// The residual of a collapsed phrase. It is ANDed here, at the one
@@ -674,15 +903,7 @@ func (c *compiler) degrade(f fragment) (fragment, error) {
 
 // antiJoin renders the complement of a full-text expression.
 func (c *compiler) antiJoin(f fragment) (string, error) {
-	switch {
-	case len(c.textCols) == 0:
-		return "", fmt.Errorf("internal: negated text fragment with no text column")
-	case len(c.textCols) > 1:
-		return "", fmt.Errorf(
-			"excluding a full-text search across more than one indexed column (%s) is not "+
-				"supported: the exclusion needs an anti-join, and it can key on only one column",
-			strings.Join(c.textCols, ", "))
-	case c.schema.Table == "":
+	if c.schema.Table == "" {
 		return "", fmt.Errorf(
 			"excluding a full-text term with no positive term beside it needs the table name, " +
 				"because `NOT (query(...))` returns 0 rows rather than every row whenever the " +
@@ -690,10 +911,54 @@ func (c *compiler) antiJoin(f fragment) (string, error) {
 				"exclusion stays inside the search function")
 	}
 
+	// Keyed on the row when the schema names one, which is the only exact
+	// form. Over logs.k8s_logs, ts < 2026-08-20 03:30:00 (1,063,259 rows),
+	// `-snapshot` should be 1,063,259 − 26,327 = 1,036,932, and the row-keyed
+	// anti-join returns exactly that.
+	//
+	// No COALESCE: the row key is never NULL — verified, 0 nulls over 1,063,259
+	// rows and over the 967,912-row frozen copy — so neither the outer value
+	// nor the subquery can produce the NULL that the text-keyed form has to
+	// defend against.
+	if sql, ok := c.rowKeyMembership(f.text, "", true); ok {
+		c.warn("excluding %q with no positive term beside it compiles to an anti-join against "+
+			"%s, which scans the table a second time: `a -b` keeps the exclusion inside the one "+
+			"search function and costs nothing extra", f.text, c.schema.Table)
+		return sql, nil
+	}
+
+	// No row key: key on the text column instead. That is EXACT for every shape
+	// this compiler emits, and the reason is structural rather than lucky, so it
+	// is worth writing down.
+	//
+	// The anti-join excludes rows whose keyed value appears among the matching
+	// rows' keyed values. When the keyed column is the same column the search
+	// ran against, that expansion is idempotent: two rows with identical text
+	// produce identical tokens, so the index either matches both or neither.
+	// Measured — `query('msg:snapshot')` is 17,661 rows and
+	// `msg IN (SELECT msg WHERE query('msg:snapshot'))` is also 17,661.
+	//
+	// And the compiler always keys on the column it searched: antiJoin uses
+	// c.textCols[0], and a fragment spanning two text columns is refused just
+	// below. So the collision case cannot arise. Verified across 14
+	// term/preset combinations on a 1,063,259-row table — msg-keyed under the
+	// msg-default preset and line-keyed under the line-default preset — every
+	// one identical to the row-keyed answer.
+	//
+	// The shape that IS wrong is a MISMATCH: keying on msg while searching
+	// line gives 1,035,332 against a truth of 1,036,932. That is a hand-written
+	// combination, not one this compiler produces, and the row-key form is
+	// preferred anyway because it stays correct if that ever changes and needs
+	// no COALESCE.
 	col := c.textCols[0]
-	c.warn("excluding %q with no positive term beside it compiles to an anti-join against %s, "+
-		"which scans the table a second time: `a -b` keeps the exclusion inside the one search "+
-		"function and costs nothing extra", col, c.schema.Table)
+	c.warn("excluding %q with no positive term beside it compiles to an anti-join against %s "+
+		"keyed on %q, because this schema declares no row key. It is exact — the keyed column "+
+		"is the column the search ran against, so two rows with the same text match or miss "+
+		"together — but it scans the table a second time, and it would stop being exact if the "+
+		"keying and the search ever diverged. Declaring \"row_key\" (`_row_id` on this engine) "+
+		"removes both concerns. `a -b` keeps the exclusion inside the one search function and "+
+		"costs nothing extra",
+		col, c.schema.Table, col)
 
 	// COALESCE covers a NULL in the outer row — a row with no text at all
 	// contains nothing, so it survives the exclusion — and the subquery
@@ -701,6 +966,226 @@ func (c *compiler) antiJoin(f fragment) (string, error) {
 	return fmt.Sprintf(
 		"COALESCE(%s NOT IN (SELECT %s FROM %s WHERE %s IS NOT NULL AND query('%s')), TRUE)",
 		col, col, c.schema.Table, col, escapeString(f.text)), nil
+}
+
+// semiJoin renders a text expression as a row-key membership test, so it can
+// stand inside a disjunction.
+//
+// # Why a bare query() cannot
+//
+// The optimiser pushes a search function into the index scan regardless of the
+// surrounding boolean. That is the same mechanism that makes an empty search
+// argument return nothing and that makes a bare `NOT (query(x))` return zero
+// instead of everything — and under OR it is worse, because it silently discards
+// the other branch. Measured over logs.k8s_logs, ts < 2026-08-20 03:30:00
+// (1,063,259 rows), against truths computed independently:
+//
+//	                                                          emitted    truth
+//	query('line:zzzznosuchtoken') OR lower(level)='ERROR'            0  402,974
+//	query('line:zzzznosuchtoken') OR 1=1                             0  1,063,259
+//	query('line:snapshot')        OR lower(level)='ERROR'      424,841  424,841
+//
+// The third line is why this went unnoticed: the shape is correct whenever the
+// text side matches at least one row, and 26,327 + 402,974 − 4,460 = 424,841
+// checks out. A typo in one branch of an OR was enough to void the query.
+//
+// Keyed on the row, both cases are exact — 402,974 and 424,841.
+//
+// # The fallback, and why it is exact
+//
+// A pure text fragment CAN be keyed on its own text column, and that is exact
+// rather than approximate. The predicate inside the subquery is a function of
+// that one column, so two rows with the same value match or miss together and
+// expanding the match set by shared value is idempotent — measured,
+// `query('line:region')` is 228,209 rows and
+// `line IN (SELECT line WHERE query('line:region'))` is also 228,209, and the
+// disjunction is exact for every term tried: 403,699 / 405,734 / 407,681 /
+// 424,841 / 622,935, each equal to the row-keyed answer.
+//
+// An earlier version of this comment claimed the text-keyed form over-matched,
+// with a percentage attached. It does not, and the way that number was got wrong
+// is worth keeping: the measurement keyed on `msg` while searching `line` — the
+// very mismatch this file warns about elsewhere — so it measured a shape nothing
+// emits. Keyed on the column it searches there is no error to trade away.
+//
+// So the row key is preferred for cost — comparing an 18-byte identifier beats
+// comparing a log line that can run to 29KB — and the text column is a correct
+// fallback. What is NOT sound is keying a COMPOSITE branch this way, because
+// such a branch constrains other columns too; see hoistIntoSubquery.
+//
+// Two shapes are still refused, and only two: a fragment spanning more than one
+// text column, where keying on one of them is not idempotent, and a composite
+// branch with no row key.
+// rowKeyMembership is the one construction every subquery shape is built from.
+//
+// A search function inside a subquery prunes only that subquery's scan, which is
+// the whole trick: the outer predicate then tests row membership, an ordinary
+// comparison no optimiser rewrites. `IN` for a positive branch, `NOT IN` for a
+// negated one — the same move, opposite polarity — so the disjunction fix and the
+// negation fix are one mechanism rather than two similar-looking pieces of code.
+//
+// The repo already contained half of it: a negated branch ORed with SQL was
+// always exact — `-zzzznosuchtoken OR level=ERROR` returns the whole table,
+// 1,063,259 — precisely because the negation compiled to an anti-join. The bug
+// was that the positive branch did not get the same treatment.
+//
+// # On stability, since everything here rests on it
+//
+// The subquery and the outer scan must agree about which rows exist, on a table
+// taking thousands of rows a minute. They do, because one statement over a
+// closed bound is one snapshot: the same semi-join returned 424,841 three times
+// consecutively, and `_row_id IN (SELECT _row_id FROM t)` is the whole table
+// while `NOT IN` of the same is 0 — self-identity across the boundary, measured.
+//
+// Returns ok=false when the schema has nothing to key on; the callers differ on
+// what to do about that, and deliberately so.
+func (c *compiler) rowKeyMembership(text, residual string, negate bool) (sql string, ok bool) {
+	if c.schema.RowKey == "" || c.schema.Table == "" {
+		return "", false
+	}
+	op := "IN"
+	if negate {
+		op = "NOT IN"
+	}
+	where := "query('" + escapeString(text) + "')"
+	if residual != "" {
+		// A collapsed phrase's literal scan belongs INSIDE the subquery, where
+		// it narrows the same rows the search function selected. Hoisted
+		// outside it would filter the other disjunct too.
+		where += " AND " + residual
+	}
+	// No COALESCE. The row key is never NULL — verified, 0 nulls over 1,063,259
+	// rows and over the 967,912-row frozen copy — so neither the outer value nor
+	// the subquery can produce the NULL that a text-keyed NOT IN must defend
+	// against.
+	return fmt.Sprintf("%s %s (SELECT %s FROM %s WHERE %s)",
+		c.schema.RowKey, op, c.schema.RowKey, c.schema.Table, where), true
+}
+
+// hoistIntoSubquery moves a whole COMPOSITE branch into a row-key subquery.
+//
+// A branch like `(lower(level)=lower('ERROR') AND query('line:RemoteStopped'))`
+// contains a search function but is no longer a text fragment — the conjunction
+// already collapsed it, which is exactly why a `text`-based guard could not see
+// it. Under OR it therefore prunes the scan for the entire predicate:
+// `level:WARN OR (level:ERROR RemoteStopped)` returned 27,502 where the truth is
+// 60,727, losing 54.7% in silence, and that predicate was byte-identical before
+// and after the round that was supposed to remove this class of loss.
+//
+// The whole branch goes inside, not just the search function, because the branch
+// is a predicate over the same table and membership by row key is exactly
+// equivalent.
+//
+// Only a row key will do here, and that is measured rather than cautious.
+// Keying a composite branch on its text column is NOT idempotent, because the
+// branch constrains other columns too: two rows sharing a text value can differ
+// in `level`, and then expanding the match set by shared text pulls in a row the
+// branch excluded. Measured on the live table, where exactly two `msg` values of
+// 160,802 occur at more than one level — the row-keyed truth for `level:ERROR tso` is 1,728 rows and the
+// msg-keyed form gives 1,884 — 156 over. The magnitude is a property of the data
+// rather than a general ratio: it is however many rows share a text value across
+// differing values of the other columns the branch constrains, which here is two
+// msg values out of 160,802.
+//
+// An earlier version of this comment said 45 rows against 201, over by 4.5x.
+// That was measured on a hand-built proxy predicate rather than on a shape this
+// compiler emits, and it does not reproduce; the figures above are the real one.
+//
+// A pure text fragment has no such problem, which is why semiJoin can fall back
+// and this cannot.
+func (c *compiler) hoistIntoSubquery(f fragment) (string, error) {
+	if c.schema.RowKey == "" || c.schema.Table == "" {
+		return "", fmt.Errorf(
+			"a condition combining a full-text term with something else cannot be ORed with "+
+				"another condition unless the schema declares a row key, and this one declares "+
+				"%s. This engine visits only the blocks its index says contain matches and "+
+				"evaluates the rest of the predicate only there, so the other branch loses its "+
+				"rows in every block the term did not reach — measured, "+
+				"`level:WARN OR (level:ERROR RemoteStopped)` returned 27,502 of a true 60,727. "+
+				"Keying the branch on its text column instead is not sound either, because the "+
+				"branch constrains other columns too. Declare \"row_key\" (and \"table\"), or "+
+				"rewrite so the full-text terms are ANDed with the rest rather than ORed",
+			c.missingForSubquery())
+	}
+	return fmt.Sprintf("%s IN (SELECT %s FROM %s WHERE %s)",
+		c.schema.RowKey, c.schema.RowKey, c.schema.Table, f.sql), nil
+}
+
+func (c *compiler) semiJoin(f fragment) (string, error) {
+	if f.negated {
+		// A NEGATED branch in a disjunction is the case that was already
+		// correct, and it must stay that way. `-zzzznosuchtoken OR level=ERROR`
+		// returns the whole table, 1,063,259, because the negation compiles to
+		// an anti-join and the search function therefore prunes only its own
+		// subquery. That is the pattern this whole change generalises, so the
+		// negated branch delegates to it rather than being handled twice.
+		//
+		// It also means the no-row-key policy differs for the two polarities,
+		// which is right rather than untidy: the pruning defect does not touch
+		// the negated form at all — measured, it returns 1,063,259 under either
+		// keying — so its only flaw is the text-collision over-exclusion, which
+		// is bounded and warned about. The positive form has no bounded
+		// fallback, so it is refused.
+		return c.antiJoin(f)
+	}
+	if err := c.checkOneIndex(); err != nil {
+		return "", err
+	}
+	if sql, ok := c.rowKeyMembership(f.text, f.residual, false); ok {
+		return sql, nil
+	}
+	// No row key: key on the text column itself, which is exact when the
+	// fragment searches exactly one. `len(c.textCols)` is a statement-wide count
+	// rather than a per-fragment one, so this is conservative — it may refuse a
+	// compilable query, but it never emits a wrong one.
+	if c.schema.Table != "" && len(c.textCols) == 1 {
+		col := c.textCols[0]
+		where := "query('" + escapeString(f.text) + "')"
+		if f.residual != "" {
+			where += " AND " + f.residual
+		}
+		c.warn("a full-text term ORed with a non-full-text condition is compiled as a subquery, "+
+			"because a search function inside a disjunction makes this engine visit only the "+
+			"blocks its index says match and evaluate the other branch only there. With no row "+
+			"key declared the subquery is keyed on %q, which is exact but compares whole values "+
+			"— declare \"row_key\" (`_row_id` on this engine) to key on an identifier instead",
+			col)
+		return fmt.Sprintf("%s IN (SELECT %s FROM %s WHERE %s)",
+			col, col, c.schema.Table, where), nil
+	}
+	{
+		return "", fmt.Errorf(
+			"a full-text term ORed with a non-full-text condition needs a row key, and this "+
+				"schema declares %s. Without one the search function has to sit directly in the "+
+				"disjunction, where this engine prunes the scan to nothing whenever the search "+
+				"matches nothing and the other branch is discarded with it — measured, "+
+				"`query(...) OR 1=1` returns 0 rows out of 1,063,259. Declare \"row_key\" (and "+
+				"\"table\"), or rewrite the query so the full-text terms are ANDed rather than "+
+				"ORed with the rest, for example `(a OR b) level:error` instead of "+
+				"`a OR level:error`", c.reasonNoSubqueryKey())
+	}
+}
+
+// reasonNoSubqueryKey explains why neither key is available, which by the time
+// it is called means the fragment spans several text columns or there is no
+// table.
+func (c *compiler) reasonNoSubqueryKey() string {
+	if len(c.textCols) > 1 {
+		return fmt.Sprintf("no row key, and the search spans %d text columns (%s) so keying on "+
+			"one of them would not be exact", len(c.textCols), strings.Join(c.textCols, ", "))
+	}
+	return c.missingForSubquery()
+}
+
+func (c *compiler) missingForSubquery() string {
+	switch {
+	case c.schema.RowKey == "" && c.schema.Table == "":
+		return "neither a row key nor a table"
+	case c.schema.RowKey == "":
+		return "no row key"
+	default:
+		return "no table"
+	}
 }
 
 func (c *compiler) render(n parser.Node) (fragment, error) {
@@ -744,7 +1229,48 @@ func (c *compiler) not(child parser.Node) (fragment, error) {
 	// kv['container']='vector' is 6,742 and NOT(...) is 443,148, three short
 	// of the 449,893 total; the COALESCE form returns 443,151 and partitions
 	// exactly. Unknown means "not excluded".
+	// A bare NOT around a search function is the round-one defect, and it
+	// reaches here whenever the negated child was a mixed conjunction that
+	// collapsed its text into sql. The optimiser prunes the scan to the blocks
+	// the index says match and then negates WITHIN them, so the rows in every
+	// other block are lost. Measured over ts < 2026-08-20 04:00:00 (1,072,856
+	// rows), where `level:ERROR AND line:RemoteStopped` is empty so the
+	// complement is the whole table:
+	//
+	//	COALESCE(NOT ((level=ERROR AND query('line:RemoteStopped'))), TRUE)
+	//	                                                    883,884
+	//	_row_id NOT IN (SELECT _row_id … WHERE level=ERROR AND query(…))
+	//	                                                  1,072,856   exact
+	//
+	// Hoisting the branch into a disjunction's subquery does not help, because
+	// the bare NOT travels inside with it: that shape returned 917,109 against
+	// the same 1,072,856. The negation itself has to become the anti-join.
+	if f.outerSearch() > 0 {
+		return c.negateWithRowKey(f)
+	}
 	return fragment{sql: "COALESCE(NOT (" + f.sql + "), TRUE)"}, nil
+}
+
+// negateWithRowKey complements a whole composite branch through an anti-join, so
+// the search function inside it prunes only its own scan.
+//
+// Only a row key will do. Keying on the text column is not sound here for the
+// same reason it is not sound in hoistIntoSubquery: the branch constrains other
+// columns too, so expanding a match set by shared text is not idempotent.
+func (c *compiler) negateWithRowKey(f fragment) (fragment, error) {
+	if c.schema.RowKey == "" || c.schema.Table == "" {
+		return fragment{}, fmt.Errorf(
+			"negating a condition that combines a full-text term with something else needs a "+
+				"row key, and this schema declares %s. A bare NOT around a search function is "+
+				"not its complement on this engine — the scan is pruned to the blocks the index "+
+				"says match and the negation is evaluated only there, so every other block's "+
+				"rows are lost: measured, 883,884 rows against a true 1,072,856. Declare "+
+				"\"row_key\" (and \"table\"), or negate the full-text term on its own "+
+				"(`-term`) rather than negating the group it sits in",
+			c.missingForSubquery())
+	}
+	return fragment{sql: fmt.Sprintf("%s NOT IN (SELECT %s FROM %s WHERE %s)",
+		c.schema.RowKey, c.schema.RowKey, c.schema.Table, f.sql)}, nil
 }
 
 // boolean combines children, keeping everything in the text language when it
@@ -789,7 +1315,7 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 	var textFrags []fragment
 	parts := make([]string, 0, len(frags))
 	textSlot := -1
-	for _, f := range frags {
+	for _, f := range frags { //nolint:dupl // rebuilt after the OR hoist below
 		if f.isText() {
 			if textSlot < 0 {
 				textSlot = len(parts)
@@ -801,6 +1327,45 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 		parts = append(parts, f.sql)
 	}
 
+	// Any child whose SQL already carries a search function cannot stand in a
+	// disjunction either, and this is where three families were missed. A
+	// conjunction collapses its text child into sql, a negation wraps sql in
+	// COALESCE(NOT …), a degraded phrase spends its text as sql, and a fuzzy
+	// leaf is born as sql — in every one of those the search function is inside
+	// `sql` with no `text` left to notice it by. Asking the SQL directly is what
+	// makes the check total rather than a list of remembered cases.
+	//
+	// The whole branch is hoisted, not just the search function: it is a
+	// predicate over the same table, so membership by row key is exactly
+	// equivalent.
+	if op == "OR" {
+		for i := range frags {
+			if frags[i].isText() || frags[i].outerSearch() == 0 {
+				continue
+			}
+			sub, err := c.hoistIntoSubquery(frags[i])
+			if err != nil {
+				return fragment{}, err
+			}
+			frags[i] = fragment{sql: sub}
+		}
+		// Rebuild parts from the (possibly rewritten) fragments.
+		parts = parts[:0]
+		textSlot = -1
+		textFrags = nil
+		for _, f := range frags {
+			if f.isText() {
+				if textSlot < 0 {
+					textSlot = len(parts)
+					parts = append(parts, "")
+				}
+				textFrags = append(textFrags, f)
+				continue
+			}
+			parts = append(parts, f.sql)
+		}
+	}
+
 	if len(textFrags) > 0 {
 		merged := textFrags[0]
 		if len(textFrags) > 1 {
@@ -810,13 +1375,28 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 				return fragment{}, err
 			}
 		}
-		wrapped, err := c.wrapText(merged)
+		// A disjunction is the shape that cannot hold a bare search function.
+		// The optimiser pushes the search into the index scan whatever boolean
+		// surrounds it, so when the search matches nothing the scan is pruned
+		// to nothing and the OTHER disjunct is never evaluated — the whole
+		// predicate returns zero rows. Measured, `query('line:zzzznosuchtoken')
+		// OR 1=1` is 0 against a table of 1,063,259. It has to go in a
+		// subquery.
+		var wrapped string
+		var err error
+		if op == "OR" {
+			wrapped, err = c.semiJoin(merged)
+		} else {
+			wrapped, err = c.wrapText(merged)
+		}
 		if err != nil {
 			return fragment{}, err
 		}
 		parts[textSlot] = wrapped
 	}
 
+	// No count to accumulate: the assembled fragment's SQL carries whatever its
+	// pieces put there, and outerSearch() reads it back off the string.
 	return fragment{sql: "(" + strings.Join(parts, " "+op+" ") + ")"}, nil
 }
 
@@ -1115,7 +1695,6 @@ func (c *compiler) textTerm(f Field, t *parser.Term) (fragment, error) {
 			c.warn("boost ^%s is not expressible on a fuzzy term: fuzziness reaches the engine "+
 				"through match()'s option argument, which has no weight of its own", t.Boost)
 		}
-		c.searchFuncs++
 		return fragment{sql: fmt.Sprintf("match(%s, '%s', 'fuzziness=%d')",
 			f.Column, escapeString(t.Value), t.Fuzz)}, nil
 

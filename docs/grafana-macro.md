@@ -524,6 +524,21 @@ The `-schema` / `-preset` plumbing is the other half: the schema stops being a G
 function and becomes a file, which is what makes `schemaFor` above able to read
 one from the datasource's settings rather than hardcoding a table.
 
+### One search function per statement — the qualifier that was missing
+
+Everything above says a statement may hold one search function. Measured later, and worth stating
+because an absolute claim outlives the code it described: the limit binds a **bare** search function,
+one sitting directly in the scan. Wrapped in a row-key subquery it is an ordinary boolean and escapes
+the limit — `count_if(query('line:RemoteStopped'))` is `[1065]`, while
+`count_if(_row_id IN (SELECT _row_id … query('line:RemoteStopped')))` returns 737, matching the
+predicate on its own, and two such predicates sit in one statement returning 737 and 26,408
+(closed window `ts < '2026-08-20 04:00:00'`, 1,072,856 rows).
+
+So the compiler's habit of folding all boolean full-text logic into a single `query()` is a
+consequence of preferring the index, not of a hard limit, and the subquery form is what lets a
+disjunction hold a text condition at all. Reshaping panels around that freedom is a separate change
+and is not attempted here.
+
 ## Upstreaming
 
 This is additive — a new file plus two map entries — and touches no existing

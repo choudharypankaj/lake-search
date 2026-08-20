@@ -40,6 +40,7 @@ package databend
 const k8sLogsDef = `{
   "table": "logs.k8s_logs",
   "default": "msg",
+  "row_key": "_row_id",
   "time": "ts",
   "severity": "level",
   "variant": "kv",
@@ -190,6 +191,7 @@ const k8sLogsDef = `{
 const k8sLogsLineDef = `{
   "table": "logs.k8s_logs",
   "default": "line",
+  "row_key": "_row_id",
   "time": "ts",
   "severity": "level",
   "variant": "kv",
