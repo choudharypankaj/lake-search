@@ -196,7 +196,7 @@ const k8sLogsLineDef = `{
   "case_insensitive": true,
   "display": ["ts", "level", "component", "pod", "node", "source_file", "line"],
   "indexes": [
-    {"name": "idx_msg", "kind": "inverted", "columns": ["msg", "line", "kv"],
+    {"name": "idx_msg", "kind": "inverted", "columns": ["msg", "line", "kv", "source_file"],
      "tokenizer": "english", "filters": ["english_stop", "english_stemmer"]},
     {"name": "idx_msg_ng", "kind": "ngram", "columns": ["msg", "line"]}
   ],
@@ -211,7 +211,8 @@ const k8sLogsLineDef = `{
     {"name": "namespace", "kind": "string"},
     {"name": "pod", "kind": "string"},
     {"name": "node", "kind": "string"},
-    {"name": "source_file", "kind": "string"},
+    {"name": "source_file", "kind": "text", "aliases": ["file"],
+     "example": "compaction_runner.rs"},
     {"name": "raw", "kind": "string"}
   ]
 }`

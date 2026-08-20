@@ -21,6 +21,6 @@ k8s_logs_v2	"CREATE TABLE k8s_logs_v2 (
   msg VARCHAR NULL,
   kv VARIANT NULL,
   line VARCHAR NULL AS (concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv, 'container', 'service', 'format'), '$.*')::STRING, '[]'))) STORED,
-  SYNC INVERTED INDEX idx_msg (msg, kv, line) filters = 'english_stop,english_stemmer', tokenizer = 'english',
+  SYNC INVERTED INDEX idx_msg (source_file, msg, kv, line) filters = 'english_stop,english_stemmer', tokenizer = 'english',
   SYNC NGRAM INDEX idx_msg_ng (msg, line)
 ) ENGINE=FUSE CLUSTER BY (to_date(ts), component)"

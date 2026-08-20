@@ -71,7 +71,12 @@ func TestParseShape(t *testing.T) {
 	if inv.Kind != InvertedIndex || inv.Name != "idx_msg" {
 		t.Errorf("first index = %+v", inv)
 	}
-	if !sameSet(inv.Columns, []string{"msg", "kv", "line"}) {
+	// source_file joined the group when the file position became searchable:
+	// `file:compaction_runner` was silently 0 as an equality on a whole path,
+	// and 2,860 rows once tokenised. The engine reports the columns in its own
+	// order, hence sameSet -- and hence Drift comparing sets too, or a correct
+	// descriptor would report drift on every run.
+	if !sameSet(inv.Columns, []string{"msg", "kv", "line", "source_file"}) {
 		t.Errorf("idx_msg columns = %v", inv.Columns)
 	}
 	if inv.Tokenizer != "english" || !sameSet(inv.Filters, []string{"english_stop", "english_stemmer"}) {

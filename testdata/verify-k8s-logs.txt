@@ -1,3 +1,4 @@
+
 lsprobe|v1|section|columns|logs.k8s_logs
 ts	TIMESTAMP	YES	NULL	
 component	VARCHAR	YES	NULL	
@@ -9,7 +10,7 @@ source_file	VARCHAR	YES	NULL
 msg	VARCHAR	YES	NULL	
 kv	VARIANT	YES	NULL	
 line	VARCHAR	YES	NULL	STORED COMPUTED COLUMN `concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv, 'container', 'service', 'format'), '$.*')::STRING, '[]'))`
-raw	VARCHAR	YES	NULL	
+raw	VARCHAR	YES	NULL
 lsprobe|v1|section|create|logs.k8s_logs
 k8s_logs	"CREATE TABLE k8s_logs (
   ts TIMESTAMP NULL,
@@ -23,13 +24,13 @@ k8s_logs	"CREATE TABLE k8s_logs (
   kv VARIANT NULL,
   line VARCHAR NULL AS (concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv, 'container', 'service', 'format'), '$.*')::STRING, '[]'))) STORED,
   raw VARCHAR NULL,
-  SYNC INVERTED INDEX idx_msg (msg, kv, line) filters = 'english_stop,english_stemmer', tokenizer = 'english',
+  SYNC INVERTED INDEX idx_msg (source_file, msg, kv, line) filters = 'english_stop,english_stemmer', tokenizer = 'english',
   SYNC NGRAM INDEX idx_msg_ng (msg, line)
 ) ENGINE=FUSE CLUSTER BY (to_date(ts), component)"
 lsprobe|v1|section|bagkeys|logs.k8s_logs
 lsprobe|v1|bagwindow|stats|not measured: this descriptor types no bag key, so there is nothing to check per key. Only the shadowing enumeration below ran
 lsprobe|v1|bagwindow|enum|no bound (existence needs the widest window: a forward-only key is absent from history and a rare key is absent from a recent window)
-lsprobe|v1|bagname|kv|namespace|30265
+lsprobe|v1|bagname|kv|namespace|30928
 lsprobe|v1|bagname|kv|node|26
 lsprobe|v1|bagname|kv|body|3
 lsprobe|v1|bagname|kv|component|1

@@ -9,7 +9,7 @@ source_file	VARCHAR	YES	NULL
 msg	VARCHAR	YES	NULL	
 kv	VARIANT	YES	NULL	
 line	VARCHAR	YES	NULL	STORED COMPUTED COLUMN `concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv, 'container', 'service', 'format'), '$.*')::STRING, '[]'))`
-raw	VARCHAR	YES	NULL	
+raw	VARCHAR	YES	NULL
 lsprobe|v1|section|create|logs.k8s_logs
 k8s_logs	"CREATE TABLE k8s_logs (
   ts TIMESTAMP NULL,
@@ -23,6 +23,6 @@ k8s_logs	"CREATE TABLE k8s_logs (
   kv VARIANT NULL,
   line VARCHAR NULL AS (concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv, 'container', 'service', 'format'), '$.*')::STRING, '[]'))) STORED,
   raw VARCHAR NULL,
-  SYNC INVERTED INDEX idx_msg (msg, kv, line) filters = 'english_stop,english_stemmer', tokenizer = 'english',
+  SYNC INVERTED INDEX idx_msg (source_file, msg, kv, line) filters = 'english_stop,english_stemmer', tokenizer = 'english',
   SYNC NGRAM INDEX idx_msg_ng (msg, line)
 ) ENGINE=FUSE CLUSTER BY (to_date(ts), component)"

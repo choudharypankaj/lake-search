@@ -336,11 +336,35 @@ example_field = PRIMARY or BODY
 # search box -- so this only ever shows a value the schema itself declared.
 example_value = (FIELDS.get(example_field, {}) or {}).get("example") or "value"
 example_sev = f"`{SEVERITY}:ERROR` \u00b7 " if SEVERITY else ""
+# The file position needs its own example or nobody finds it. It is visible on
+# every rendered line -- `[compaction_runner.rs:360]` -- yet a bare term never
+# reaches it: the searched surface is the message plus the bag's values, and the
+# file lives in its own column, so typing what you can plainly see returns the
+# handful of rows that mention it in prose. Shown only when the schema has such a
+# field AND it is full-text indexed, because as an unindexed string it needs
+# `file:*x*` and this strip would then teach a query that finds nothing.
+# Written as a wildcard on the field's OWN name rather than as `file:x`, and
+# that is not fussiness. This strip is generated from the schema in THIS tree,
+# while the search box is executed by the datasource plugin, which vendors its
+# own older copy of the compiler -- so the two can disagree about what a field
+# is. Measured against the deployed plugin: `file:compaction_runner` and
+# `source_file:compaction_runner` both return 0 there (it still knows the field
+# as a plain string, so it emits an equality against a whole path), while the
+# wildcard returns 2,909 under both the old compiler (LIKE) and the new one
+# (word-boundary RLIKE). The strip has to teach the query that works where it is
+# READ, not the prettiest one this tree can compile.
+example_file = ""
+for _n in ("source_file", "caller", "logger", "file"):
+    _f = FIELDS.get(_n)
+    if _f and _f.get("example"):
+        _stem = _f["example"].split(".")[0].split("_")[0]
+        example_file = f"`{_n}:*{_stem}*` \u00b7 "
+        break
 panels.append({
     "id": 10, "type": "text", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 2},
     "options": {"mode": "markdown", "content": (
         f"`snapshot` \u00b7 `\"peer status\"` (phrase, order matters) \u00b7 `{example_field}:{example_value}` \u00b7 "
-        f"{example_sev}`-TiFlash` (exclude) \u00b7 `a OR b` \u00b7 `(a OR b) c` \u00b7 "
+        f"{example_sev}{example_file}`-TiFlash` (exclude) \u00b7 `a OR b` \u00b7 `(a OR b) c` \u00b7 "
         f"`snapshoot~1` (fuzzy) \u00b7 `snapsh*` (wildcard) \u00b7 `{example_field}:*` (exists)\n\n"
         "Empty box browses everything. Stemming is on — `truncate` finds *Truncating*."
     )}
