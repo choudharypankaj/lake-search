@@ -123,6 +123,49 @@ type Def struct {
 
 	Indexes []IndexDef `json:"indexes,omitempty"`
 	Fields  []FieldDef `json:"fields"`
+
+	// Introspect records that this descriptor was generated rather than
+	// written, and on what evidence. It is data only — resolution ignores it
+	// entirely — but it is the difference between a descriptor a reader can
+	// audit and one that reads as fact because it is checked in.
+	//
+	// A guess laundered into configuration is worse than no guess: without this
+	// block the next person cannot tell `severity: level` chosen because the
+	// column is called level from `severity: level` chosen because someone
+	// looked at the values.
+	Introspect *IntrospectDef `json:"introspect,omitempty"`
+}
+
+// IntrospectDef is the provenance block `lake-search introspect build` writes.
+type IntrospectDef struct {
+	// Version is the probe version the descriptor was built from.
+	Version string `json:"version"`
+
+	// Table is what was probed, so a descriptor edited to point elsewhere is
+	// visibly no longer what was measured.
+	Table string `json:"table"`
+
+	// ColumnsDigest fingerprints the column list at probe time.
+	// `introspect verify` re-reads DESCRIBE and reports drift against it, which
+	// is the answer to a descriptor being a snapshot rather than a live read.
+	ColumnsDigest string `json:"columns_digest,omitempty"`
+
+	// Profiled records whether a sampled value profile was available. Without
+	// one every type rests on the declared type alone, which is the blind spot
+	// that types a column of Go durations as a number.
+	Profiled bool `json:"profiled"`
+
+	// Window describes the profile's bound, so a reader knows how much data the
+	// content decisions rest on.
+	Window string `json:"window,omitempty"`
+
+	// Roles says how each role was decided, or why it was not.
+	Roles map[string]string `json:"roles,omitempty"`
+
+	// Refused lists what was considered and rejected, with the evidence. This
+	// is the most important field in the block: it is the only record that a
+	// plausible inference was deliberately NOT made.
+	Refused []string `json:"refused,omitempty"`
 }
 
 // IndexDef is one index in the on-disk form.
@@ -146,6 +189,9 @@ type BagDef struct {
 	// Keys types individual keys, by leaf name. Values are the same kind
 	// strings a field uses.
 	Keys map[string]string `json:"keys,omitempty"`
+
+	// From records how this bag was decided. Data only.
+	From string `json:"from,omitempty"`
 }
 
 // FieldDef is one searchable field in the on-disk form.
@@ -173,6 +219,12 @@ type FieldDef struct {
 
 	// Example is one real value, used only by the dashboard help text.
 	Example string `json:"example,omitempty"`
+
+	// From records how this field was decided when the descriptor was
+	// generated: `canonical-name`, `content-sample`, `lone-candidate`,
+	// `derived-text-surface`, `type-only`, or absent for a hand-written field.
+	// Data only; resolution ignores it.
+	From string `json:"from,omitempty"`
 }
 
 var kindNames = map[string]Kind{

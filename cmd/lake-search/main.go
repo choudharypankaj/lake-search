@@ -36,6 +36,8 @@ func main() {
 		os.Exit(cmdConform(os.Args[2:]))
 	case "schema":
 		os.Exit(cmdSchema(os.Args[2:]))
+	case "introspect":
+		os.Exit(cmdIntrospect(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)
@@ -57,6 +59,8 @@ func usage() {
                                         print a complete SELECT
   conform [-file F] [-table T]          print the row-count conformance script
   schema                                validate the schema and describe it
+  introspect probe|profile|build        bootstrap a descriptor for an unknown
+                                        table, by printing SQL for you to run
 
 Every command takes -schema FILE or -preset NAME, or reads LAKE_SEARCH_SCHEMA.
 A schema is data: it names your table, its columns and their kinds, so pointing

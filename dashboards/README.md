@@ -9,6 +9,32 @@ curl -u admin:admin -H 'Content-Type: application/json' -d @dash.json \
   http://<grafana>/api/dashboards/db
 ```
 
+## What is deployed on the reference cluster
+
+`logs.k8s_logs` was migrated on 2026-08-20 -- it now carries the derived `line`
+column and one inverted index over `(msg, line, kv)` -- so the dashboard there
+is generated from the POST-migration preset, and that is the command to repeat
+if you redeploy it:
+
+```bash
+python3 dashboards/tidb-logs-explorer.py --preset k8s-logs-line > dash.json
+```
+
+Generated with no flags you get the `k8s-logs` preset, which describes the table
+as it was BEFORE that migration: `msg` alone, searched and shown. Both presets
+are kept because both shapes are real -- an un-migrated table cannot use the
+first command, and a migrated one should not use the second.
+
+One caveat that outlives the migration. The `$__search` macro lives in the
+Grafana datasource plugin, which vendors its OWN copy of this library, so the
+dashboard runs whatever compiler was current when the plugin was last released
+-- not what is in this tree. The plugin deployed on the reference cluster
+predates the round-4 compiler, which is visible: `$__search(line, ...)` resolves
+the new column correctly, because a bare term only needs the column NAME, but
+`store_id:>100` still dies there with `[1006] to_float64('Some(25)')` and a bag
+key still compiles to an unindexed scan. Both are fixed in this tree. Rebuild
+and release the plugin to get them; the migration alone does not.
+
 It is a generator rather than a checked-in blob because the same WHERE clause
 appears in nine panels; editing that in raw JSON is how panels drift apart.
 
