@@ -1,0 +1,110 @@
+{
+  "table": "logs.k8s_logs_v2",
+  "preset": "k8s-logs-line",
+  "note": "Row-count assertions for the derived text surface and the indexed attribute bag — the two behaviours the k8s-logs-line schema adds. It runs against logs.k8s_logs_v2, a frozen copy of logs.k8s_logs (967,912 rows, ts < 2026-08-19 22:19:00) carrying the STORED `line` column and the widened index group (msg, line, kv). Point it at logs.k8s_logs once the migration in round4-live-migration.sql has run there. Baselines are relative, so the suite stays valid as the table grows.",
+  "cases": [
+    {
+      "name": "a bare word reaches text the pipeline moved into the bag",
+      "query": "RemoteStopped",
+      "compare": "nonzero",
+      "note": "The whole point of the derived surface. `err=RemoteStopped` is parsed out of the message into the kv bag, so before `line` existed a bare RemoteStopped matched nothing at all: measured 0 through the index and 0 for msg LIKE '%RemoteStopped%', against 605 for line LIKE '%RemoteStopped%'."
+    },
+    {
+      "name": "the message column keeps its narrow scope",
+      "query": "msg:RemoteStopped",
+      "compare": "zero",
+      "note": "The negative control for the case above, and the reason one index spans both columns rather than the derived column replacing msg. If this is ever nonzero, `msg:` has silently widened to the reconstructed line and a user asking about the message text is being answered about the attributes too."
+    },
+    {
+      "name": "a bare word and a message term compose in one search function",
+      "query": "RemoteStopped msg:rpc",
+      "baseline": "RemoteStopped",
+      "compare": "narrows",
+      "note": "Two columns of one index inside a single query() call. Two separate indexes cannot be mixed — measured, a table with idx_line(line) and idx_line2(line2) answers each alone and fails [1065] for a query naming both — so this case failing is the signal that the columns have drifted apart into different indexes."
+    },
+    {
+      "name": "a bag key is searched through the index",
+      "query": "err:RemoteStopped",
+      "compare": "nonzero",
+      "note": "An inverted index covers a VARIANT column by JSON path, so kv['err'] is reachable as kv.err with no per-key DDL. Measured 507, exactly what the equality alone returns."
+    },
+    {
+      "name": "an indexed bag key is still exact",
+      "query": "request:command",
+      "compare": "zero",
+      "note": "The index is tokenised and stemmed and therefore strictly wider than the equality it accelerates: query('kv.request:command') alone returns 501 rows whose value is `batch_commands`, none of which equals `command`. The compiler keeps the equality as a residual beside the index clause, so this must stay zero. If it ever returns 501, the residual has been dropped and every bag-key search has silently become a stemmed substring match."
+    },
+    {
+      "name": "a bag key narrows the bare word",
+      "query": "err:RemoteStopped",
+      "baseline": "RemoteStopped",
+      "compare": "narrows",
+      "note": "The bare word finds the value anywhere in the reconstructed line; the field-scoped form insists it is that key's value. 507 against 605 when measured — the 98 others carry the token in a different key or in the message."
+    },
+    {
+      "name": "a bag key search still finds nothing for an absent value",
+      "query": "err:zzzznotpresentzzzz",
+      "compare": "zero"
+    },
+    {
+      "name": "a numeric bound on a bag key is compared as a number, not as text",
+      "query": "term:>=9",
+      "baseline": "term:*",
+      "compare": "eq",
+      "note": "Every value of kv['term'] on this table is between 19 and 175, so a numeric `>= 9` is all 33,300 rows that hold the key and the assertion is an identity. Read as text it is 339, because '10' sorts before '9'. This case replaced a `partitions` one that could not fail: `> x` and `[0 TO x]` are complementary halves of the key's rows under EITHER comparison, so the partition identity held at 32,929 + 371 and again at 30,584 + 2,716, and the case passed for both readings. Reverting the comparison to text must break this one."
+    },
+    {
+      "name": "a numeric bound the table cannot satisfy returns nothing",
+      "query": "term:<9",
+      "compare": "zero",
+      "note": "The other half of the case above and the more alarming one. The minimum value of kv['term'] here is 19, so nothing is below 9. Compared as text this returns 32,961 rows — a third of the key's rows invented out of a bound the table cannot satisfy, with no error. One-sided by construction, so it is paired with the identity above: a compile that returns 0 for everything passes this and fails that."
+    },
+    {
+      "name": "a numeric bound silently excludes values that are not numbers",
+      "query": "duration:>100",
+      "baseline": "duration:*",
+      "compare": "lt",
+      "note": "This case asserts a KNOWN LIMITATION rather than a fix, which is why it is here. All 1,945 values of kv['duration'] are Go durations — `47.823614ms`, `39.422927ms` — so TRY_CAST yields NULL for 1,943 of them and `duration:>100` returns 0. The compiler warns, and the warning is the whole mitigation. If this case ever stops holding, the cast semantics changed and the warning text needs rechecking. Under the old hard cast this statement was [1006] invalid float literal rather than an answer at all."
+    },
+    {
+      "name": "a numeric bound survives a bag key that is not all numbers",
+      "query": "store_id:>100",
+      "baseline": "store_id:*",
+      "compare": "shrinks",
+      "note": "1,243 of store_id's 40,516 rows hold a `Some(25)`-style debug rendering. Compiled as a cast this is not a wrong answer but a dead query: `kv['store_id']::VARCHAR::DOUBLE > 100` is [1006] invalid float literal, and one such value anywhere in the table is enough — so reverting the cast makes this case error rather than pass. TRY_CAST yields NULL for those rows and returns the 39,140 that are numbers, so this must be nonzero and strictly below the count that merely have the key. The decomposition: 40,516 hold the key, 39,273 cast, 39,140 of those exceed 100 and 133 do not, and 40,516 - 39,273 = 1,243 do not cast. The 1,243 is the silently-excluded set the compiler now warns about."
+    },
+    {
+      "name": "a bag key that cannot be spelled in the query language still works",
+      "query": "\"msg type\":MsgRequestVote",
+      "compare": "nonzero",
+      "note": "The query() field name has no quoting, so a key with a space in it cannot be addressed there. Such a key has to stay on the equality path rather than be silently mangled into `kv.msg type:...`, which would change where the statement's one search function is spent and probably not parse."
+    },
+    {
+      "name": "an exclusion partitions the table once the bag is indexed",
+      "query": "-container:vector",
+      "baseline": "ts:*",
+      "witness": "container:vector",
+      "compare": "partitions",
+      "note": "923,273 + 44,639 = 967,912 exactly. This replaced a bare `nonzero` on the same query, which asserted nothing: the failure mode it was named for — the residual leaking so the exclusion becomes NOT query(...) — also returns 923,273 for this key, because on `container` the index and the equality happen to agree."
+    },
+    {
+      "name": "an exclusion on a bag key does not leak the index clause",
+      "query": "-request:command",
+      "baseline": "ts:*",
+      "compare": "eq",
+      "note": "The discriminating version of the case above, on the one key where the index and the equality disagree. Nothing equals `command`, so excluding it must leave the whole table: 967,912. If the residual leaked under NOT and the exclusion compiled to NOT query('kv.request:command') instead, this returns 339,548 — not 967,411, because a bare NOT around a search function is pruned rather than complemented, which is the older defect this project already fixed for the text column. Either way it is a quarter of the table missing and this case sees it."
+    },
+    {
+      "name": "a stopword bag value skips the index",
+      "query": "standalone:No",
+      "compare": "nonzero",
+      "note": "kv['standalone'] = 'No' on exactly one row in this window, and `No` is one of the 33 words the analyzer deletes — so query('kv.standalone:No') is 0 while the equality is 1. The index clause must not be added beside the equality here, or the AND inherits the emptiness and a row that exists returns nothing. This is the only naturally occurring all-stopword bag value in the table; the multi-token form (`verb:\"to be\"`, which the first version of the guard let through) is not reachable here and is covered by TestStopwordBagValueSkipsIndex, measured on a purpose-built probe."
+    },
+    {
+      "name": "a bare word still finds nothing that is not there",
+      "query": "zzzznotpresentzzzz",
+      "compare": "zero",
+      "note": "Control. The derived column concatenates two things, so a bug in the expression would show up as a term matching more than it should, not less."
+    }
+  ]
+}

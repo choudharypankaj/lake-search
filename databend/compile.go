@@ -252,6 +252,25 @@ const variantKeyWarning = "field %q is not a column, so it is read from the %s V
 	"empty rather than an error — kv['tableid'] and kv['tableID'] are different keys — and Go " +
 	"loggers emit camelCase names like tableID, reconcileID, controllerKind and TiFlash"
 
+// indexedVariantKeyWarning is the same advisory for a bag whose column is in the
+// index group. Half of it stops being true there — the lookup is index-backed
+// rather than a scan — and the half that matters more does not: the key is still
+// matched exactly and a mis-cased key is still silently empty, because the JSON
+// path is not analysed even though the value is.
+const indexedVariantKeyWarning = "field %q is not a column, so it is read from the %s VARIANT. The " +
+	"lookup is index-backed, but the KEY is still matched EXACTLY, case included: a mis-cased " +
+	"key is silently empty rather than an error — kv['tableid'] and kv['tableID'] are different " +
+	"keys — and Go loggers emit camelCase names like tableID, reconcileID, controllerKind and " +
+	"TiFlash"
+
+// variantWarning picks between them.
+func variantWarning(f Field) string {
+	if f.Search != "" {
+		return indexedVariantKeyWarning
+	}
+	return variantKeyWarning
+}
+
 // fragment is a partially compiled subtree, in one of two languages.
 //
 // Keeping them apart is what makes the one-search-function rule enforceable:
@@ -308,19 +327,114 @@ type compiler struct {
 	// textCols records every column that reached a text fragment, so a
 	// negated fragment knows which column its anti-join keys on.
 	textCols []string
+
+	// textIndexes records the distinct inverted indexes those columns belong
+	// to. Every text leaf merges into one query() call, and that call is legal
+	// across several columns only when a single index covers all of them —
+	// measured, a table with separate idx_line(line) and idx_line2(line2)
+	// answers each column alone but fails [1065] "columns line2, line don't
+	// have inverted index" for `query('line:x AND line2:x')`. Two columns of
+	// one index compose fine: over the frozen copy, `query('line:RemoteStopped
+	// AND msg:rpc')` on a table indexed (msg, line) returns 585.
+	//
+	// A schema that does not name its indexes leaves this empty and nothing is
+	// checked, which is the previous behaviour.
+	textIndexes []string
 }
 
 func (c *compiler) warn(format string, args ...interface{}) {
 	c.warnings = append(c.warnings, fmt.Sprintf(format, args...))
 }
 
-func (c *compiler) noteTextCol(col string) {
-	for _, existing := range c.textCols {
-		if existing == col {
-			return
+// bagOf names the bag a field resolved out of, for the advisory. It repeats the
+// routing rather than being told the answer because the warning is the only
+// place the name is needed and Lookup's signature is a public contract.
+func (c *compiler) bagOf(name string) string {
+	f, known := c.schema.Lookup(name)
+	if known || f.Presence == "" {
+		return c.schema.Variant
+	}
+	if i := strings.IndexAny(f.Presence, "['"); i > 0 {
+		return f.Presence[:i]
+	}
+	return c.schema.Variant
+}
+
+// numericColumn is Field.NumericColumn plus the advisory it owes the caller.
+//
+// It warns whenever a conversion is actually introduced — that is, whenever the
+// field is not already a numeric column. The warning is not decoration. TRY_CAST
+// was chosen over a cast because a cast fails the whole statement on the first
+// value that is not a number, and one bad value must not make a legitimate
+// query unanswerable. But the price of that choice is that non-numeric values
+// become NULL and their rows drop out of the comparison with nothing said, and
+// the exposure on a real log table is not marginal. Over logs.k8s_logs_v2
+// (967,912 rows, ts < 2026-08-19 22:19:00), rows that hold the key but whose
+// value does not cast:
+//
+//	kv key        rows with key   silently dropped
+//	store                16,154             15,784   97.7%
+//	to                    6,604              5,681   86.0%
+//	observe_id            3,369              3,369    100%
+//	vote                  4,952              2,171   43.8%
+//	duration              1,945              1,943   99.9%
+//	store_id             40,516              1,243    3.1%
+//	from                  9,937                360    3.6%
+//	id                    5,059                  5
+//	tableID             231,986                  3
+//
+// 30,559 rows across nine keys, and the distribution is worse than the total:
+// the keys a human puts a bound on are the worst ones. Every one of duration's
+// 1,945 values is a Go duration — `47.823614ms`, `39.422927ms` — so
+// `duration:>100`, the most natural latency query there is, returns 0 of 1,945
+// with no error at all. Under the old hard cast that same query was
+// `[1006] invalid float literal ... to_float64('47.823614ms')`, which was
+// useless as an answer but pointed straight at the unit suffix.
+//
+// So the warning has to carry the whole mitigation, and it has to be worth
+// reading. It names the field, says the rows are excluded rather than counted,
+// and hands over the predicate that counts them — because the caller is the only
+// one who can run it.
+//
+// One thing it cannot do is reach a Grafana user. The frame-notice channel is
+// not in the deployed plugin (docs/grafana-macro.md says so in the same words),
+// so today this text arrives only in the SQL comment the query inspector shows.
+// That is a gap in the plugin, not in the wording, and it is why the wording
+// leans on the count-them predicate rather than on being noticed.
+func (c *compiler) numericColumn(f Field, name string) string {
+	expr := f.NumericColumn()
+	if f.Kind == Number && f.Numeric == "" {
+		// A real numeric column. No conversion, nothing to warn about.
+		return expr
+	}
+	probe := f.Column
+	if f.Presence != "" {
+		probe = f.Presence
+	}
+	c.warn("comparing %q as a number converts it with TRY_CAST, because it is not a numeric "+
+		"column: a value that is not a number becomes NULL, so that row is EXCLUDED from the "+
+		"comparison rather than raising an error. A zero or short result may mean the values "+
+		"carry a unit or a wrapper rather than that nothing matched — a Go duration "+
+		"(`47.823614ms`) and a debug rendering (`Some(25)`) both fail to cast silently. Count "+
+		"them with count_if(%s IS NOT NULL AND %s IS NULL)",
+		name, probe, expr)
+	return expr
+}
+
+func (c *compiler) noteText(f Field) {
+	c.textCols = appendUnique(c.textCols, f.Column)
+	if f.Index != "" {
+		c.textIndexes = appendUnique(c.textIndexes, f.Index)
+	}
+}
+
+func appendUnique(list []string, v string) []string {
+	for _, existing := range list {
+		if existing == v {
+			return list
 		}
 	}
-	c.textCols = append(c.textCols, col)
+	return append(list, v)
 }
 
 // finalize converts the root fragment into SQL, spending a search function if
@@ -333,6 +447,37 @@ func (c *compiler) finalize(f fragment) (string, error) {
 		return f.sql, nil
 	}
 	return c.wrapText(f)
+}
+
+// checkOneIndex refuses a text expression whose columns live in different
+// inverted indexes.
+//
+// Every text leaf merges into one query() call, and that is the only shape
+// this engine allows — but a single call reaches only the columns of a single
+// index. Measured on a probe table with separate idx_line(line) and
+// idx_line2(line2), each column answers alone (1 row each) while
+// `query('line:RemoteStopped AND line2:RemoteStopped')` fails
+// `[1065] columns line2, line don't have inverted index`. The message names
+// both columns as unindexed, which is misleading enough that the error is
+// worth pre-empting here with one that says what actually happened.
+//
+// Columns of the *same* index compose freely, which is the whole reason the
+// derived text surface is indexed alongside msg rather than beside it: over
+// the frozen copy, `query('line:RemoteStopped AND msg:rpc')` returns 585.
+//
+// A schema that names no indexes leaves textIndexes empty and nothing is
+// checked. That is deliberate: an unnamed index is unknown, not absent, and
+// refusing on a guess would break every schema written before indexes could be
+// declared.
+func (c *compiler) checkOneIndex() error {
+	if len(c.textIndexes) < 2 {
+		return nil
+	}
+	return fmt.Errorf(
+		"this query searches columns in %d different inverted indexes (%s) but one query() "+
+			"call reaches only the columns of one index: search a single text field, or index "+
+			"the columns together (CREATE INVERTED INDEX ... ON <table>(%s))",
+		len(c.textIndexes), strings.Join(c.textIndexes, ", "), strings.Join(c.textCols, ", "))
 }
 
 // wrapText turns a query()-language expression into SQL, spending the
@@ -368,6 +513,9 @@ func (c *compiler) finalize(f fragment) (string, error) {
 // at all, because it stays inside one query() call where the positive drives
 // the scan.
 func (c *compiler) wrapText(f fragment) (string, error) {
+	if err := c.checkOneIndex(); err != nil {
+		return "", err
+	}
 	if f.negated {
 		return c.antiJoin(f)
 	}
@@ -642,10 +790,12 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 	}
 	f, known := c.schema.Lookup(name)
 	if f.Column == "" {
-		return fragment{}, fmt.Errorf("unknown field %q and no VARIANT column configured", name)
+		return fragment{}, fmt.Errorf(
+			"unknown field %q and no VARIANT column configured: this schema declares no "+
+				"attribute bag, so a name it does not list cannot be read from anywhere", name)
 	}
 	if !known && t.Field != "" {
-		c.warn(variantKeyWarning, t.Field, c.schema.Variant)
+		c.warn(variantWarning(f), t.Field, c.bagOf(t.Field))
 	}
 
 	if t.Exists {
@@ -694,7 +844,7 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 		if _, err := strconv.ParseFloat(t.Value, 64); err != nil {
 			return fragment{}, fmt.Errorf("field %q is numeric but %q is not a number", name, t.Value)
 		}
-		return fragment{sql: f.Column + " = " + t.Value}, nil
+		return fragment{sql: c.numericColumn(f, name) + " = " + t.Value}, nil
 	case Timestamp:
 		// The remediation has to be a spelling that survives the lexer: a
 		// quoted literal with a space in it does not, because the space ends
@@ -918,7 +1068,7 @@ func (c *compiler) textTerm(f Field, t *parser.Term) (fragment, error) {
 				"silently matches that token everywhere. Compiling it as the token AND a literal "+
 				"scan for the whole phrase instead: the scan is exact about spacing and case "+
 				"where a phrase query is not", t.Value, toks[0], f.Column)
-			c.noteTextCol(f.Column)
+			c.noteText(f)
 			return fragment{
 				text:     f.Column + ":" + quoteQueryValue(toks[0], false),
 				residual: like,
@@ -949,11 +1099,11 @@ func (c *compiler) textTerm(f Field, t *parser.Term) (fragment, error) {
 		// Strictly monotone, converging on the unordered AND, and the reversed
 		// phrase first matches at exactly ~2 — a transposition costs two,
 		// which is textbook Lucene.
-		c.noteTextCol(f.Column)
+		c.noteText(f)
 		return fragment{text: c.boost(f.Column+":"+quoteQueryValue(t.Value, true)+slopSuffix(t), t)}, nil
 
 	default:
-		c.noteTextCol(f.Column)
+		c.noteText(f)
 		return fragment{text: c.boost(f.Column+":"+quoteQueryValue(t.Value, false), t)}, nil
 	}
 }
@@ -1160,14 +1310,118 @@ func (c *compiler) stringTerm(f Field, t *parser.Term) (fragment, error) {
 	}
 
 	lit := "'" + escapeString(t.Value) + "'"
+	eq := f.Column + " = " + lit
 	if c.schema.CaseInsensitive {
 		// There is no case-insensitive `=` on this engine — ILIKE exists, but
 		// it is a LIKE, so it would turn an equality into a pattern match —
 		// which is why case-insensitivity is spelled out with lower() on both
 		// sides rather than borrowed from an operator.
-		return fragment{sql: fmt.Sprintf("lower(%s) = lower(%s)", f.Column, lit)}, nil
+		eq = fmt.Sprintf("lower(%s) = lower(%s)", f.Column, lit)
 	}
-	return fragment{sql: f.Column + " = " + lit}, nil
+	if frag, ok := c.indexedEquality(f, t.Value, eq); ok {
+		return frag, nil
+	}
+	return fragment{sql: eq}, nil
+}
+
+// indexedEquality adds the index to an equality on a VARIANT key, without
+// changing what the equality means.
+//
+// An inverted index covers a VARIANT column by JSON path, so `kv['err'] = 'x'`
+// — a full scan today — can be pruned by `query('kv.err:x')` first. The catch
+// is that the two are not the same question: the equality is exact and the
+// index is tokenised and stemmed, so the index is strictly wider. Measured over
+// a 967,914-row copy indexed on (msg, line, kv):
+//
+//	                        query()   equality
+//	kv.err:RemoteStopped        507        507   same question, by luck
+//	kv.request:command          501          0   `batch_commands` stems to it
+//
+// So the index cannot replace the equality — 501 invented rows on the second
+// line — but it can precede it. The pair compiles to the index fragment plus
+// the equality as a residual, which is the same mechanism a collapsed phrase
+// already uses, and measures identically to the equality alone: 507 and 0.
+//
+// Two shapes are excluded because the index would answer nothing and the AND
+// would inherit that:
+//
+//   - a value the index deletes. A row written with kv = {"verb":"the"} is
+//     returned by the equality (1) and not by query('kv.verb:the') (0), so a
+//     stopword value has to skip the index entirely.
+//   - a value with no token in it at all, which the analyzer removes the same
+//     way.
+//
+// It also requires the key to be spellable in the query language and the bag
+// to actually be indexed, which is what keeps this dormant on a table whose
+// VARIANT column is not in the index group.
+func (c *compiler) indexedEquality(f Field, value, eq string) (fragment, bool) {
+	if f.Search == "" || !indexCanSee(f, value) {
+		return fragment{}, false
+	}
+	c.noteText(f)
+	return fragment{
+		text:     f.Search + ":" + quoteQueryValue(value, false),
+		residual: eq,
+		plain:    eq,
+	}, true
+}
+
+// indexCanSee reports whether the analyzer would leave this value anything for
+// the index to match.
+//
+// It tests every token, not the whole value, and that distinction was a defect.
+// The first version asked `f.IsStopWord(value)`, which compares the value
+// against the 33-word stop set as a single word — so a value that is not itself
+// one stopword but whose every *token* is one sailed straight past the guard
+// into an index clause that could never match, and the AND with the equality
+// inherited the emptiness. Measured on a probe table indexed over (msg, kv),
+// one row per value:
+//
+//	value            equality   index   emitted, before   after
+//	"the"                   1       0                 1       1   caught either way
+//	"to be"                 1       0                 0       1   the defect
+//	"a an"                  1       0                 0       1   the defect
+//	"the end"               1       1                 1       1   `end` survives
+//	"RemoteStopped"         1       1                 1       1
+//
+// `verb:"to be"` returned zero rows for a row that exists — the same silent
+// empty the guard was written to prevent, one token wider.
+//
+// A value with no token at all is the same case with nothing surviving, so the
+// two conditions collapse into one: if nothing survives the analyzer, do not
+// reach for the index. Tokenisation here is deliberately crude — runs of
+// alphanumerics — because the only decision it makes is whether to *add* an
+// index clause beside an equality that already answers correctly alone. Being
+// conservative costs a scan; being wrong returns nothing.
+func indexCanSee(f Field, v string) bool {
+	surviving := 0
+	for _, tok := range tokenize(v) {
+		if !f.IsStopWord(tok) {
+			surviving++
+		}
+	}
+	return surviving > 0
+}
+
+// tokenize splits a value into runs of alphanumerics, which is close enough to
+// what the `english` tokenizer keeps for the one decision it informs.
+func tokenize(v string) []string {
+	var out []string
+	start := -1
+	for i, r := range v {
+		alnum := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')
+		switch {
+		case alnum && start < 0:
+			start = i
+		case !alnum && start >= 0:
+			out = append(out, v[start:i])
+			start = -1
+		}
+	}
+	if start >= 0 {
+		out = append(out, v[start:])
+	}
+	return out
 }
 
 // like renders a wildcard value as a LIKE predicate.
@@ -1212,13 +1466,16 @@ func (c *compiler) like(f Field, value string) string {
 // string: an empty `level` is not a level. On a VARIANT key it is the opposite,
 // and the difference is large. The `[k=v]` extractor writes an empty value
 // whenever a log line says `key=` with nothing after it, so `<> ”` throws away
-// exactly the rows that prove the key is there. Measured, frozen window:
+// exactly the rows that prove the key is there. Re-measured on
+// logs.k8s_logs_v2 (967,912 rows, ts < 2026-08-19 22:19:00), because the
+// store_id line below used to read 1,376 — a number that belongs to a different
+// quantity and a smaller window:
 //
 //	kv['rest'] IS NOT NULL              433,901
 //	kv['rest']::VARCHAR IS NOT NULL     433,901
 //	kv['rest']::VARCHAR <> ''           333,266   <- 100,635 rows denied
-//	kv['store_id'] IS NOT NULL            1,376   <- control, no empty values
-//	kv['store_id']::VARCHAR <> ''         1,376      both readings agree
+//	kv['store_id'] IS NOT NULL           40,516   <- control, no empty values
+//	kv['store_id']::VARCHAR <> ''        40,516      both readings agree
 //
 // The cast is innocent on this table — the two IS NOT NULL forms agree to the
 // row, because no bag value here is a JSON null — but it is dropped anyway,
@@ -1312,10 +1569,12 @@ func (c *compiler) betweenNode(b *parser.Between) (fragment, error) {
 func (c *compiler) rangeField(name string) (Field, error) {
 	f, known := c.schema.Lookup(name)
 	if f.Column == "" {
-		return Field{}, fmt.Errorf("unknown field %q and no VARIANT column configured", name)
+		return Field{}, fmt.Errorf(
+			"unknown field %q and no VARIANT column configured: this schema declares no "+
+				"attribute bag, so a name it does not list cannot be read from anywhere", name)
 	}
 	if !known {
-		c.warn(variantKeyWarning, name, c.schema.Variant)
+		c.warn(variantWarning(f), name, c.bagOf(name))
 	}
 	if f.Kind == Text {
 		return Field{}, fmt.Errorf("field %q is full-text indexed; ranges are not meaningful on it", name)
@@ -1345,7 +1604,7 @@ func (c *compiler) bounds(f Field, name string, vals ...string) (col string, lit
 				}
 			}
 		}
-		return f.Column, vals, nil
+		return c.numericColumn(f, name), vals, nil
 
 	case Timestamp:
 		// The one place in this compiler where a loud error is the right
@@ -1369,10 +1628,35 @@ func (c *compiler) bounds(f Field, name string, vals ...string) (col string, lit
 		return f.Column, quoteAll(vals), nil
 
 	default:
-		// A VARIANT value arrives as VARCHAR, so a numeric comparison needs the
-		// second cast; a string one compares as it stands.
+		// A string-valued expression compared against a number has to be
+		// converted, and the conversion has to be TRY_CAST rather than a cast.
+		// A cast does not merely mis-sort: it fails the whole statement on the
+		// first value that is not a number, and one such value is enough.
+		// Measured over logs.k8s_logs_v2 (967,912 rows, ts < 2026-08-19
+		// 22:19:00), against a truth of 39,140 rows:
+		//
+		//	kv['store_id']::VARCHAR::DOUBLE > 100        [1006] invalid float
+		//	                                              literal 'Some(25)'
+		//	TRY_CAST(kv['store_id']::VARCHAR AS DOUBLE)      39,140
+		//
+		// 1,243 of that key's 40,516 rows are `Some(25)`-style debug
+		// renderings, which is enough to lose the other 39,140. The
+		// decomposition, so the figure is checkable: 40,516 rows hold the key,
+		// 39,273 of them cast, 39,140 of those exceed 100 and 133 do not, and
+		// 40,516 − 39,273 = 1,243 do not cast at all. An earlier version of
+		// this comment said 1,376, which is 40,516 − 39,140 — the rows that
+		// fail the predicate rather than the rows that fail the cast, folding
+		// in those 133 real numbers.
+		//
+		// A plain column fails the same way — `component::DOUBLE > 5` is [1006]
+		// on the value 'other', where TRY_CAST is 0 — so the fix is not
+		// specific to bags.
+		//
+		// Nothing is traded for it: where the cast survives, the two agree
+		// exactly. `kv['term']::VARCHAR::DOUBLE > 40` and the TRY_CAST form
+		// both return 32,929.
 		if numeric {
-			return f.Column + "::DOUBLE", vals, nil
+			return c.numericColumn(f, name), vals, nil
 		}
 		return f.Column, quoteAll(vals), nil
 	}

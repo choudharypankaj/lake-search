@@ -66,7 +66,11 @@ func Search(query *sqlutil.Query, args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	r, err := databend.CompileString(text, schemaFor(col))
+	schema, err := schemaFor(col)
+	if err != nil {
+		return "", err
+	}
+	r, err := databend.CompileString(text, schema)
 	if err != nil {
 		return "", err
 	}
@@ -86,7 +90,11 @@ func SearchScore(query *sqlutil.Query, args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	r, err := databend.CompileScore(text, schemaFor(col))
+	schema, err := schemaFor(col)
+	if err != nil {
+		return "", err
+	}
+	r, err := databend.CompileScore(text, schema)
 	if err != nil {
 		return "", err
 	}
@@ -113,7 +121,11 @@ func SearchScoreExpr(query *sqlutil.Query, args []string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	r, err := databend.CompileScoreExpr(text, schemaFor(col))
+	schema, err := schemaFor(col)
+	if err != nil {
+		return "", err
+	}
+	r, err := databend.CompileScoreExpr(text, schema)
 	if err != nil {
 		return "", err
 	}
@@ -168,23 +180,51 @@ func unquote(s string) string {
 	return s
 }
 
-// schemaFor builds a schema around the named full-text column.
+// schemaFor resolves the schema the macro compiles against, and re-points its
+// default field at the column named in the macro call.
 //
-// The datasource already stores a logs schema (logsTable, logsTimeColumn,
-// logsLevelColumn, logsMessageColumn) — a fuller integration reads the field
-// map from there instead of hardcoding it, and reads Table from logsTable.
+// The schema itself is data. Load it from the datasource's own settings — a
+// JSON path or an inline document in the plugin's jsonData — and fall back to a
+// built-in preset so the macro still works before anyone configures one:
+//
+//	databend.LoadSchema(path)     // file
+//	databend.Preset("k8s-logs")   // built-in
 //
 // Table matters for one construct: excluding a full-text term with no positive
 // term beside it compiles to an anti-join, which has to name the table.
 // Leaving it wrong points that subquery at the wrong table; leaving it empty
-// makes that one shape a compile error instead.
-func schemaFor(col string) databend.Schema {
-	s := databend.K8sLogs()
-	if col != "" && col != s.Default {
-		s.Default = col
-		s.Fields[col] = databend.Field{Column: col, Kind: databend.Text}
+// makes that one shape a compile error instead. Take it from logsTable.
+//
+// Note what this deliberately does NOT do: it does not invent a Field for an
+// unrecognised column. A hand-built `Field{Column: col, Kind: Text}` compiles
+// and is wrong in three ways at once — it claims an inverted index that may not
+// exist ([1065] at runtime), it drops the NGRAM flag so every wildcard warns
+// about a scan that is actually indexed, and it drops the stopword set so 33
+// ordinary words are sent to an index that deletes them and returns nothing. A
+// column the schema does not describe is a configuration error, and saying so
+// is better than guessing.
+func schemaFor(col string) (databend.Schema, error) {
+	s, notes, err := datasourceSchema() // LoadSchema or Preset, per settings
+	if err != nil {
+		return databend.Schema{}, err
 	}
-	return s
+	for _, n := range notes {
+		backend.Logger.Warn("log schema", "note", n)
+	}
+	if col == "" || col == s.Default {
+		return s, nil
+	}
+	f, ok := s.Fields[strings.ToLower(col)]
+	if !ok {
+		return databend.Schema{}, fmt.Errorf(
+			"$__search: column %q is not in the configured log schema", col)
+	}
+	if f.Kind != databend.Text {
+		return databend.Schema{}, fmt.Errorf(
+			"$__search: column %q is not full-text indexed in the configured log schema", col)
+	}
+	s.Default = strings.ToLower(col)
+	return s, nil
 }
 ```
 
@@ -446,10 +486,53 @@ Every statement prints PASS or FAIL. The cases that matter most are the ones
 that used to fail silently: empty search, `snapshoot~1`, `snapsh*`, and
 negation.
 
+### And since that build, once more
+
+Two changes affect the emitted SQL. Both were measured on `logs.k8s_logs_v2`, a
+frozen 967,912-row copy of the table (`ts < '2026-08-19 22:19:00'`), so before
+and after are the same rows.
+
+| Query | Before | After |
+| --- | --- | --- |
+| `store_id:>100` | `kv['store_id']::VARCHAR::DOUBLE > 100` — `[1006] invalid float literal ... to_float64('Some(25)')`, no rows at all, because 1,243 of that key's 40,516 rows are debug renderings rather than numbers (39,273 cast; the 1,376 this table used to say was 40,516 − 39,140, which counts predicate failures rather than cast failures) | `TRY_CAST(kv['store_id']::VARCHAR AS DOUBLE) > 100`, **39,140**, plus a warning |
+| `component:>5` | `component::DOUBLE > 5` — `[1006] ... to_float64('other')`, same failure on a plain column | **0**, which is the truth |
+| `term:>40` | 32,929 — the cast survives here | **32,929**, unchanged |
+| `err:RemoteStopped`, bag in the index group | `lower(kv['err']::VARCHAR) = lower('RemoteStopped')`, 507 rows by full scan | `query('kv.err:RemoteStopped') AND` the same equality, **507** by index |
+| `request:command`, same | 0 | **0** — the index clause alone is 501, which is why the equality stays |
+| bare `RemoteStopped`, derived column | 0 | **605** |
+
+### The one advisory that matters most is the one this channel cannot deliver
+
+TRY_CAST answers where a cast errored, and the price is that a value which is not
+a number becomes NULL and its row leaves the comparison with nothing said. On the
+live table that is 30,559 rows across nine bag keys — and all 1,943 non-numeric
+values of `duration`, every one a Go duration like `47.823614ms`, so
+`duration:>100` returns **0 of the 1,945 rows that have the key**.
+
+Every numeric conversion therefore emits a warning that names the field, says the
+rows are excluded rather than counted, and hands over the predicate that counts
+them. **That warning does not reach a Grafana user today.** The frame-notice
+channel described above is not in the deployed plugin, so it arrives only in the
+SQL comment the query inspector shows — which means a bound on a bag key is, for
+now, a query to check by hand.
+
+This is the strongest argument in this document for landing `searchNotices`. Every
+other warning here trades speed for correctness and is survivable unread; this one
+is the sole notice a user gets that their answer is missing rows.
+
+The `-schema` / `-preset` plumbing is the other half: the schema stops being a Go
+function and becomes a file, which is what makes `schemaFor` above able to read
+one from the datasource's settings rather than hardcoding a table.
+
 ## Upstreaming
 
 This is additive — a new file plus two map entries — and touches no existing
 behaviour, which makes it a plausible upstream contribution rather than a
-permanent fork. The one design question for upstream is whether the field map
+permanent fork. The design question it used to leave open — whether the field map
 should come from the datasource's existing logs-schema settings instead of a
-built-in default, which is the natural follow-up once the macro proves itself.
+built-in default — is now answered on this side: a schema is a JSON document,
+`databend.LoadSchema` reads one, and the presets are the same document held as a
+constant. What remains for upstream is deciding *where* the plugin stores it
+(a path in jsonData, an inline document, or generated from the existing
+logsTable/logsTimeColumn/logsLevelColumn settings), which is a settings-UI
+question rather than a compiler one.

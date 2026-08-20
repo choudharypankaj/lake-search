@@ -30,9 +30,9 @@ through, so the habits people already have either work or fail loudly.
 - 🔁 **Rewrites what the engine gets wrong** — `a OR -b` has its negative clause silently dropped here, so De Morgan folds it into the one clause shape that evaluates correctly, still inside a single `query()`
 - 🧮 **Excludes with an anti-join, not a bare `NOT`** — `NOT (query(x))` returns **zero** rows rather than every row when `x` matches nothing, so `-pdctl` used to blank the screen
 - 📦 **Zero dependencies** — standard library only, so it vendors into a Grafana datasource plugin without dragging anything along
-- 🔌 **Schema-driven** — describe your table once; unknown fields route into a `VARIANT` column, which is what makes open-ended log schemas searchable
+- 🔌 **Schema is data, not code** — describe your table in a JSON file (`-schema`) or pick a built-in (`-preset`); unknown fields route into a `VARIANT` bag, which is what makes open-ended log schemas searchable, and a schema that cannot support something says so when it loads rather than when a panel renders
 - 📊 **A Grafana macro** — `$__search(msg, '$q')` expands in the datasource backend, retiring the hidden predicate-generating dashboard variable
-- ✅ **Conformance by row count, not by exit code** — 47 cases asserting *relationships between counts*, because a wrong query here is indistinguishable from an empty result
+- ✅ **Conformance by row count, not by exit code** — 98 cases across two fixtures asserting *relationships between counts*, because a wrong query here is indistinguishable from an empty result
 - 🧪 **Verified live** — every engine claim below was measured on a running warehouse, not read off a doc page
 
 <img alt="Lucene-style search text compiled to a Databend SQL predicate" src="docs/img/pipeline.svg">
@@ -64,7 +64,9 @@ Or as a library:
 ```go
 import "github.com/choudharypankaj/lake-search/databend"
 
-r, err := databend.CompileString(userInput, databend.K8sLogs())
+schema, notes, err := databend.LoadSchema("my-logs.json") // or databend.Preset("k8s-logs")
+// notes  -> "no severity field: a log view over this schema cannot colour …"
+r, err := databend.CompileString(userInput, schema)
 // r.SQL       -> predicate, safe to splice into WHERE
 // r.Warnings  -> "this will be a full scan", "fuzziness ignored", …
 // r.UsesMatch -> whether score() is legal alongside it
@@ -89,6 +91,9 @@ returns nothing:
 | `http://a.com` | the colon reads as a field selector; **0 rows** | "that URL isn't in the logs" |
 | `-absent_term` | the search function prunes the scan; **0 rows** | "nothing survives the exclusion" |
 | *(empty box)* | `match(col,'')` matches nothing; **0 rows** | "there are no logs" |
+| a word the collector parsed out of the message | `err=RemoteStopped` is moved into the `kv` bag, so `RemoteStopped` is not in `msg` any more; **0 rows** against 605 for the same word in the reconstructed line | "that error never happened" |
+| `latency_ms:>30` on a bag key | one non-numeric value anywhere in that key fails the **whole statement**: `[1006] invalid float literal ... to_float64('Some(25)')`, where the truth is 39,140 rows | "the query is broken" |
+| `err:RemoteStopped` through the index alone | `query()` is tokenised and stemmed, so it matches a value merely *containing* a token that stems to the term: `kv.request:command` is **501 rows** whose value is `batch_commands`, where the equality is 0 | "501 requests were `command`" |
 
 Every row above is rewritten into SQL that answers the question that was asked, with one
 exception, and the exception is marked: `"peer stat*"` is **explained rather than rewritten**.
@@ -264,7 +269,17 @@ Three cases exist to catch the *engine* rather than the compiler:
   literal, which it does — `'2026-08-18T22'` is read as 22:00:00 with no diagnostic, so the
   assertion is a strict inequality against a bound an hour earlier rather than an upper bound.
 
-All 47 cases were run against a live warehouse (Databend v1.2.933-nightly, ~603k rows) and pass.
+There are two fixtures, because a suite has to know the schema it was written against.
+[`testdata/conformance.json`](testdata/conformance.json) names `"preset": "k8s-logs"` and its 86
+cases run against the live table; many of them pin a bare term against an explicit `msg:` baseline,
+so under a schema whose default field is a different column the two sides measure different columns
+and the assertion stops meaning anything.
+[`testdata/conformance-line.json`](testdata/conformance-line.json) is the derived-surface suite, 12
+cases over a frozen copy carrying the STORED column and the widened index group.
+
+All 86 cases in the first suite were re-run against the live warehouse (Databend v0.34.0, 975,927
+rows) and pass, and all 12 in the second against the 967,912-row frozen copy. The earlier figures
+below were measured on the same table at ~603k rows.
 Every partition identity holds to the row — 19,962 + 5,717 = 25,679 inside one `query()`,
 20,309 + 5,370 = 25,679 for the De Morgan fold, 594,705 + 8,277 = 602,982 for a negated bag key,
 504,803 + 98,179 = 602,982 for a full-text exclusion, and 305,406 + 297,576 = 602,982 for a
@@ -351,32 +366,185 @@ inconsistently between words the stemmer alters and words it leaves alone.
 
 ## Schema
 
-`databend.K8sLogs()` describes a nine-column log table with an inverted index on `msg` and a VARIANT
-column `kv` for arbitrary parsed key/value pairs. Define your own for any other table:
+A schema is **data**. It names the table, its columns, their kinds and its indexes, so pointing
+lake-search at your own log table is a file rather than a patch:
 
-```go
-s := databend.Schema{
-    Default: "body",
-    Fields: map[string]databend.Field{
-        "body":    {Column: "body", Kind: databend.Text, Ngram: true},
-        "service": {Column: "service_name", Kind: databend.String},
-        "latency": {Column: "duration_ms", Kind: databend.Number},
-    },
-    Variant:         "attributes",
-    CaseInsensitive: true,
+```
+lake-search sql -schema my-logs.json 'level:error latency_ms:>250 timeout'
+lake-search sql -preset k8s-logs-line '...'      # a built-in
+export LAKE_SEARCH_SCHEMA=my-logs.json           # or set it once
+lake-search schema -schema my-logs.json          # validate and describe it
+```
+
+[`testdata/schema-app-logs.json`](testdata/schema-app-logs.json) is a complete worked example over a
+table with nothing in common with the built-in one — a different name, expressions rather than column
+names for the time and severity roles, two attribute bags one of which is prefixed, and typed bag
+keys. The shape:
+
+```json
+{
+  "table": "app.request_log",
+  "default": "line",
+  "time": "ts", "severity": "sev",
+  "display": ["ts", "sev", "service", "route", "status", "line"],
+  "indexes": [
+    {"name": "idx_text", "kind": "inverted", "columns": ["line", "message", "attrs"],
+     "tokenizer": "english", "filters": ["english_stop", "english_stemmer"]},
+    {"name": "idx_text_ng", "kind": "ngram", "columns": ["line", "message"]}
+  ],
+  "bags": [
+    {"column": "resource_attrs", "prefix": "resource"},
+    {"column": "attrs", "keys": {"latency_ms": "number"}}
+  ],
+  "fields": [
+    {"name": "line", "kind": "text", "aliases": ["body"]},
+    {"name": "message", "kind": "text", "aliases": ["msg"]},
+    {"name": "ts", "column": "from_unixtime(ts_micros / 1000000)", "kind": "timestamp"},
+    {"name": "sev", "column": "upper(severity_text)", "kind": "string", "aliases": ["level"]},
+    {"name": "status", "kind": "number"}
+  ]
 }
 ```
 
-Fields not in the map are routed to the VARIANT column, which is what makes an open-ended log schema
+Five things about that file are load-bearing rather than decorative.
+
+**Indexes are declared, and the per-field flags are derived from them.** Nothing restates "this
+column has an NGRAM index" or "this column's index deletes stopwords" — those are read off the index
+declaration, which is what you can copy straight out of `SHOW CREATE TABLE`. That removes the
+failure the old Go-literal shape invited: claiming `english_stop` on a column whose index has no such
+filter routes 33 ordinary words onto needless full scans, and claiming it is absent when it is
+present makes those 33 searches return zero rows silently.
+
+**All the searchable surfaces must sit in one index group, and that is checked when the file loads.**
+A single `query()` call reaches only the columns of one index. Measured, a table carrying separate
+`idx_line(line)` and `idx_line2(line2)` answers each column alone and fails
+`[1065] columns line2, line don't have inverted index` for a query naming both — so a schema spread
+across two groups describes a table where ordinary queries cannot run, and the right time to say so
+is at load.
+
+**A field may be an expression, not just a column name.** `from_unixtime(ts_micros / 1000000)` is a
+perfectly good time role. Expressions are aliased to the typed name in a select list, so callers get
+something they can address.
+
+**Roles replace hardcoded column names.** `time`, `severity` and `display` are how the CLI and the
+dashboard generator build a statement without knowing this deployment's spelling; `SELECT ts, level,
+component, pod, msg` used to be a literal in both, and the dashboard used to write eleven panels'
+worth of column names into its SQL with no check that the table had them — pointing it at another
+table emitted 129 references to columns that did not exist. It now refuses the panels a schema has
+not earned and says which role was missing.
+
+**Optional roles are optional, and their absence is announced.** A table with no attribute bag and no
+severity column is a real shape, not a broken one — but a bagless schema turns `store_id:7` into a
+compile error and a severity-less one leaves a log panel unable to colour anything, and neither fact
+is visible at query time. Loading prints them:
+
+```
+schema my-logs.json: no attribute bag: a field name that is not declared here is a compile error
+  rather than a bag lookup, so `store_id:7` will be refused instead of read from a VARIANT
+schema my-logs.json: no severity field: a log view over this schema cannot colour or count by level
+```
+
+### The attribute bag
+
+Fields not declared in the schema are read from a bag, which is what makes an open-ended log schema
 searchable: the unified TiDB/TiKV/PD/TiCDC log format carries arbitrary `[k=v]` pairs whose names
-differ between components, so no fixed column list can cover them.
+differ between components, so no fixed column list can cover them. A bag with a `prefix` is addressed
+explicitly (`resource.pod`); bags without one are catch-alls, tried in declaration order.
+
+**A bag in the index group is searched through the index.** An inverted index covers a VARIANT column
+by JSON path, so `err:RemoteStopped` compiles to `query('kv.err:RemoteStopped')` — index-backed, with
+no per-key DDL and no per-key declaration, including keys that first appear after the index was
+built. It keeps the equality beside it, because the index is *wider* than the equality it
+accelerates: `query('kv.request:command')` returns 501 rows whose value is `batch_commands`, where
+the equality returns 0. A value the index deletes cannot go through it at all — a row with
+`kv = {"verb":"the"}` is found by the equality and not by `query('kv.verb:the')` — so a stopword
+value skips the index, and so does a key with a space in it, which the query language cannot spell.
+
+**Bag key types are resolved at emission, and declaring one is an override.** This engine does not
+need static per-key types the way a fixed-type map does: a VARIANT is self-describing per value and
+the index covers it by path. A numeric bound converts with `TRY_CAST`, and that choice is
+load-bearing rather than stylistic — a plain cast does not mis-sort, it *kills the statement* on the
+first value that is not a number:
+
+| | rows |
+| --- | --- |
+| `kv['store_id']::VARCHAR::DOUBLE > 100` | `[1006] invalid float literal ... to_float64('Some(25)')` |
+| `TRY_CAST(kv['store_id']::VARCHAR AS DOUBLE) > 100` | 39,140 |
+| `component::DOUBLE > 5` (a plain column, same failure) | `[1006] ... to_float64('other')` |
+| `TRY_CAST(component AS DOUBLE) > 5` | 0 |
+
+1,243 of that key's 40,516 rows hold a `Some(25)`-style debug rendering, which is enough to lose the
+other 39,140. The decomposition, so the figure is checkable rather than quoted: 40,516 rows hold the
+key, **39,273** cast, 39,140 of those exceed 100 and 133 do not, and 40,516 − 39,273 = **1,243** do
+not cast at all. Where a cast survives, the two agree exactly — both 32,929 for `kv['term'] > 40`.
+
+**What TRY_CAST costs, stated rather than buried.** Those 1,243 rows are *silently excluded* from any
+bound on that key, and store_id is the mild case. Rows that hold the key but whose value does not
+cast, same window:
+
+| kv key | rows with key | silently dropped | |
+| --- | --- | --- | --- |
+| `store` | 16,154 | 15,784 | 97.7% |
+| `to` | 6,604 | 5,681 | 86.0% |
+| `observe_id` | 3,369 | 3,369 | 100% |
+| `vote` | 4,952 | 2,171 | 43.8% |
+| `duration` | 1,945 | 1,943 | 99.9% |
+| `store_id` | 40,516 | 1,243 | 3.1% |
+| `from` | 9,937 | 360 | 3.6% |
+| `id`, `tableID` | 5,059 / 231,986 | 5 / 3 | — |
+
+30,559 rows across nine keys, and the distribution is the problem more than the total: the keys a
+human puts a bound on are the worst ones. Every one of `duration`'s 1,945 values is a Go duration —
+`47.823614ms` — so `duration:>100`, the most natural latency query there is, returns **0 of 1,945**.
+
+So every numeric conversion emits a warning that names the field, says the rows are excluded rather
+than counted, and hands over the predicate that counts them
+(`count_if(kv['duration'] IS NOT NULL AND TRY_CAST(…) IS NULL)`). **Be aware that in Grafana that
+warning is invisible today** — the frame-notice channel is not in the deployed plugin, so warnings
+reach only the SQL comment in the query inspector (see
+[`docs/grafana-macro.md`](docs/grafana-macro.md)). That is a gap in the plugin rather than in the
+compiler, and until it closes a bound on a bag key is a query to check by hand.
+
+Comparing as text instead is the other wrong answer and it is silent: on the 33,300 rows carrying
+`kv['term']`, `term:>40` is 30,584 as text against 32,929 as a number, and `term:<9` answers **32,961
+rows where the truth is 0**, because every value from 10 to 99 is textually less than `"9"`.
+
+### The derived text surface
+
+The collector lifts `k=v` pairs out of the message, so text a reader can see in the line is not in
+`msg` any more. A field declared with a `derived` expression is a STORED computed column that puts it
+back — the message concatenated with the bag's values — carrying the same inverted index, so a bare
+word finds it:
+
+| | rows |
+| --- | --- |
+| `query('msg:RemoteStopped')` | 0 |
+| `query('line:RemoteStopped')` | 605 |
+| `query('line:RemoteStopped AND msg:rpc')` | 585 — two columns, one `query()` call |
+
+It exists **only** for the bare word. There is no all-fields search in this query language: `query()`
+with no field is an error and so is `kv.*:x`, and a compiler cannot write an explicit cross-field OR
+over keys it does not know. Field-scoped bag search does not need it.
+
+It concatenates the bag's *values*, not its `key=value` pairs, and that is a trade-off in both
+directions: values-only means a key name is reachable only as field syntax, while the pair form would
+make a bare `err` match every row that merely *has* an `err` key. Since the bag is separately
+searchable by key, the noise is not worth buying.
+
+**Making it the default field widens existing searches.** That is the intent, and it is still a
+behaviour change every saved link will notice: `query('msg:snapshot')` is 17,649 rows and
+`query('line:snapshot')` is 25,488 — 7,839 rows, +44%, that carry the term only in bag values.
+`msg:` typed explicitly still means exactly what it always did. This is also why it is a separate
+preset (`k8s-logs-line`) rather than a change to `k8s-logs`: the migration is a deployment decision,
+and pointing a schema at a column the table does not have is `[1065]` on the first query.
 
 ## Pipeline
 
-[`pipeline/`](pipeline/) holds the collector that fills the table this searches — a Vector DaemonSet
-that parses five log formats into the schema above. It lives here because the parser and the schema
+[`pipeline/`](pipeline/) holds the collector that fills the table the built-in presets describe — a
+Vector DaemonSet that parses five log formats into it. It lives here because the parser and the schema
 have to agree: `kv` is what makes an unknown field searchable, and it only holds anything because the
-transform puts it there.
+transform puts it there. The same transform is why the derived text surface exists at all — lifting
+`k=v` out of the message is what takes it out of `msg`.
 
 ## License
 

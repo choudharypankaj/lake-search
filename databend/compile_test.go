@@ -108,7 +108,14 @@ func TestCompile(t *testing.T) {
 
 		// --- VARIANT fallback for unmodelled [k=v] keys ---
 		{"variant field", "store_id:7", `lower(kv['store_id']::VARCHAR) = lower('7')`},
-		{"variant range casts", "store_id:>7", `kv['store_id']::VARCHAR::DOUBLE > 7`},
+		// TRY_CAST rather than a cast, and the difference is a query that
+		// answers versus one that dies. Over logs.k8s_logs_v2 (967,912 rows,
+		// ts < 2026-08-19 22:19:00), 1,243 of store_id's 40,516 rows hold a
+		// `Some(25)`-style debug rendering: `kv['store_id']::VARCHAR::DOUBLE >
+		// 100` is [1006] invalid float literal, where the TRY_CAST form
+		// returns the 39,140 rows that are numbers. Where the cast survives
+		// the two agree exactly — both 32,929 for kv['term'] > 40.
+		{"variant range casts", "store_id:>7", `TRY_CAST(kv['store_id']::VARCHAR AS DOUBLE) > 7`},
 
 		// --- grouping ---
 		{"parens", "(peer OR status) AND level:error",
@@ -167,7 +174,7 @@ func TestCompile(t *testing.T) {
 			`(ts > '2026-08-18' AND ts < '2026-08-19')`},
 		{"half-open range", "ts:[2026-08-18 TO *}", `ts >= '2026-08-18'`},
 		{"numeric range casts through the VARIANT", "store_id:[1 TO 100]",
-			`kv['store_id']::VARCHAR::DOUBLE BETWEEN 1 AND 100`},
+			`TRY_CAST(kv['store_id']::VARCHAR AS DOUBLE) BETWEEN 1 AND 100`},
 		// A bag key present with an empty value still exists, so an existence
 		// test on a VARIANT key asks about the key and not about the value.
 		// `<> ''` on kv['rest'] denies 100,635 rows that do have the key.
@@ -591,7 +598,10 @@ func TestAntiJoinSearchFunctionIsNotTheOuterOne(t *testing.T) {
 
 func TestErrors(t *testing.T) {
 	s := K8sLogs()
-	s.Variant = "" // close the VARIANT escape hatch
+	// Close the escape hatch. Both spellings have to go: Bags is where a
+	// resolved schema keeps its VARIANT columns, and Variant is the one-column
+	// shorthand a hand-built Schema may still use.
+	s.Bags, s.Variant = nil, ""
 
 	if _, err := CompileString("nosuchfield:x", s); err == nil {
 		t.Error("expected an error for an unknown field with no VARIANT column")

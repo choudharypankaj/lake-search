@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 
 	"github.com/choudharypankaj/lake-search/databend"
@@ -33,6 +34,8 @@ func main() {
 		os.Exit(cmdSQL(os.Args[2:]))
 	case "conform":
 		os.Exit(cmdConform(os.Args[2:]))
+	case "schema":
+		os.Exit(cmdSchema(os.Args[2:]))
 	case "-h", "--help", "help":
 		usage()
 		os.Exit(0)
@@ -53,6 +56,11 @@ func usage() {
   sql [-table T] [-limit N] [-score] <query>
                                         print a complete SELECT
   conform [-file F] [-table T]          print the row-count conformance script
+  schema                                validate the schema and describe it
+
+Every command takes -schema FILE or -preset NAME, or reads LAKE_SEARCH_SCHEMA.
+A schema is data: it names your table, its columns and their kinds, so pointing
+this at your own log table is a file rather than a patch.
 
 Warnings go to stderr, SQL to stdout, so output can be piped safely.
 `)
@@ -66,37 +74,107 @@ Warnings go to stderr, SQL to stdout, so output can be piped safely.
 // would reject it as an unknown flag. A search tool whose syntax collides with
 // its own CLI is a bad tool, so the flags are matched explicitly and everything
 // else — leading dash or not — is search text.
-func takeFlags(args []string, flags map[string]*bool) []string {
+func takeFlags(args []string, flags map[string]*bool, strs map[string]*string) []string {
 	for len(args) > 0 {
 		if args[0] == "--" {
 			return args[1:]
 		}
-		p, ok := flags[args[0]]
-		if !ok {
-			break
+		if p, ok := flags[args[0]]; ok {
+			*p = true
+			args = args[1:]
+			continue
 		}
-		*p = true
-		args = args[1:]
+		if p, ok := strs[args[0]]; ok {
+			if len(args) < 2 {
+				fmt.Fprintf(os.Stderr, "error: %s needs a value\n", args[0])
+				os.Exit(2)
+			}
+			*p = args[1]
+			args = args[2:]
+			continue
+		}
+		break
 	}
 	return args
 }
 
+// schemaFlags is the schema selector every command shares.
+//
+// The default is the shipped preset, so the tool still works with no arguments
+// against the table it was built for. Everything else is data: -schema names a
+// file, -preset names a built-in, and LAKE_SEARCH_SCHEMA is the same file for a
+// deployment that would rather not repeat the flag.
+type schemaFlags struct {
+	file   string
+	preset string
+}
+
+func (sf *schemaFlags) register(fs *flag.FlagSet) {
+	fs.StringVar(&sf.file, "schema", "", "schema definition file (JSON)")
+	fs.StringVar(&sf.preset, "preset", "", "built-in schema preset: "+
+		strings.Join(databend.PresetNames(), ", "))
+}
+
+func (sf *schemaFlags) strFlags() map[string]*string {
+	return map[string]*string{
+		"-schema": &sf.file, "--schema": &sf.file,
+		"-preset": &sf.preset, "--preset": &sf.preset,
+	}
+}
+
+// resolve loads the schema and prints the notes it earned.
+//
+// The notes are printed unconditionally, and that is the point of them. A
+// schema with no VARIANT bag turns `store_id:7` into a compile error; a schema
+// with no severity field leaves a log panel unable to colour anything. Both are
+// legal shapes and neither is visible at query time, so the loader says so once,
+// out loud, when the file is read — the alternative is a user discovering it
+// from an empty panel.
+func (sf *schemaFlags) resolve() (databend.Schema, error) {
+	file, preset := sf.file, sf.preset
+	if file == "" && preset == "" {
+		file = os.Getenv("LAKE_SEARCH_SCHEMA")
+	}
+	switch {
+	case file != "" && preset != "":
+		return databend.Schema{}, fmt.Errorf("give -schema or -preset, not both")
+	case file != "":
+		s, notes, err := databend.LoadSchema(file)
+		printNotes(file, notes)
+		return s, err
+	case preset != "":
+		s, notes, err := databend.Preset(preset)
+		printNotes("preset "+preset, notes)
+		return s, err
+	default:
+		return databend.K8sLogs(), nil
+	}
+}
+
+func printNotes(src string, notes []string) {
+	for _, n := range notes {
+		fmt.Fprintf(os.Stderr, "schema %s: %s\n", src, n)
+	}
+}
+
 func cmdCompile(args []string) int {
 	var scoreV, exprV, quietV bool
+	var sf schemaFlags
 	score, expr, quiet := &scoreV, &exprV, &quietV
 	rest := takeFlags(args, map[string]*bool{
 		"-score": score, "--score": score,
 		"-score-expr": expr, "--score-expr": expr,
 		"-quiet": quiet, "--quiet": quiet,
-	})
+	}, sf.strFlags())
 
 	q := strings.Join(rest, " ")
-	schema := databend.K8sLogs()
+	schema, err := sf.resolve()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
 
-	var (
-		r   databend.Result
-		err error
-	)
+	var r databend.Result
 	switch {
 	case *expr:
 		// The select-list half of a relevance panel. It is a separate call
@@ -121,19 +199,31 @@ func cmdCompile(args []string) int {
 
 func cmdSQL(args []string) int {
 	fs := flag.NewFlagSet("sql", flag.ExitOnError)
-	table := fs.String("table", "logs.k8s_logs", "table to query")
+	var sf schemaFlags
+	sf.register(fs)
+	table := fs.String("table", "", "table to query, overriding the schema's")
 	limit := fs.Int("limit", 100, "row limit")
 	score := fs.Bool("score", false, "select a BM25 relevance column and order by it")
 	fs.Parse(args)
 
+	schema, err := sf.resolve()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
 	// The schema carries the table too: excluding a full-text term compiles to
 	// an anti-join, which has to name the same table the SELECT reads.
-	schema := databend.K8sLogs()
-	schema.Table = *table
+	if *table != "" {
+		schema.Table = *table
+	}
+	if schema.Table == "" {
+		fmt.Fprintln(os.Stderr, "error: no table: give -table or a schema that names one")
+		return 1
+	}
 	q := strings.Join(fs.Args(), " ")
 
 	if *score {
-		return sqlScore(q, schema, *table, *limit)
+		return sqlScore(q, schema, *limit)
 	}
 
 	r, err := databend.CompileString(q, schema)
@@ -143,13 +233,34 @@ func cmdSQL(args []string) int {
 	}
 	printWarnings(r)
 
-	fmt.Printf(`SELECT ts, level, component, pod, msg
+	// The select list and the sort come from the schema's roles rather than
+	// from a literal written here. `SELECT ts, level, component, pod, msg` was
+	// what used to be printed, which made the library schema-driven and the
+	// command that emits SQL not.
+	fmt.Printf(`SELECT %s
 FROM %s
-WHERE %s
-ORDER BY ts DESC
+WHERE %s%s
 LIMIT %d;
-`, *table, r.SQL, *limit)
+`, strings.Join(schema.DisplayColumns(), ", "), schema.Table, r.SQL,
+		orderBy(schema, ""), *limit)
 	return 0
+}
+
+// orderBy renders the sort a log view wants, newest first, from the schema's
+// time role. A schema that declares no time field gets no ORDER BY rather than
+// a guess: guessing is how a panel ends up sorted by a column that is not time.
+func orderBy(schema databend.Schema, lead string) string {
+	var parts []string
+	if lead != "" {
+		parts = append(parts, lead)
+	}
+	if col := schema.TimeColumn(); col != "" {
+		parts = append(parts, col+" DESC")
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "\nORDER BY " + strings.Join(parts, ", ")
 }
 
 // sqlScore prints the relevance-panel shape, which is the only shape where the
@@ -160,7 +271,7 @@ LIMIT %d;
 // a constant instead. Selecting score() unconditionally is [1065]; discarding
 // the predicate instead, which is what this tool used to do, is an empty panel
 // with the user's filter silently thrown away.
-func sqlScore(q string, schema databend.Schema, table string, limit int) int {
+func sqlScore(q string, schema databend.Schema, limit int) int {
 	pred, err := databend.CompileScore(q, schema)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -174,12 +285,12 @@ func sqlScore(q string, schema databend.Schema, table string, limit int) int {
 	printWarnings(pred)
 	printWarnings(databend.Result{Warnings: extraWarnings(pred.Warnings, expr.Warnings)})
 
-	fmt.Printf(`SELECT %s AS relevance, ts, level, component, pod, msg
+	fmt.Printf(`SELECT %s AS relevance, %s
 FROM %s
-WHERE %s
-ORDER BY relevance DESC, ts DESC
+WHERE %s%s
 LIMIT %d;
-`, expr.SQL, table, pred.SQL, limit)
+`, expr.SQL, strings.Join(schema.DisplayColumns(), ", "), schema.Table, pred.SQL,
+		orderBy(schema, "relevance DESC"), limit)
 	return 0
 }
 
@@ -202,6 +313,14 @@ func extraWarnings(already, all []string) []string {
 // conformance mirrors testdata/conformance.json.
 type conformance struct {
 	Table string `json:"table"`
+
+	// Preset and Schema name the schema the fixture's queries are written
+	// against. A suite that asserts on a derived column is meaningless under a
+	// schema that does not declare one, so the fixture says which it needs
+	// instead of inheriting whatever the CLI defaults to.
+	Preset string `json:"preset,omitempty"`
+	Schema string `json:"schema,omitempty"`
+
 	Note  string `json:"note"`
 	Cases []struct {
 		Name     string `json:"name"`
@@ -223,6 +342,8 @@ type conformance struct {
 // suite keeps working as the table grows.
 func cmdConform(args []string) int {
 	fs := flag.NewFlagSet("conform", flag.ExitOnError)
+	var sf schemaFlags
+	sf.register(fs)
 	file := fs.String("file", "testdata/conformance.json", "fixture file")
 	table := fs.String("table", "", "override the table named in the fixture")
 	fs.Parse(args)
@@ -241,7 +362,17 @@ func cmdConform(args []string) int {
 		c.Table = *table
 	}
 
-	schema := databend.K8sLogs()
+	// The fixture's own schema wins unless the caller names one on the command
+	// line, so `lake-search conform -file X` always runs X against the schema
+	// X was written for.
+	if sf.file == "" && sf.preset == "" {
+		sf.file, sf.preset = c.Schema, c.Preset
+	}
+	schema, err := sf.resolve()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
 	schema.Table = c.Table
 	fmt.Printf("-- lake-search conformance suite over %s\n", c.Table)
 	fmt.Printf("-- %s\n--\n", wrapComment(c.Note))
@@ -398,6 +529,177 @@ func condition(compare string, hasBaseline, hasWitness bool) (string, error) {
 	default:
 		return "", fmt.Errorf("unknown compare %q", compare)
 	}
+}
+
+// cmdSchema validates a schema and prints what it resolved to.
+//
+// It exists so that a deployment writing its own schema file finds out what is
+// wrong from a command, at the moment it writes the file, rather than from a
+// panel that renders nothing an hour later. Everything printed here is derived:
+// which index makes a field full-text, whether a column's LIKE searches are
+// index-backed, how many words that index deletes. Those are the three facts
+// that decide whether a search returns the right rows, and none of them is
+// visible in the file itself.
+func cmdSchema(args []string) int {
+	fs := flag.NewFlagSet("schema", flag.ExitOnError)
+	var sf schemaFlags
+	sf.register(fs)
+	asJSON := fs.Bool("json", false, "emit the resolved schema as JSON instead of prose")
+	fs.Parse(args)
+
+	schema, err := sf.resolve()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+
+	if *asJSON {
+		// The machine-readable form exists so that other tools do not have to
+		// re-implement resolution. The dashboard generator is the one that
+		// needs it: it is Python, the presets are Go constants, and the
+		// alternative was a second copy of the built-in table's column list
+		// maintained by hand in the generator — which is exactly the coupling
+		// this round set out to remove.
+		//
+		// It emits the *resolved* schema, so aliases are expanded and every
+		// field carries the column expression it actually compiles to.
+		out, err := json.MarshalIndent(resolvedSchema(schema), "", "  ")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+		fmt.Println(string(out))
+		return 0
+	}
+
+	fmt.Printf("table:            %s\n", orNone(schema.Table))
+	fmt.Printf("default field:    %s\n", schema.Default)
+	fmt.Printf("time field:       %s\n", orNone(schema.Time))
+	fmt.Printf("severity field:   %s\n", orNone(schema.Severity))
+	fmt.Printf("bags:             %s\n", orNone(bagSummary(schema)))
+	fmt.Printf("time zone:        %s\n", orDefault(schema.TimeZone, "session"))
+	fmt.Printf("case-insensitive: %t\n", schema.CaseInsensitive)
+	fmt.Printf("display:          %s\n", strings.Join(schema.DisplayColumns(), ", "))
+
+	fmt.Println("\nindexes:")
+	if len(schema.Indexes) == 0 {
+		fmt.Println("  (none declared — full-text fields cannot be checked)")
+	}
+	for _, ix := range schema.Indexes {
+		fmt.Printf("  %-12s %-8s (%s)", ix.Name, ix.Kind, strings.Join(ix.Columns, ", "))
+		if ix.Tokenizer != "" {
+			fmt.Printf(" tokenizer=%s", ix.Tokenizer)
+		}
+		if len(ix.Filters) > 0 {
+			fmt.Printf(" filters=%s", strings.Join(ix.Filters, ","))
+		}
+		fmt.Println()
+	}
+
+	fmt.Println("\nfields:")
+	for _, name := range sortedNames(schema) {
+		f := schema.Fields[name]
+		fmt.Printf("  %-14s %-10s %s", name, databend.KindName(f.Kind), f.Column)
+		if f.Index != "" {
+			fmt.Printf(" [inverted %s]", f.Index)
+		}
+		if f.Ngram {
+			fmt.Print(" [ngram]")
+		}
+		if n := len(f.StopWords); n > 0 {
+			fmt.Printf(" [%d stopwords]", n)
+		}
+		fmt.Println()
+	}
+	return 0
+}
+
+// resolvedSchema is the JSON shape `schema -json` prints. It is deliberately
+// flat and role-first: a consumer wants to ask "does this table have a severity
+// column, and what is it called", not to re-run field resolution.
+type resolved struct {
+	Table    string            `json:"table"`
+	Default  string            `json:"default"`
+	Time     string            `json:"time,omitempty"`
+	Severity string            `json:"severity,omitempty"`
+	Display  []string          `json:"display"`
+	Bags     []resolvedBag     `json:"bags,omitempty"`
+	Fields   map[string]rField `json:"fields"`
+}
+
+type resolvedBag struct {
+	Column string `json:"column"`
+	Prefix string `json:"prefix,omitempty"`
+	Index  string `json:"index,omitempty"`
+}
+
+type rField struct {
+	Column string `json:"column"`
+	Kind   string `json:"kind"`
+	Index  string `json:"index,omitempty"`
+	Ngram  bool   `json:"ngram,omitempty"`
+}
+
+func resolvedSchema(s databend.Schema) resolved {
+	r := resolved{
+		Table: s.Table, Default: s.Default, Time: s.Time, Severity: s.Severity,
+		Display: s.Display, Fields: make(map[string]rField, len(s.Fields)),
+	}
+	if r.Display == nil {
+		r.Display = []string{}
+	}
+	for name, f := range s.Fields {
+		r.Fields[name] = rField{
+			Column: f.Column, Kind: databend.KindName(f.Kind),
+			Index: f.Index, Ngram: f.Ngram,
+		}
+	}
+	for _, b := range s.Bags {
+		r.Bags = append(r.Bags, resolvedBag{Column: b.Column, Prefix: b.Prefix, Index: b.Index})
+	}
+	return r
+}
+
+func sortedNames(s databend.Schema) []string {
+	names := make([]string, 0, len(s.Fields))
+	for n := range s.Fields {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// bagSummary says, per bag, the two things that decide what a bag key search
+// does: whether it is reachable through an index, and how it is addressed.
+func bagSummary(s databend.Schema) string {
+	var out []string
+	for _, b := range s.Bags {
+		d := b.Column
+		if b.Prefix != "" {
+			d += " prefix=" + b.Prefix
+		} else {
+			d += " (catch-all)"
+		}
+		if b.Index != "" {
+			d += " [inverted " + b.Index + "]"
+		} else {
+			d += " [not indexed: key search is a full scan]"
+		}
+		if n := len(b.Keys); n > 0 {
+			d += fmt.Sprintf(" %d typed key(s)", n)
+		}
+		out = append(out, d)
+	}
+	return strings.Join(out, "; ")
+}
+
+func orNone(s string) string { return orDefault(s, "(none)") }
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
 }
 
 func printWarnings(r databend.Result) {

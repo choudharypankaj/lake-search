@@ -2,13 +2,27 @@
 
 `vector-logs.yaml` is the collector half of this system: a Vector DaemonSet that
 tails every container on the node, shapes each line into the nine-column
-`logs.k8s_logs` schema that [`databend.K8sLogs()`](../databend/schema.go)
-describes, and writes it to TiDB Cloud Lake through Vector's `databend` sink.
+`logs.k8s_logs` table that the `k8s-logs` preset
+([`databend/presets.go`](../databend/presets.go)) describes, and writes it to
+TiDB Cloud Lake through Vector's `databend` sink.
 
 It lives here rather than in a separate repo because the parser and the search
 schema have to agree: `kv` is what makes an unknown field like `error=` or
 `changefeed=` searchable, and it only holds anything because the transform puts
 it there.
+
+That agreement cuts the other way too, and it is why the derived text surface in
+[`round4-live-migration.sql`](../../lake-search-handoff/round4-live-migration.sql)
+exists. Lifting `k=v` out of the message is what takes it *out of* `msg`:
+measured on a 967,912-row frozen copy, `err=RemoteStopped` is in `kv` and nowhere
+in `msg`, so a search for `RemoteStopped` returned 0 rows against a true 605. The
+transform is not wrong to move it — structured fields are what make
+`err:RemoteStopped` possible at all — but the free-text surface has to be
+reassembled somewhere, and a STORED column is where.
+
+The write path is unaffected by that column. `COPY INTO ... FILE_FORMAT =
+(type = NDJSON)` with no column list keeps working with a computed column
+present; verified against a copy of the table after the migration.
 
 ```bash
 kubectl apply -f pipeline/vector-logs.yaml

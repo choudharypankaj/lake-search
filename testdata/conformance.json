@@ -1,6 +1,7 @@
 {
   "table": "logs.k8s_logs",
-  "note": "Row-count assertions, not smoke tests. On Databend a mistranslated query returns zero rows and raises no error, so 'the SQL executed' proves nothing. Every case here states a relationship between two counts. Baselines are relative, so the suite stays valid as the table grows.",
+  "preset": "k8s-logs",
+  "note": "Row-count assertions, not smoke tests. This suite is written against the k8s-logs schema, where a bare term searches msg, and it says so rather than inheriting whatever the CLI defaults to: many cases pin a bare term against an explicit `msg:` baseline, and under a schema whose default field is a different column the two sides measure different columns and the assertion stops meaning anything. Run it under another schema with -preset and expect those cases to disagree legitimately; the derived-surface behaviours have their own fixture in conformance-line.json. On Databend a mistranslated query returns zero rows and raises no error, so 'the SQL executed' proves nothing. Every case here states a relationship between two counts. Baselines are relative, so the suite stays valid as the table grows.",
   "cases": [
     {
       "name": "empty search returns everything",
