@@ -170,6 +170,9 @@ type FieldDef struct {
 	// table completely enough to write the migration that creates it, and it
 	// documents at a glance that the field is not a column the writer sets.
 	Derived string `json:"derived,omitempty"`
+
+	// Example is one real value, used only by the dashboard help text.
+	Example string `json:"example,omitempty"`
 }
 
 var kindNames = map[string]Kind{
@@ -408,7 +411,7 @@ func (d Def) Schema() (Schema, []string, error) {
 			col = fd.Name
 		}
 
-		f := Field{Column: col, Kind: kind}
+		f := Field{Column: col, Kind: kind, Example: fd.Example}
 		if kind == Text {
 			ixName, covered := byCol[col]
 			if !covered {

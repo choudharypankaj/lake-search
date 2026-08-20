@@ -318,11 +318,18 @@ panels = []
 # a syntax strip that demonstrates `component:tikv` against a table with no
 # component column teaches the reader a query that returns an error.
 example_field = PRIMARY or BODY
+# A real value if the schema names one, the placeholder if it does not. The
+# placeholder is honest but weak: `component:value` teaches the syntax, while
+# `component:tikv` also teaches what component holds, which is the part nobody
+# can guess from the field name. Inventing one here would be worse than the
+# placeholder -- a help strip whose example returns no rows reads as a broken
+# search box -- so this only ever shows a value the schema itself declared.
+example_value = (FIELDS.get(example_field, {}) or {}).get("example") or "value"
 example_sev = f"`{SEVERITY}:ERROR` \u00b7 " if SEVERITY else ""
 panels.append({
     "id": 10, "type": "text", "gridPos": {"x": 0, "y": 0, "w": 24, "h": 2},
     "options": {"mode": "markdown", "content": (
-        f"`snapshot` \u00b7 `\"peer status\"` (phrase, order matters) \u00b7 `{example_field}:value` \u00b7 "
+        f"`snapshot` \u00b7 `\"peer status\"` (phrase, order matters) \u00b7 `{example_field}:{example_value}` \u00b7 "
         f"{example_sev}`-TiFlash` (exclude) \u00b7 `a OR b` \u00b7 `(a OR b) c` \u00b7 "
         f"`snapshoot~1` (fuzzy) \u00b7 `snapsh*` (wildcard) \u00b7 `{example_field}:*` (exists)\n\n"
         "Empty box browses everything. Stemming is on — `truncate` finds *Truncating*."
@@ -609,14 +616,24 @@ if EXCLUDE:
     EC = col(EXCLUDE)
     chain = (f"WHERE {col(PRIMARY)} IN (${{{PRIMARY}:sqlstring}}) " if PRIMARY else "")
     templating.append(
-        {"type": "query", "name": f"exclude_{EXCLUDE}", "label": f"Exclude {EXCLUDE}",
+        {"type": "query", "name": f"exclude_{EXCLUDE}",
+         # The label reads as prose in the variable bar, so it uses the same
+         # human name the include list does rather than the raw field name.
+         "label": f"Exclude {LABELS.get(EXCLUDE, EXCLUDE).lower()}",
          "datasource": DS,
-         "description": f"Drop these. Leave (none) selected to exclude nothing.",
+         # The list IS chained on the primary facet below, so say so: a list
+         # that silently narrows is a list whose missing entries look like
+         # missing data.
+         "description": ("Drop these. Leave (none) selected to exclude nothing."
+                         + (f" Narrows with {LABELS.get(PRIMARY, PRIMARY)}." if chain else "")),
+         # `ev` for the same reason the facets alias theirs: EXCLUDE may be an
+         # expression, and the outer select would then ask the derived table for
+         # a column it does not have.
          "query": (f"SELECT __value, __text FROM ("
                    f"SELECT '(none)' AS __value, '(none)' AS __text, 1 AS grp, NULL AS max_ts "
                    f"UNION ALL "
-                   f"SELECT {EC}, {EC} || {STALE}, 0 AS grp, max_ts FROM ("
-                   f"SELECT {EC}, max({TS}) AS max_ts FROM {TABLE} {chain}GROUP BY {EC}) t"
+                   f"SELECT ev, ev || {STALE}, 0 AS grp, max_ts FROM ("
+                   f"SELECT {EC} AS ev, max({TS}) AS max_ts FROM {TABLE} {chain}GROUP BY {EC}) t"
                    f") u ORDER BY grp DESC, max_ts DESC"),
          "multi": True, "includeAll": False, "refresh": 2, "sort": 0,
          "current": {"text": ["(none)"], "value": ["(none)"]}, "options": []})

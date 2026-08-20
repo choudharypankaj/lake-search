@@ -53,7 +53,7 @@ const k8sLogsDef = `{
   "fields": [
     {"name": "msg", "kind": "text", "aliases": ["message"]},
     {"name": "ts", "kind": "timestamp", "aliases": ["timestamp"]},
-    {"name": "component", "kind": "string"},
+    {"name": "component", "kind": "string", "example": "tikv"},
     {"name": "level", "kind": "string"},
     {"name": "namespace", "kind": "string"},
     {"name": "pod", "kind": "string"},
@@ -157,7 +157,7 @@ const k8sLogsLineDef = `{
      "derived": "concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv,'container','service','format'),'$.*')::VARCHAR,'[]'))"},
     {"name": "msg", "kind": "text", "aliases": ["message"]},
     {"name": "ts", "kind": "timestamp", "aliases": ["timestamp"]},
-    {"name": "component", "kind": "string"},
+    {"name": "component", "kind": "string", "example": "tikv"},
     {"name": "level", "kind": "string"},
     {"name": "namespace", "kind": "string"},
     {"name": "pod", "kind": "string"},

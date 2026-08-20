@@ -638,6 +638,10 @@ type rField struct {
 	Kind   string `json:"kind"`
 	Index  string `json:"index,omitempty"`
 	Ngram  bool   `json:"ngram,omitempty"`
+
+	// Carried through so the dashboard generator can put a real value in the
+	// help text instead of the word "value".
+	Example string `json:"example,omitempty"`
 }
 
 func resolvedSchema(s databend.Schema) resolved {
@@ -651,7 +655,7 @@ func resolvedSchema(s databend.Schema) resolved {
 	for name, f := range s.Fields {
 		r.Fields[name] = rField{
 			Column: f.Column, Kind: databend.KindName(f.Kind),
-			Index: f.Index, Ngram: f.Ngram,
+			Index: f.Index, Ngram: f.Ngram, Example: f.Example,
 		}
 	}
 	for _, b := range s.Bags {

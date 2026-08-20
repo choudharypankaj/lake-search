@@ -123,6 +123,16 @@ type Field struct {
 	// the right default: a filter declared here that the index does not
 	// actually have would route ordinary words onto a needless full scan.
 	StopWords map[string]bool
+
+	// Example is one real value of this field, for the help text a reader
+	// scans before typing anything. It exists because the generic form is
+	// worse than the specific one: `component:value` tells someone the
+	// syntax, `component:tikv` tells them the syntax AND that component is
+	// the thing that says tikv, which is the half they cannot guess. Empty
+	// means the help text falls back to the placeholder, which is the right
+	// default -- a made-up value in a real deployment's help strip is a
+	// search that returns nothing.
+	Example string
 }
 
 // IsStopWord reports whether the whole of v is one word this field's index
