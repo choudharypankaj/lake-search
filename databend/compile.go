@@ -84,20 +84,29 @@ func Compile(n parser.Node, s Schema) (Result, error) {
 	}
 	// Counted off the finished statement rather than tallied on the way down.
 	// The tally had two increment sites and any new leaf emitting a search
-	// function was a third one waiting to be forgotten; the string is the
-	// truth, and a search function that ended up inside a subquery correctly
-	// does not count against the outer scan.
-	nSearch := outerSearchFuncs(sql)
-	if nSearch > 1 {
+	// function was a third one waiting to be forgotten; the string is the truth.
+	//
+	// Counted per SCAN, which is the limit the engine actually enforces. The
+	// per-statement count that replaced the tally had a blind spot of its own: a
+	// search function inside a subquery correctly does not count against the
+	// outer scan, but two of them inside the SAME subquery still exceed the
+	// limit, and that failed at runtime with [1065] rather than here. This is
+	// the backstop for that — separateScans is what keeps the shapes legal, and
+	// if it ever misses one the refusal happens at compile time.
+	if n := maxScanSearchFuncs(sql); n > 1 {
 		return Result{}, fmt.Errorf(
-			"this query needs %d BARE search functions but Databend allows one per table "+
-				"(a search function inside a row-key subquery does not count, which is how the "+
-				"disjunction shapes compile): "+
+			"this query needs %d search functions in one scan but Databend allows one per table "+
+				"(a search function inside a row-key subquery runs in its own scan, which is how "+
+				"the disjunction and two-term shapes compile): "+
 				"put the full-text terms in a single group so they compile to one query() call "+
 				"(for example `(a OR b) level:error` rather than `(a level:error) OR (b level:warn)`)",
-			nSearch)
+			n)
 	}
-	return Result{SQL: sql, Warnings: c.warnings, UsesMatch: nSearch > 0}, nil
+	// UsesMatch is about the OUTER scan on purpose: score() is legal only beside
+	// a bare search function in the same statement, and it cannot see into a
+	// subquery — measured, `SELECT score() … WHERE msg NOT IN (SELECT … query(…))`
+	// fails [1065] too.
+	return Result{SQL: sql, Warnings: c.warnings, UsesMatch: outerSearchFuncs(sql) > 0}, nil
 }
 
 // CompileString parses and compiles in one step.
@@ -481,6 +490,17 @@ func literalEnd(b []byte, open int) (int, bool) {
 // stripSubqueryBodies removes `(SELECT … )` spans, matching parentheses so a
 // nested subquery goes with its parent.
 func stripSubqueryBodies(sql string) string {
+	outer, _ := splitScans(sql)
+	return outer
+}
+
+// splitScans separates one SQL string into the scans it describes: the text left
+// over when every `(SELECT … )` span is removed, and the body of each of those
+// spans. A nested subquery comes back inside its parent's body, so a caller that
+// wants every scan recurses — see maxScanSearchFuncs.
+//
+// Literals must already be masked; see maskLiterals.
+func splitScans(sql string) (outer string, bodies []string) {
 	var b strings.Builder
 	for i := 0; i < len(sql); {
 		if sql[i] == '(' && startsSelect(sql[i+1:]) {
@@ -498,26 +518,76 @@ func stripSubqueryBodies(sql string) string {
 				}
 			}
 			if j >= len(sql) {
-				// Unbalanced `(SELECT` with no closing paren: keep the rest
-				// rather than dropping it, so the count comes out too HIGH
-				// rather than too low. Over-counting costs a needless subquery
-				// or a refusal; under-counting loses rows in silence.
+				// Unbalanced `(SELECT` with no closing paren: keep the rest as
+				// outer text rather than swallowing it, so a search function
+				// after it is still counted. The count then comes out too HIGH
+				// rather than too low; over-counting costs a needless subquery
+				// or a refusal, under-counting loses rows in silence.
 				//
 				// That direction only actually holds because literals are
 				// masked before this runs. It did not hold before: a literal
 				// containing `(SELECT` and an unmatched `(` made this run past
 				// the closing quote and swallow the real query() after it,
 				// which is an UNDER-count and exactly the losing direction.
+				//
+				// Writing the tail out is the fix for a second, smaller version
+				// of the same mistake: this loop used to `break` here, which
+				// dropped the tail and under-counted exactly as the comment
+				// above says it must not.
+				b.WriteString(sql[i:])
 				break
 			}
+			bodies = append(bodies, sql[i+1:j])
 			i = j + 1
 			continue
 		}
 		b.WriteByte(sql[i])
 		i++
 	}
-	return b.String()
+	return b.String(), bodies
 }
+
+// maxScanSearchFuncs returns the largest number of search functions this SQL
+// puts in any SINGLE scan: the outer statement, or the body of any subquery, at
+// any depth.
+//
+// The engine's limit is per scan, not per statement — `[1065] duplicate search
+// function for table N` counts what one scan holds — and that is the whole
+// reason a subquery is a fix rather than a dodge. Checking only the OUTER scan
+// therefore made every subquery a blind spot: `RemoteStopped RemoteStopped~1`
+// merges into no single query() call, because the fuzzy leaf is born as
+// `match(…)` and never joins the shared text expression, so the conjunction
+// holds two search functions. ANDed on its own it was refused at compile time
+// with a clear message; wrapped in a disjunction it was hoisted into one
+// subquery body, the outer count came out 0, and the statement failed at RUNTIME
+// with [1065] against a true 61,432.
+//
+// Measured, the limit really is per scan: the same two calls answer 725 rows in
+// every one of the three ways of spreading them over two scans — query() outer
+// with match() hoisted, match() outer with query() hoisted, and both hoisted —
+// and fail [1065] only when they share one.
+func maxScanSearchFuncs(sql string) int {
+	return maxScan(maskLiterals(sql))
+}
+
+func maxScan(masked string) int {
+	outer, bodies := splitScans(masked)
+	n := countSearchCalls(outer)
+	for _, body := range bodies {
+		if m := maxScan(body); m > n {
+			n = m
+		}
+	}
+	return n
+}
+
+// searchCalls counts every search function in this SQL, wherever it sits.
+//
+// outerSearchFuncs answers where they are; this answers whether there are any.
+// A negation needs the second question: a fragment whose search function is
+// safely inside a subquery still must not be wrapped in a scalar NULL guard,
+// because COALESCE around a row-key membership test does not plan. See not().
+func searchCalls(sql string) int { return countSearchCalls(maskLiterals(sql)) }
 
 func startsSelect(s string) bool {
 	for len(s) > 0 && (s[0] == ' ' || s[0] == '\n' || s[0] == '\t') {
@@ -548,6 +618,163 @@ func countSearchCalls(sql string) int {
 
 func isIdentByte(b byte) bool {
 	return b == '_' || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9')
+}
+
+// nullableSQL reports whether this SQL expression can evaluate to NULL.
+//
+// One decision rests on it: whether a negation needs a NULL guard. `x` and `-x`
+// must partition the table, and `NOT (e)` is NULL — and therefore excluded —
+// wherever e is NULL, so a negation over a nullable expression has to say
+// "unknown means not excluded" out loud. Every column in a log table is
+// nullable, and the VARIANT path makes it bite immediately: kv['container'] =
+// 'vector' is 6,742 rows while NOT(…) is 443,148, three short of the 449,893
+// total, and the guarded form returns 443,151 and partitions exactly.
+//
+// Some expressions cannot be NULL, and guarding one of those is not merely
+// redundant — it is un-plannable. COALESCE around a row-key membership test
+// fails on this engine, measured over ts < 2026-08-20 03:30:00:
+//
+//	COALESCE(_row_id IN (SELECT _row_id FROM t WHERE lower(level)='info'), TRUE)  [1006]
+//	COALESCE(level   IN (SELECT level   FROM t WHERE lower(level)='info'), TRUE)  479,004
+//	NOT (_row_id IN (SELECT _row_id FROM t WHERE lower(level)='info'))            584,255
+//	COALESCE(NOT (lower(level)='info'), TRUE)                                     584,255
+//
+// so it is COALESCE together with a membership test on the PSEUDO-column, and
+// the row key is exactly the thing in that expression that cannot be NULL. A
+// live census of 72 realistic shapes had 12 fail this way — every
+// `NOT (text OR plain)` and every `NOT (NOT (plain text))`, whatever the terms —
+// because the negation guarded a fragment that had hoisted its search function
+// into a row-key subquery, which no fragment could contain before that hoist
+// existed.
+//
+// Derived from the string rather than carried on the fragment, for the same
+// reason outerSearch is: a flag that 47 construction sites must remember to set
+// is a whitelist. It is CONSERVATIVE — anything it does not recognise is
+// nullable — and that is the safe direction, because an unnecessary guard is
+// only harmful when it wraps a subquery, and not() takes the anti-join in that
+// case rather than the guard.
+func nullableSQL(sql, rowKey string) bool {
+	return exprNullable(maskLiterals(sql), rowKey)
+}
+
+func exprNullable(e, rowKey string) bool {
+	e = strings.TrimSpace(e)
+	for len(e) > 1 && e[0] == '(' && matchingParen(e, 0) == len(e)-1 {
+		e = strings.TrimSpace(e[1 : len(e)-1])
+	}
+	// AND and OR propagate NULL unless another operand settles the result, so a
+	// combination can be NULL exactly when one of its operands can.
+	if parts := splitTopLevelBool(e); len(parts) > 1 {
+		for _, p := range parts {
+			if exprNullable(p, rowKey) {
+				return true
+			}
+		}
+		return false
+	}
+	if rest, ok := cutKeyword(e, "NOT"); ok {
+		return exprNullable(rest, rowKey) // NOT NULL is NULL
+	}
+	// The guard itself. Every COALESCE this compiler emits ends `, TRUE)`, so
+	// its value is never NULL.
+	if strings.HasPrefix(e, "COALESCE(") && strings.HasSuffix(e, ", TRUE)") &&
+		matchingParen(e, len("COALESCE")) == len(e)-1 {
+		return false
+	}
+	// A membership test on the row key. The row key is never NULL — that is part
+	// of what Schema.RowKey declares, and it is measured: 0 NULLs over 1,063,259
+	// rows and over the 967,912-row frozen copy — and the subquery selects the
+	// same column, so the key set holds no NULL either. Neither `IN` nor
+	// `NOT IN` can come back unknown.
+	if rowKey != "" && isRowKeyMembership(e, rowKey) {
+		return false
+	}
+	return true
+}
+
+// isRowKeyMembership reports whether the whole expression is
+// `<rowKey> IN (SELECT …)` or `<rowKey> NOT IN (SELECT …)`.
+func isRowKeyMembership(e, rowKey string) bool {
+	if !strings.HasPrefix(e, rowKey) || len(e) == len(rowKey) || isIdentByte(e[len(rowKey)]) {
+		return false // absent, or a longer identifier that merely starts the same way
+	}
+	rest := strings.TrimSpace(e[len(rowKey):])
+	if r, ok := cutKeyword(rest, "NOT"); ok {
+		rest = r
+	}
+	rest2, ok := cutKeyword(rest, "IN")
+	if !ok {
+		return false
+	}
+	return len(rest2) > 0 && rest2[0] == '(' && startsSelect(rest2[1:]) &&
+		matchingParen(rest2, 0) == len(rest2)-1
+}
+
+// cutKeyword strips a leading keyword, requiring a real boundary after it so
+// `NOTHING` is not read as `NOT`.
+func cutKeyword(e, word string) (string, bool) {
+	if len(e) <= len(word) || !strings.EqualFold(e[:len(word)], word) {
+		return "", false
+	}
+	switch e[len(word)] {
+	case ' ', '\t', '\n', '(':
+		return strings.TrimSpace(e[len(word):]), true
+	}
+	return "", false
+}
+
+// splitTopLevelBool splits an expression on ` AND ` and ` OR ` outside any
+// parentheses, so operands of a subquery or of a nested group stay whole.
+//
+// Precedence is irrelevant here: nullability is "any operand can be NULL" for
+// both operators, so a flat split over a mixed chain gives the same answer as a
+// correctly nested one.
+func splitTopLevelBool(e string) []string {
+	var out []string
+	depth, start := 0, 0
+	for i := 0; i < len(e); i++ {
+		switch e[i] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+		}
+		if depth != 0 {
+			continue
+		}
+		for _, op := range []string{" AND ", " OR "} {
+			if strings.HasPrefix(e[i:], op) {
+				out = append(out, e[start:i])
+				start = i + len(op)
+				i += len(op) - 1
+				break
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return append(out, e[start:])
+}
+
+// matchingParen returns the index of the `)` that closes the `(` at i, or -1.
+func matchingParen(s string, i int) int {
+	if i >= len(s) || s[i] != '(' {
+		return -1
+	}
+	depth := 0
+	for j := i; j < len(s); j++ {
+		switch s[j] {
+		case '(':
+			depth++
+		case ')':
+			depth--
+			if depth == 0 {
+				return j
+			}
+		}
+	}
+	return -1
 }
 
 type compiler struct {
@@ -1222,20 +1449,20 @@ func (c *compiler) not(child parser.Node) (fragment, error) {
 		f.negated = !f.negated
 		return f, nil
 	}
-	// COALESCE, not a bare NOT: every column in a log table is nullable, and
-	// `NOT (col = 'x')` is NULL — and therefore excluded — wherever col is
-	// NULL, so `x` and `-x` would not add up to the table. Measured on the
-	// VARIANT path, where a missing key makes it bite immediately:
-	// kv['container']='vector' is 6,742 and NOT(...) is 443,148, three short
-	// of the 449,893 total; the COALESCE form returns 443,151 and partitions
-	// exactly. Unknown means "not excluded".
-	// A bare NOT around a search function is the round-one defect, and it
-	// reaches here whenever the negated child was a mixed conjunction that
-	// collapsed its text into sql. The optimiser prunes the scan to the blocks
-	// the index says match and then negates WITHIN them, so the rows in every
-	// other block are lost. Measured over ts < 2026-08-20 04:00:00 (1,072,856
-	// rows), where `level:ERROR AND line:RemoteStopped` is empty so the
-	// complement is the whole table:
+	// A negation has to be TOTAL: a row where the inner expression is neither
+	// true nor false belongs to the complement, or `x` and `-x` do not add up to
+	// the table. Three constructions get there, and which one is required is a
+	// property of the FRAGMENT rather than of the query somebody wrote.
+
+	// 1. A search function in the OUTER scan must become an anti-join, whatever
+	// else is true of the fragment. A bare NOT around one is the round-one
+	// defect, and it reaches here whenever the negated child was a mixed
+	// conjunction that collapsed its text into sql. The optimiser prunes the
+	// scan to the blocks the index says match and then negates WITHIN them, so
+	// the rows in every other block are lost. Measured over
+	// ts < 2026-08-20 04:00:00 (1,072,856 rows), where
+	// `level:ERROR AND line:RemoteStopped` is empty so the complement is the
+	// whole table:
 	//
 	//	COALESCE(NOT ((level=ERROR AND query('line:RemoteStopped'))), TRUE)
 	//	                                                    883,884
@@ -1248,6 +1475,44 @@ func (c *compiler) not(child parser.Node) (fragment, error) {
 	if f.outerSearch() > 0 {
 		return c.negateWithRowKey(f)
 	}
+
+	// 2. An expression that cannot be NULL is already total under a plain NOT,
+	// so it gets one. That is not a tidiness argument: for the fragments that
+	// reach here the plain NOT is the only form that PLANS, because a guard
+	// around a row-key membership test fails [1006]. See nullableSQL, which
+	// carries the measurements.
+	if !nullableSQL(f.sql, c.schema.RowKey) {
+		return fragment{sql: "NOT (" + f.sql + ")"}, nil
+	}
+
+	// 3. A nullable fragment that CONTAINS a search function — inside a
+	// subquery, where the search function itself is perfectly safe — still
+	// cannot take the guard, because the guard would wrap that subquery.
+	// `NOT (RemoteStopped OR level:ERROR)` is the shape: the disjunction hoists
+	// the text term into a row-key subquery, the result is nullable because of
+	// the `level` comparison beside it, and COALESCE over the pair fails
+	// [1006] — 12 of 72 shapes in a live census, every member of two whole
+	// families.
+	//
+	// The anti-join needs no guard at all: the subquery's WHERE keeps only the
+	// rows that match, so the complement of its key set is every other row,
+	// unknowns included. Measured, `NOT (RemoteStopped OR level:ERROR)` compiles
+	// to 659,560 against an independently computed 659,560.
+	if searchCalls(f.sql) > 0 && c.schema.RowKey != "" && c.schema.Table != "" {
+		return c.negateWithRowKey(f)
+	}
+
+	// 4. The guard. COALESCE, not a bare NOT, because every column in a log
+	// table is nullable and `NOT (col = 'x')` is NULL — and therefore excluded —
+	// wherever col is NULL. Measured on the VARIANT path, where a missing key
+	// makes it bite immediately: kv['container']='vector' is 6,742 and NOT(...)
+	// is 443,148, three short of the 449,893 total; the COALESCE form returns
+	// 443,151 and partitions exactly. Unknown means "not excluded".
+	//
+	// Nothing that reaches here holds a subquery on the row key: case 3 takes
+	// those whenever one is declared, and without a row key a membership test is
+	// keyed on a real column, which the engine plans — measured, the text-keyed
+	// spelling of the [1006] shape answers 659,560.
 	return fragment{sql: "COALESCE(NOT (" + f.sql + "), TRUE)"}, nil
 }
 
@@ -1395,9 +1660,81 @@ func (c *compiler) boolean(children []parser.Node, op string) (fragment, error) 
 		parts[textSlot] = wrapped
 	}
 
+	// One search function per scan, which is the limit the engine enforces.
+	if err := c.separateScans(parts); err != nil {
+		return fragment{}, err
+	}
+
 	// No count to accumulate: the assembled fragment's SQL carries whatever its
 	// pieces put there, and outerSearch() reads it back off the string.
 	return fragment{sql: "(" + strings.Join(parts, " "+op+" ") + ")"}, nil
+}
+
+// separateScans keeps at most one search function per scan, moving the extras
+// into subqueries of their own.
+//
+// The engine's limit is per scan rather than per statement, and a single
+// conjunction can exceed it: `RemoteStopped RemoteStopped~1` merges into no one
+// query() call, because a fuzzy leaf is born as `match(…)` and never joins the
+// shared text expression. Two bare search functions in one scan is
+// `[1065] duplicate search function for table 0`.
+//
+// The fix is the subquery the disjunction already uses. A search function inside
+// `(SELECT …)` runs in its own scan, and under a conjunction that is exactly
+// equivalent: the subquery selects the rows its own predicate matches — pruning
+// its own scan, correctly, because its search function is conjunctive there —
+// and the outer conjunction intersects with them. Measured, the pair above
+// answers 725 rows in all three ways of spreading two calls over two scans
+// (query() outer, match() outer, both hoisted) and [1065] with both bare.
+//
+// Wrapping that conjunction in a disjunction or a negation used to move it
+// wholesale into one subquery body, where nothing counted it: the outer count
+// was 0, Compile passed it, and the engine returned [1065] against a true
+// 61,432. Separating here fixes both spellings at once, because the wrapper now
+// receives a conjunction that is already legal.
+//
+// Called for AND and for OR. Under OR it never fires — every search-bearing
+// branch has already been hoisted — and running it there anyway means a future
+// OR path that leaks one is separated rather than silently emitted.
+func (c *compiler) separateScans(parts []string) error {
+	total := 0
+	for _, p := range parts {
+		total += outerSearchFuncs(p)
+	}
+	if total <= 1 {
+		return nil
+	}
+	if c.schema.RowKey == "" || c.schema.Table == "" {
+		return fmt.Errorf(
+			"this query needs %d search functions in one scan and this engine allows one, so "+
+				"they have to be split across scans, which needs a row key — this schema "+
+				"declares %s. Declare \"row_key\" (`_row_id` on this engine), or put the "+
+				"full-text terms in a single group so they compile to one query() call: `a b` "+
+				"merges, `a b~1` cannot, because a fuzzy term is a search function of its own",
+			total, c.missingForSubquery())
+	}
+	budget := 1
+	for i, p := range parts {
+		n := outerSearchFuncs(p)
+		if n == 0 {
+			continue
+		}
+		if n <= budget {
+			budget -= n
+			continue
+		}
+		sub, err := c.hoistIntoSubquery(fragment{sql: p})
+		if err != nil {
+			return err
+		}
+		parts[i] = sub
+	}
+	c.warn("this query needs %d search functions and this engine runs one per scan, so %d of "+
+		"them compile into row-key subqueries to give each its own scan. The answer is exact, "+
+		"and each subquery reads the table again: `a b` merges into a single query() call and "+
+		"costs nothing extra, while `a b~1` cannot merge because a fuzzy term is a search "+
+		"function in its own right", total, total-1)
+	return nil
 }
 
 // textBoolean combines full-text fragments inside the query() mini-language.

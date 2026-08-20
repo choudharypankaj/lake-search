@@ -26,7 +26,7 @@ through, so the habits people already have either work or fail loudly.
 
 - 🔍 **Lucene-style syntax** — `field:value`, `field:(a OR b)`, `"phrases"`, `AND`/`OR`, `-exclude`, `field:[a TO b]`, `field:>100`, `field:*`, `term~2`, `pref*`, `/regex/`, `term^2`
 - 🧨 **Kills the silent failures** — a fuzzy `term~N` and a wildcard `*` return **zero rows and no error** inside this engine's search syntax; they are rewritten, not forwarded
-- 🧠 **Knows the one-search-function rule** — boolean full-text logic is folded into a single `query()` call, because two search functions per statement is `[1065]`
+- 🧠 **Knows the one-search-function rule** — the engine allows at most one search function per *scan*, so full-text logic folds into a single `query()` call where it can and into a row-key subquery where it cannot; two in one scan is `[1065]`
 - 🔁 **Rewrites what the engine gets wrong** — `a OR -b` has its negative clause silently dropped here, so De Morgan folds it into the one clause shape that evaluates correctly, still inside a single `query()`
 - 🧮 **Excludes with an anti-join, not a bare `NOT`** — `NOT (query(x))` returns **zero** rows rather than every row when `x` matches nothing, so `-pdctl` used to blank the screen
 - 📦 **Zero dependencies** — standard library only, so it vendors into a Grafana datasource plugin without dragging anything along
@@ -151,27 +151,60 @@ and their disjunction 118,896 — the union to the row.
 | *(empty)* | `1=1` — and no search function anywhere in the output |
 | unknown field | `kv['field']::VARCHAR` via the VARIANT column; `kv.a.b` chains subscripts |
 
-## The one-search-function rule
+## The one-search-function-per-scan rule
 
 Verified on a live warehouse (Databend v0.34.0), and it shapes the whole design:
-**a statement may contain at most one BARE search function per table.** The qualifier is
-load-bearing and was measured later: the limit binds a search function sitting directly in the scan,
-and a search function wrapped in a row-key subquery escapes it entirely — `count_if(query(…))` is
-`[1065]`, while `count_if(_row_id IN (SELECT _row_id … query(…)))` returns 737 — the same as the
-predicate alone — and two such predicates coexist in one statement returning 737 and 26,408
-(`ts < '2026-08-20 04:00:00'`, 1,072,856 rows). That is why the compiler can now
-put more than one text condition in a statement, and it is the reason the
+**a search function may appear only in a `WHERE` clause, and at most one may appear in any one
+scan.** Both halves are load-bearing and both were measured.
+
+*Only in `WHERE`.* `SELECT query('line:peer') …`, `HAVING … AND query(…)` and `count_if(query(…))`
+are each `[1065] search function query can only be used in where clause` — even with a single call.
+That is why the conformance suite counts with `count(*)` over a `WHERE` and never with `count_if`
+over a search function.
+
+*One per scan, not per statement.* Two search functions in one `WHERE` are `[1065] duplicate search
+function for table 0` — the same call twice, `query()` beside `match()`, two `match()`es, under
+`AND` or under `OR`, and even on two different indexed columns:
+
+```sql
+match(msg,'a') AND match(msg,'b')                 -- [1065] duplicate search function for table 0
+match(msg,'a') AND query('msg:b')                 -- same
+query('msg:a') AND query('msg:b')                 -- same
+query('msg:peer') AND query('source_file:raft')   -- same, two different indexed columns
+```
+
+But the limit binds a **scan**, so one statement may hold as many search functions as it has scans.
+Measured over `ts < '2026-08-20 04:00:00'` (1,072,856 rows):
+
+```sql
+query('line:rpc') AND query('line:RemoteStopped')          -- [1065]
+
+query('line:rpc')                                          -- 717 rows
+  AND _row_id IN (SELECT _row_id FROM logs.k8s_logs WHERE query('line:RemoteStopped'))
+  AND _row_id IN (SELECT _row_id FROM logs.k8s_logs
+                  WHERE match(line,'RemoteStopped','fuzziness=1'))
+```
+
+— the same 717 as the search-free reference `line ILIKE '%rpc%' AND line ILIKE '%RemoteStopped%'`,
+and the same 717 with the calls spread over the two scans in either order, all three hoisted, four
+calls over four scans, or nested four subqueries deep. A row-key subquery is one such scan; so is
+each branch of a `UNION ALL`, each CTE, and each scalar subquery in a select list. That is why the
+compiler can put more than one text condition in a statement, and it is the reason the
 [row-key subquery](#why-a-schema-declares-a-row-key) works at all rather than merely being a
 workaround for block pruning.
 
-```sql
-match(msg,'a') AND match(msg,'b')   -- [1065] duplicate search function for table 0
-match(msg,'a') AND query('msg:b')   -- same
-query('msg:a') AND query('msg:b')   -- same
-```
+Two consequences worth knowing. `score()` needs a **bare** search function in its own scan: beside
+only a hoisted call it is `[1065] Score function must be used together with match or query
+function`, which is why `-score` emits `0` rather than `score()` for any query whose search function
+was hoisted or anti-joined. And a search function cannot be applied to a joined or derived table at
+all — `match(a.line,'peer')` in a self-join is `[1006] Unable to get field named …` — so a row-key
+subquery is the only way to put two of them in one answer.
 
-So boolean full-text logic cannot be built with SQL `AND`/`OR`. It has to go *inside* one `query()`
-call, and that mini-language has three undocumented behaviours that all fail silently:
+So boolean full-text logic still folds into one `query()` call wherever it *can* — `a b` merges and
+costs nothing extra — but where it cannot, the extra call is given a scan of its own rather than
+being refused, and the refusal survives only where there is nowhere to hoist to: a schema that
+declares no `row_key`. Inside that one `query()` call, the mini-language has three undocumented
+behaviours that all fail silently:
 
 | Form | Result |
 | --- | --- |
@@ -235,7 +268,7 @@ never comes here at all: it stays inside the single `query()` call, where the po
 scan and an absent excluded term costs nothing.
 
 Two consequences worth knowing. The exclusion's search function is in a *different scan*, so it
-neither counts against the one-per-table rule — `snapshoot~1 -tiflash` compiles now, and returns
+neither counts against the one-per-scan rule — `snapshoot~1 -tiflash` compiles now, and returns
 17,608 rows — nor satisfies `score()`, whose binder does not see through the subquery. And
 because the outer scan carries no search function, it sees every row including the most recent
 hour of ingest, which the inverted index has not caught up on; a fresh row that should have been
@@ -243,9 +276,16 @@ excluded is included until the index does.
 
 Structured predicates, `LIKE` and ranges are *not* search functions, so they compose freely with the
 single `query()` call. Fuzziness is the exception: it exists only as an option argument to `match()`,
-so a fuzzy term spends the statement's one search function and cannot be combined with another
-full-text term — which lake-search reports as a compile error rather than emitting SQL that dies
-with `[1065]`.
+so a fuzzy term is a search function in its own right and cannot merge into the shared `query()`
+string. Combined with another full-text term it therefore takes a scan of its own — `a b~1` compiles
+to a `query()` call beside a row-key subquery — rather than emitting SQL that dies with `[1065]`, and
+it is refused only when the schema declares no `row_key` and there is nowhere to hoist to.
+
+> **A small `LIMIT` and a row-key subquery do not mix (engine bug, Databend v0.34.0).**
+> `SELECT ts, level … WHERE _row_id IN (SELECT …) LIMIT 10` is
+> `[1006] Unable to get field named "2"`; `LIMIT 11` and above is fine, one projected column is fine
+> at any limit, and `count(*)` is always fine. `lake-search sql` defaults to `LIMIT 100`, above the
+> threshold — but `-limit 3` over a hoisted or anti-joined query walks into it.
 
 ## Testing against a real warehouse
 
@@ -284,11 +324,11 @@ There are two fixtures, because a suite has to know the schema it was written ag
 cases run against the live table; many of them pin a bare term against an explicit `msg:` baseline,
 so under a schema whose default field is a different column the two sides measure different columns
 and the assertion stops meaning anything.
-[`testdata/conformance-line.json`](testdata/conformance-line.json) is the derived-surface suite, 12
+[`testdata/conformance-line.json`](testdata/conformance-line.json) is the derived-surface suite, 25
 cases over a frozen copy carrying the STORED column and the widened index group.
 
 All 86 cases in the first suite were re-run against the live warehouse (Databend v0.34.0, 975,927
-rows) and pass, and all 12 in the second against the 967,912-row frozen copy. The earlier figures
+rows) and pass, and all 25 in the second against the 967,912-row frozen copy. The earlier figures
 below were measured on the same table at ~603k rows.
 Every partition identity holds to the row — 19,962 + 5,717 = 25,679 inside one `query()`,
 20,309 + 5,370 = 25,679 for the De Morgan fold, 594,705 + 8,277 = 602,982 for a negated bag key,

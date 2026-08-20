@@ -642,11 +642,38 @@ func TestOneSearchFunctionRule(t *testing.T) {
 		t.Error("with no row key this must still be refused")
 	}
 
-	// Fuzziness exists only as an option to match(), so a fuzzy term is a
-	// search function of its own and cannot share a statement with another
-	// full-text term.
-	if _, err := CompileString("snapshoot~1 peer", s); err == nil {
-		t.Error("expected an error: fuzzy term plus a second full-text term")
+	// Fuzziness exists only as an option to match(), so a fuzzy term is a search
+	// function of its own and cannot share a SCAN with another full-text term.
+	// It can share a statement: the conjunction puts the second one in a row-key
+	// subquery, which is a scan of its own.
+	//
+	// This used to be refused, and the refusal was hiding a runtime failure
+	// rather than preventing one. Wrapping the same conjunction in a disjunction
+	// or a negation moved it into a subquery where the outer count saw nothing,
+	// and the engine returned [1065] — 9 of 40 shapes in a live census, in three
+	// wrappers, all of them the same three conjunctions the AND path refused.
+	// Separating the scans fixes both spellings at once. Verified live: the pair
+	// answers 725 rows, identically for all three ways of spreading two search
+	// functions over two scans, and [1065] with both bare.
+	r, err = CompileString("snapshoot~1 peer", s)
+	if err != nil {
+		t.Fatalf("a fuzzy term beside a text term should compile into two scans: %v", err)
+	}
+	if n := maxScanSearchFuncs(r.SQL); n != 1 {
+		t.Errorf("expected one search function per scan, got %d: %s", n, r.SQL)
+	}
+	if searchCalls(r.SQL) != 2 {
+		t.Errorf("expected both search functions to survive: %s", r.SQL)
+	}
+	if len(r.Warnings) == 0 {
+		t.Error("a second scan is a cost the caller should hear about")
+	}
+	// With no row key there is nowhere to put the second one, so it is refused —
+	// which is what every schema without a row key kept doing.
+	sNoKey := s
+	sNoKey.RowKey = ""
+	if _, err := CompileString("snapshoot~1 peer", sNoKey); err == nil {
+		t.Error("with no row key, two search functions in one scan must be refused")
 	}
 
 	// But a fuzzy term composes freely with structured filters and LIKE,
