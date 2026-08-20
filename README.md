@@ -137,6 +137,7 @@ and their disjunction 118,896 — the union to the row.
 | `and`, `or`, `not` — any case | an operator only where an operator is **grammatical**: `and`, `or`, `&&` and `\|\|` between two terms, `NOT` before a term. Anywhere else — the whole query, a field's value, the only thing inside a `field:(…)` group, leading with nothing to its left — it is the word the user typed, matched by a word-boundary scan; read as an operator there, `msg:(not)` and a bare `not` compiled to a filter that matched everything. `NOT` is the one that must be capitalised, because it **inverts** the term it takes while `and`/`or` only join terms that keep their own meaning either way: `msg:(not ready)` is the two words, `msg:(NOT ready)` is the complement of `ready` — 3,537 rows against 711,157 over `ts < '2026-08-19 08:00:00'` (715,185 rows). A *trailing* `and`/`or` is dropped rather than demoted — `region or` is someone mid-keystroke, so it still returns `region`. The cost of the word reading, stated rather than hidden: on a single-valued column `level:(error not warn)` is three ANDed equalities and can never match — write `level:(error -warn)` or `level:(error NOT warn)` |
 | `term^2` | `(col:term)^2` inside the one `query()` — reorders `score()`, matches the same rows |
 | `/re/`, `field:/re/` | `col RLIKE 're'` — not a search function, but no index serves it |
+| `file.rs:360`, `file.rs` | a source **file position**: `query('(line:"file.rs:360") OR (source_file:"file.rs:360")')` — one call, both surfaces, because the collector parses the position out of a bracket-format line into its own column and leaves it in the text of a logfmt one. Read as `field:value` it was a bag key nothing writes, and 0 rows. Needs a declared `source_file` role; without one nothing changes |
 | `field:value` | `lower(field) = lower('value')` — there is no case-insensitive `=` here |
 | `field:(a OR b)` | the group compiles under the field: SQL on a plain column, one `query()` on the text one |
 | `-field:value` | `COALESCE(NOT (…), TRUE)` — so `x` and `-x` partition the table |
@@ -476,8 +477,8 @@ is at load.
 perfectly good time role. Expressions are aliased to the typed name in a select list, so callers get
 something they can address.
 
-**Roles replace hardcoded column names.** `time`, `severity` and `display` are how the CLI and the
-dashboard generator build a statement without knowing this deployment's spelling; `SELECT ts, level,
+**Roles replace hardcoded column names.** `time`, `severity`, `source_file` and `display` are how the
+CLI and the dashboard generator build a statement without knowing this deployment's spelling; `SELECT ts, level,
 component, pod, msg` used to be a literal in both, and the dashboard used to write eleven panels'
 worth of column names into its SQL with no check that the table had them — pointing it at another
 table emitted 129 references to columns that did not exist. It now refuses the panels a schema has
@@ -493,6 +494,11 @@ schema my-logs.json: no attribute bag: a field name that is not declared here is
   rather than a bag lookup, so `store_id:7` will be refused instead of read from a VARIANT
 schema my-logs.json: no severity field: a log view over this schema cannot colour or count by level
 ```
+
+`source_file` is the one optional role whose absence is *not* announced, and deliberately: it is the
+state every deployment starts in, and it changes nothing a reader could otherwise see — a schema
+without it compiles every query exactly as it did before the role existed. See
+[The file position](#the-file-position).
 
 ### The attribute bag
 
@@ -589,6 +595,98 @@ behaviour change every saved link will notice: `query('msg:snapshot')` is 17,649
 `msg:` typed explicitly still means exactly what it always did. This is also why it is a separate
 preset (`k8s-logs-line`) rather than a change to `k8s-logs`: the migration is a deployment decision,
 and pointing a schema at a column the table does not have is `[1065]` on the first query.
+
+### The file position
+
+Every unified TiDB/TiKV/PD/TiCDC line carries its call site in brackets, so a reader can see it and
+therefore types it:
+
+```
+[2026/08/20 16:20:59.070 +00:00] [INFO] [compaction_runner.rs:360] ["collected 0 compaction candidates"]
+```
+
+Both ways of typing it used to answer **zero**. The collector parses the call site into its own column
+and the derived surface is the message plus the bag's *values*, so a bare `compaction_runner.rs`
+reached no surface that holds it; and `compaction_runner.rs:360` parses as the field
+`compaction_runner.rs` with the value `360`, which is not a column, so it took the VARIANT path and
+compiled to a lookup for a bag key nothing writes. It warned — and in Grafana a warning is a SQL
+comment nobody sees.
+
+A schema that declares the **`source_file` role** gets both spellings compiled against the field that
+holds a call site. `name.ext` is a file name, `name.ext:digits` is a file position, and each is
+searched in the default surface **and** in that field, ORed inside the statement's one `query()` call.
+
+**It is a union rather than a redirect, and this table is what refuses the redirect.** Three log
+formats arrive here and they do not agree on where the call site ends up. Measured over the closed
+window `[2026-08-20 16:00:00, 16:25:00)` — 8,142 rows:
+
+| term | `line:` | `source_file:` | union | a redirect would give |
+| --- | --- | --- | --- | --- |
+| `compaction_runner.rs` (tikv, bracket format) | 0 | 30 | 30 | 30 |
+| `compaction_runner.rs:360` | 0 | 15 | 15 | 15 |
+| `reflector.go` (csi-driver, klog) | 0 | 69 | 69 | 69 |
+| `factory.go` (named in a klog message) | 69 | 0 | 69 | **0** |
+| `warnings.go:110` (controller, logfmt `caller=`) | 32 | 0 | 32 | **0** |
+
+The bracket format has its position parsed out, so only `source_file` holds it. A logfmt line —
+`caller=…/rest/warnings.go:110`, `source=compact.go:565` — has no bracket to parse, so `source_file`
+is empty and the position survives in the bag and therefore in `line`. 143 of those 8,142 rows carry
+a `.rs`/`.go` file-shaped token in `line`, so this is not a corner; over the wider closed window
+`[2026-08-20 00:00:00, 16:00:00)` (286,604 rows) `factory.go` is 2,559 in the text against 0 in the
+column and `warnings.go` splits 1,280 against 128. The union is a strict superset of what the default
+surface answered before, and the two sides are disjoint wherever both are non-zero — 1,280 + 128 =
+1,408 and 19 + 16 = 35, measured.
+
+**The shape rule is structural, not a list of known extensions.** `name.ext` needs name segments of
+file-name characters and an **all-letters** extension, so `10.0.0.1`, `192.168.176.28` and `v8.5.7`
+are ordinary text — their last segment is digits. It is *not* keyed on `{go, rs}`, and that is a
+deliberate refusal: this warehouse's `source_file` holds 972 distinct values and only those two
+extensions occur in any of them, so a rule keyed on them would pass every test this data can pose and
+fail silently the first time a C++ or Python component logs into the table. `handler.py:88` and
+`db_impl_compaction_flush.cc:1042` therefore behave exactly like `.rs`, with no code change.
+
+The price is that `foo.bar`, `example.com` and `k8s_logs.ts` (a column reference in a logged
+statement) are read as files too. That is affordable *because* the rule expands rather than
+redirects: the extra disjunct is on a column holding no such token, so it contributes nothing and
+removes nothing. Under a redirect the same false positive would have thrown the answer away.
+
+A **declared** name always outranks the shape: a field or alias spelled `parser.go`, a bag addressed
+by column or prefix (`kv.compaction_runner.rs:360` is the bag), or a bag key declared under exactly
+that spelling. Quotes narrow the search back to the text surface, which is what makes them the escape
+hatch — `"compaction_runner.rs:360"` is the message and nothing else — and so does naming a field.
+
+**What the token search costs.** `source_file:` is a token search and this analyzer splits on `_` as
+well as `.`, so a name that *ends* another name matches both. Over `ts < '2026-08-20 16:25:00'`
+(1,292,338 rows) `query('source_file:manager.go')` is 513,055 rows, of which 199 are that file and
+512,856 are `*_manager.go` — 199 + 512,856 = 513,055 exactly, so the whole excess is the suffix
+family. This is not new: the explicitly-scoped `source_file:manager.go` has answered exactly that
+since the column joined the index group, and what the expansion does is make the bare spelling agree
+with the scoped one. The exact alternative, `source_file LIKE 'manager.go:%'`, is refused because it
+is anchored at character 0 and the role promises only that the field holds a call site — a deployment
+storing `components/raftstore/src/peer.rs:100` would get **0** rows from it, which is the silent zero
+this rule exists to remove. The warning says which reading was used.
+
+**Every expansion says so**, because searching a column the user did not name is exactly the class of
+thing this compiler warns about. In Grafana that warning is still a SQL comment
+([`docs/grafana-macro.md`](docs/grafana-macro.md)).
+
+**A plain column is served too, and told to expect a scan.** The role accepts `text` and `string`. A
+text field is in the index group, so the position joins the one `query()` call. A plain column has no
+tokens, and an equality is the wrong reading of both spellings — the stored value is the whole call
+site, so `source_file = 'compaction_runner.rs'` is 0 rows for all 36 of that file's lines — so it is
+matched as a literal substring instead. Measured on the `k8s-logs` preset, whose `source_file` is a
+plain VARCHAR: `lower(source_file) LIKE lower('%compaction\_runner.rs:360%')` is the same 18, and
+`…rs%'` the same 36. A `number` or `timestamp` role is refused at load.
+
+Fuzziness is dropped on a file **position** and kept on a file **name**, and the difference is the
+colon: fuzziness reaches this engine only through `match()`, whose query text is parsed as
+`field:value`, so `match(source_file, 'compaction_runner.rs:360', 'fuzziness=2')` is
+`[1903] Field does not exist: 'compaction_runner.rs'` where `match(source_file,
+'compaction_runner.rs', 'fuzziness=1')` is 36.
+
+**A deployment that declares no role keeps today's behaviour exactly** — the rule is off, both
+spellings compile as they did before it existed, and both shipped conformance suites emit
+byte-identical SQL either way.
 
 ## Why a schema declares a row key
 

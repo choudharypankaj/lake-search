@@ -37,12 +37,23 @@ package databend
 // deleted before the index is consulted — the difference between a right and a
 // wrong answer, not between fast and slow. Point this at a table built without
 // either and the declaration is what has to change.
+//
+// The `source_file` role is declared even though the field is a plain column
+// here, and this preset is what demonstrates the half of the rule that does not
+// need an index. `compaction_runner.rs:360` is matched as a literal substring
+// rather than by token — a full scan of the column, and the compiler says so —
+// where the migrated preset below compiles it into the statement's one query()
+// call. Both are right; only one is cheap, and both return the same 15 rows over
+// [2026-08-20 16:00:00, 16:25:00). What neither can be is an equality: the column
+// holds the whole call site, so `source_file = 'compaction_runner.rs'` is zero
+// rows for every one of that file's 30 lines in that window.
 const k8sLogsDef = `{
   "table": "logs.k8s_logs",
   "default": "msg",
   "row_key": "_row_id",
   "time": "ts",
   "severity": "level",
+  "source_file": "source_file",
   "variant": "kv",
   "case_insensitive": true,
   "display": ["ts", "level", "component", "pod", "node", "source_file", "msg"],
@@ -181,6 +192,29 @@ const k8sLogsDef = `{
 // for exactly this reason and will start keeping `raw` in `display` once the
 // profiled window sits after the change; that is the rule working, not failing.
 //
+// # The file position, and why it is a role rather than a column name
+//
+// `source_file` is in the index group, which makes `source_file:compaction_runner`
+// index-backed — but a reader does not type that. A reader types what the line
+// shows, `compaction_runner.rs:360`, and that spelling parsed as the field
+// `compaction_runner.rs` with the value `360`, took the bag path, and asked for a
+// key nothing writes. Zero rows, and the warning that said so rode along as a SQL
+// comment the panel does not show.
+//
+// The `source_file` role is what closes it, and it is a role rather than a
+// constant because the column is `source_file` here, `caller` under zap and
+// `file` or `logger` elsewhere. Measured over the closed window
+// [2026-08-20 16:00:00, 16:25:00), 8,142 rows:
+//
+//	compaction_runner.rs        0 (line:…)  ->  30 = every line of that file
+//	compaction_runner.rs:360    0 (bag key) ->  15 = that line
+//
+// Both compile into the one query() call the statement is allowed, as
+// `(line:…) OR (source_file:…)` — the position is searched in the message text
+// too, because a logfmt component leaves its call site there rather than in the
+// column, and searching one surface alone answers zero for the other. See
+// sourcefile.go, which carries the measurement that refuses the redirect.
+//
 // # A divergence worth stating
 //
 // A bare word here searches the message *and* the attribute values. The
@@ -194,6 +228,7 @@ const k8sLogsLineDef = `{
   "row_key": "_row_id",
   "time": "ts",
   "severity": "level",
+  "source_file": "source_file",
   "variant": "kv",
   "case_insensitive": true,
   "display": ["ts", "level", "component", "pod", "node", "source_file", "line"],

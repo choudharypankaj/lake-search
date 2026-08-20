@@ -87,6 +87,33 @@ type Def struct {
 	Time     string `json:"time,omitempty"`
 	Severity string `json:"severity,omitempty"`
 
+	// SourceFile names the field holding a logging call site — the
+	// `compaction_runner.rs:360` a logger prints beside its message. Declaring
+	// it turns a term of that shape into a search of that field; see
+	// Schema.SourceFile and sourcefile.go.
+	//
+	// Two things about the field it names, because they decide what the two
+	// spellings can answer:
+	//
+	// It should carry the WHOLE call site, line number included, as the
+	// collector stored it. `file.rs:360` is matched against the value, so a
+	// column holding only `file.rs` answers the bare name and nothing else —
+	// which is a miss rather than a wrong answer, and the warning names the
+	// field it searched so a reader can see where it looked.
+	//
+	// Kind "text" is the useful declaration and kind "string" is accepted. A
+	// text field is in the inverted index group, so the position compiles into
+	// the statement's one query() call and composes with every other text term.
+	// A plain column cannot be searched by token, so it is matched as a literal
+	// substring instead — correct, and a full scan unless an NGRAM index covers
+	// it. Both are announced at compile time.
+	//
+	// Absence is NOT reported as a note, unlike Severity. Every deployment is
+	// absent by default and absence changes nothing a reader can see: it is
+	// the behaviour that shipped before this role existed. A note here would
+	// fire on every schema in the world to describe the status quo.
+	SourceFile string `json:"source_file,omitempty"`
+
 	// Variant names the single VARIANT column unknown field names are routed
 	// into. It is the one-bag spelling of Bags and exists because most tables
 	// have exactly one.
@@ -316,6 +343,7 @@ func (d Def) Schema() (Schema, []string, error) {
 		Default:         strings.ToLower(d.Default),
 		Time:            strings.ToLower(d.Time),
 		Severity:        strings.ToLower(d.Severity),
+		SourceFile:      strings.ToLower(d.SourceFile),
 		RowKey:          d.RowKey,
 		Variant:         d.Variant,
 		TimeZone:        d.TimeZone,
@@ -644,6 +672,26 @@ func (d Def) Schema() (Schema, []string, error) {
 		notes = append(notes, "no severity field: a log view over this schema cannot colour or "+
 			"count by level, and a panel that guesses will pick whatever string column comes "+
 			"first")
+	}
+	if s.SourceFile != "" {
+		f, ok := s.Fields[s.SourceFile]
+		if !ok {
+			return Schema{}, nil, fmt.Errorf(
+				"schema: source_file field %q is not declared", d.SourceFile)
+		}
+		// Text and string both work — see Def.SourceFile — but a number or a
+		// timestamp cannot hold `file.rs:360` at all, so a schema claiming one is
+		// describing a role it does not have, and every file-shaped term would be
+		// redirected onto a comparison that cannot match.
+		switch f.Kind {
+		case Text, String:
+		default:
+			return Schema{}, nil, fmt.Errorf(
+				"schema: source_file field %q is kind %q, but a source file position is text "+
+					"(`compaction_runner.rs:360`); declare the field \"text\" so the position is "+
+					"searched through the inverted index, or \"string\" so it is matched as a "+
+					"substring", d.SourceFile, KindName(f.Kind))
+		}
 	}
 	if s.Table == "" {
 		notes = append(notes, "no table: excluding a full-text term with no positive term "+

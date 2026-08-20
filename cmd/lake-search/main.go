@@ -598,6 +598,7 @@ func cmdSchema(args []string) int {
 	fmt.Printf("default field:    %s\n", schema.Default)
 	fmt.Printf("time field:       %s\n", orNone(schema.Time))
 	fmt.Printf("severity field:   %s\n", orNone(schema.Severity))
+	fmt.Printf("source file:      %s\n", orNone(schema.SourceFile))
 	fmt.Printf("bags:             %s\n", orNone(bagSummary(schema)))
 	fmt.Printf("time zone:        %s\n", orDefault(schema.TimeZone, "session"))
 	fmt.Printf("case-insensitive: %t\n", schema.CaseInsensitive)
@@ -640,13 +641,21 @@ func cmdSchema(args []string) int {
 // flat and role-first: a consumer wants to ask "does this table have a severity
 // column, and what is it called", not to re-run field resolution.
 type resolved struct {
-	Table    string            `json:"table"`
-	Default  string            `json:"default"`
-	Time     string            `json:"time,omitempty"`
-	Severity string            `json:"severity,omitempty"`
-	Display  []string          `json:"display"`
-	Bags     []resolvedBag     `json:"bags,omitempty"`
-	Fields   map[string]rField `json:"fields"`
+	Table    string `json:"table"`
+	Default  string `json:"default"`
+	Time     string `json:"time,omitempty"`
+	Severity string `json:"severity,omitempty"`
+
+	// SourceFile is the field holding a logging call site, when the schema
+	// declares one. A consumer needs it for the same reason it needs Severity:
+	// to build a view around the role without knowing this deployment's column
+	// name. Omitted when absent, which is what says the file-position shape rule
+	// is off here.
+	SourceFile string `json:"source_file,omitempty"`
+
+	Display []string          `json:"display"`
+	Bags    []resolvedBag     `json:"bags,omitempty"`
+	Fields  map[string]rField `json:"fields"`
 }
 
 type resolvedBag struct {
@@ -669,7 +678,8 @@ type rField struct {
 func resolvedSchema(s databend.Schema) resolved {
 	r := resolved{
 		Table: s.Table, Default: s.Default, Time: s.Time, Severity: s.Severity,
-		Display: s.Display, Fields: make(map[string]rField, len(s.Fields)),
+		SourceFile: s.SourceFile,
+		Display:    s.Display, Fields: make(map[string]rField, len(s.Fields)),
 	}
 	if r.Display == nil {
 		r.Display = []string{}

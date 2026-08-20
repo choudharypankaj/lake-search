@@ -250,6 +250,26 @@ type Schema struct {
 	Time     string
 	Severity string
 
+	// SourceFile names the field that holds a logging call site — the
+	// `compaction_runner.rs:360` a logger prints beside its message. It is a
+	// role for the same reason Time and Severity are: the column is called
+	// `source_file` on the reference table, `caller` under zap, `logger` and
+	// `file` elsewhere, and a compiler that hardcoded one of those would be
+	// describing one deployment.
+	//
+	// What it buys is a term shape that is neither text nor a field lookup.
+	// `compaction_runner.rs:360` parses as the field `compaction_runner.rs`
+	// with the value `360`, which is not a column, so it takes the bag path and
+	// asks for a key nothing writes; and the bare name is not in the derived
+	// text surface either, because the collector split it into its own column
+	// before the surface was built. Both spellings therefore answered zero and
+	// raised only a warning that Grafana does not show. See sourcefile.go for
+	// the shape rule and what it deliberately refuses to fire on.
+	//
+	// Empty — the default — means the shape rule is off and both spellings
+	// compile exactly as they did before it existed.
+	SourceFile string
+
 	// Display lists the field names a row-level view selects, in order. It
 	// defaults to Time, Severity and Default when a schema does not say.
 	Display []string

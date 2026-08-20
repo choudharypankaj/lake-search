@@ -1424,6 +1424,14 @@ func (c *compiler) render(n parser.Node) (fragment, error) {
 	case *parser.Not:
 		return c.not(t.Child)
 	case *parser.Term:
+		// A source file position is neither a field lookup nor a term on the
+		// default surface alone: the collector puts it in a column of its own for
+		// one log format and leaves it in the text for another, and both formats
+		// are in one table. It expands into a disjunction over the two. See
+		// sourcefile.go.
+		if n := c.sourceFileNode(t); n != nil {
+			return c.render(n)
+		}
 		return c.term(t)
 	case *parser.Range:
 		return c.rangeNode(t)

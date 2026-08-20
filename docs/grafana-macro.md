@@ -488,9 +488,11 @@ negation.
 
 ### And since that build, once more
 
-Two changes affect the emitted SQL. Both were measured on `logs.k8s_logs_v2`, a
-frozen 967,912-row copy of the table (`ts < '2026-08-19 22:19:00'`), so before
-and after are the same rows.
+The changes since that build that affect the emitted SQL. Each was measured on
+`logs.k8s_logs_v2`, a frozen 967,912-row copy of the table
+(`ts < '2026-08-19 22:19:00'`), so before and after are the same rows — except the
+two file-position rows, which are measured on the live table and name their own
+closed window.
 
 | Query | Before | After |
 | --- | --- | --- |
@@ -500,6 +502,8 @@ and after are the same rows.
 | `err:RemoteStopped`, bag in the index group | `lower(kv['err']::VARCHAR) = lower('RemoteStopped')`, 507 rows by full scan | `query('kv.err:RemoteStopped') AND` the same equality, **507** by index |
 | `request:command`, same | 0 | **0** — the index clause alone is 501, which is why the equality stays |
 | bare `RemoteStopped`, derived column | 0 | **605** |
+| `compaction_runner.rs:360`, source-file role declared | `query('kv.compaction_runner.rs:360') AND lower(COALESCE(kv['compaction_runner.rs'], …)) = lower('360')` — a bag key nothing writes, **0** | `query('(line:"compaction_runner.rs:360") OR (source_file:"compaction_runner.rs:360")')`, **15** over the closed window `[2026-08-20 16:00:00, 16:25:00)` (8,142 rows), plus a warning |
+| bare `compaction_runner.rs`, same | `query('line:compaction_runner.rs')`, **0** | both surfaces in one call, **30**, same window |
 
 ### The one advisory that matters most is the one this channel cannot deliver
 
