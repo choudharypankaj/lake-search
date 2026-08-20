@@ -1,6 +1,7 @@
 package databend
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/choudharypankaj/lake-search/parser"
@@ -70,9 +71,10 @@ import (
 // 128 in the column and `compact.go` 19 against 16 — the two sides disjoint, since
 // 1,280 + 128 = 1,408 and 19 + 16 = 35 are what the unions return.
 //
-// The disjunction cannot lose: it is a strict superset of what the default surface
-// answered before, which is asserted structurally by
-// TestSourceFileExpansionCannotLoseRows rather than by counting.
+// The text half is therefore never dropped, which TestSourceFileKeepsTheTextSurface
+// pins structurally rather than by counting. It is not a strict superset of what
+// the default surface answered before — the literal comparison below narrows it in
+// one measured case — but it is never absent.
 //
 // Both halves go inside ONE query() call, which the engine allows because
 // `source_file` sits in the same inverted index group as msg, line and kv.
@@ -80,34 +82,30 @@ import (
 // "compaction_runner.rs:360")')` is 15 and still composes with a term and a
 // column filter.
 //
-// # What the token search costs, with the arithmetic
+// # Why the search function alone is not the answer
 //
-// `source_file:` is a TOKEN search and this analyzer splits on `_` as well as on
-// `.`, so a name that ENDS another name matches both. Over `ts < '2026-08-20
-// 16:25:00'` (1,292,338 rows):
+// The first version of this rule stopped at the disjunction above, and it was
+// wrong in the other direction. `source_file:` is a TOKEN search and this analyzer
+// splits on `_` as well as on `.`, so a name that ENDS another name matches both.
+// Over `ts < '2026-08-20 16:25:00'` (1,292,338 rows):
 //
 //	query('source_file:manager.go')        513,055
-//	source_file LIKE 'manager.go:%'            199   the file itself
+//	source_file LIKE 'manager.go%'             199   the file itself
 //	source_file LIKE '%_manager.go:%'      512,856   files ending with the name
 //
 // and 199 + 512,856 = 513,055 exactly, so the whole of the excess is the suffix
-// family. Positions inherit it in miniature: `server.go:342` is 1,720 rows where
-// 9 carry that exact position, the rest being `*_server.go` files with a line 342.
+// family. A search for one file name returning 40% of the table is not a usable
+// answer, and it is the same defect class as the silent zero it replaced: a wrong
+// answer a reader cannot tell is wrong.
 //
-// This is not new and it is not the expansion's doing — `source_file:manager.go`,
-// the explicitly-scoped spelling, has answered exactly this since the column
-// joined the index group, and the gate pins it unchanged. What the expansion does
-// is make the bare spelling agree with the scoped one.
+// The tool that fixes it is the one a95e957 landed: a single search function
+// prunes the scan while ordinary predicates refine it. So the search function
+// stays — it is what makes this cheap — and a literal comparison is ANDed onto it.
+// See sourceFileFragment for the shapes, the oracle and the cost.
 //
-// The exact alternative was considered and refused: `lower(source_file) LIKE
-// lower('manager.go:%')` returns the 199, but it is anchored at character 0 of the
-// column, which assumes the value begins with a basename. The role promises only
-// that the field holds a call site — a deployment that stores
-// `components/raftstore/src/peer.rs:100` would get 0 rows from the anchored form,
-// which is the silent zero this whole rule exists to remove. It is also a full
-// scan on a 1.29M-row column, and it cannot share the statement's search
-// function. The token search is wider; the anchored one is wrong on a shape the
-// role allows.
+// The explicitly-scoped spellings are untouched: `source_file:manager.go` typed by
+// hand is still a token search, still 513,055, and the gate pins it. Only the
+// spelling this rule owns — the bare file name — is made exact.
 //
 // # The shape rule
 //
@@ -192,39 +190,202 @@ func isSourceExtension(ext string) bool {
 	return true
 }
 
-// sourceFileNode expands a term that reads as a source file into a disjunction
-// over the default surface and the source-file role, or returns nil when the term
-// is not one.
+// sourceFileFragment compiles a term that reads as a source file, or reports
+// ok=false when the term is not one.
 //
-// It builds NEW nodes rather than editing the ones it was given. Compile is
-// public and a caller may compile the same parsed query twice — CompileScore and
-// CompileScoreExpr each do — and a mutated tree would make the second compile see
-// a term nobody typed.
+// # The shape, and why it is a search function AND a literal filter
 //
-// The children name their fields explicitly, which is also what stops this from
-// recursing: a field the schema declares can never fire the rule, and both
-// children name declared fields.
-func (c *compiler) sourceFileNode(t *parser.Term) parser.Node {
+// The search function is a SUPERSET that prunes the scan; the literal comparison
+// beside it is what makes the answer exact. That is the tool a95e957 landed — one
+// search function per scan, with ordinary predicates composing freely around it —
+// and it is the only way to have both here, because the query language cannot
+// anchor and a LIKE cannot prune.
+//
+// It has to be both, because the token search alone is not a usable answer. Over
+// `ts < '2026-08-20 16:25:00'` (1,292,338 rows):
+//
+//	                              token union   exact truth   this compiler
+//	manager.go                        514,446         1,590           1,590
+//	client.go                          41,086        17,487          17,487
+//	compaction_runner.rs                3,790         3,790           3,790
+//	compaction_runner.rs:360            1,571         1,571           1,571
+//	warnings.go                         3,810         3,810           3,810
+//	server.go:342                       1,720         1,720           1,720
+//	tidb_monitor_controller.go:101      7,752         7,752           7,752
+//
+// `manager.go` was 2,584× too many rows — 40% of the table — because this
+// analyzer splits on `_` as well as on `.`, so the token pair [manager, go] is
+// inside every `*_manager.go`. Exactly: `source_file LIKE 'manager.go%'` is 199
+// and `LIKE '%_manager.go:%'` is 512,856, and 199 + 512,856 = 513,055 is the token
+// search. The truth column above is `source_file LIKE 'X%' OR line LIKE '%X%'`
+// computed with no compiler in the loop, and this compiler now equals it on all
+// nine terms measured.
+//
+// Cost, same window, best of three runs:
+//
+//	                                   compaction_runner.rs   manager.go
+//	search function alone (was)                      0.12s        0.17s
+//	search function AND filter (is)                  0.24s        0.39s
+//	filter alone, no search function                 0.39s        0.39s
+//
+// So the refinement roughly doubles a sub-second query, and the search function is
+// still earning its place: 0.24s against 0.39s for the same rows when the term is
+// selective. On `manager.go` the two are equal, because a token search matching
+// 40% of the table prunes nothing — which is the same fact as the defect.
+//
+// # What the filter is
+//
+//	a position  source_file = 'X'        OR source_file LIKE '%/X'
+//	a name      source_file LIKE 'X%'    OR source_file LIKE '%/X%'
+//	either      OR line LIKE '%X%'
+//
+// The `%/X` disjuncts are what keep this honest on a deployment that stores a path
+// — `components/raftstore/src/peer.rs:100` — because the role promises only that
+// the field holds a call site, not that it begins with a basename. Neither
+// disjunct is index-served; the search function beside them is.
+//
+// `LIKE 'X%'` rather than `LIKE 'X:%'` is deliberate: it makes no assumption about
+// the separator between the name and the line, so `file.rs:360`, `file.rs 360` and
+// a bare `file.rs` all match. What it costs is a file whose name is a longer
+// dotted name beginning with the one typed — `client.go` would also answer for a
+// hypothetical `client.gopher` — and this table has no such pair among its 262
+// distinct basenames (the five prefix pairs it does have all involve `raft`, which
+// has no dot and so cannot reach this rule).
+//
+// # The text half is an intersection, and that is the point
+//
+// The filter's prose disjunct is `line LIKE '%X%'`, ANDed with the analyzed match
+// the search function makes. Neither test is right on its own, and their blind
+// spots are opposite:
+//
+//	the ANALYZER splits on `-` and `.` alike, so it cannot tell the Go module
+//	`client-go` from the file `client.go`. Measured, `query('line:client.go')` is
+//	16,501 rows and the literal is 11,769; all 4,732 it drops carry `client-go` —
+//	`/go/pkg/mod/k8s.io/client-go` (3,548), `github.com/tikv/client-go/v2/tikv.`
+//	(852), `pkg/mod/k8s.io/client-go` (230),
+//	`k8s.io/client-go/informers/factory.go` (79), `/gomodcache/k8s.io/client-go`
+//	(23) — which is 4,732 exactly.
+//
+//	the LITERAL has no word boundaries, so it cannot tell `grpcutil.go` from
+//	`util.go`, `leaderelection.go` from `election.go`, `sysinfo.go` from
+//	`info.go`, `observer.go` from `server.go`, `terror.go` from `error.go`,
+//	`tlsconfig.go` from `config.go`, `contexthandler.go` from `handler.go`,
+//	`runtime.goexit` from `runtime.go`, or `main.go:1542` from `main.go:154`.
+//
+// Their conjunction rejects both families, which makes it a better answer than
+// either — and than the obvious oracle. Measured over `ts < '2026-08-20 16:25:00'`
+// against `source_file LIKE 'X%' OR line LIKE '%X%'` for every one of the table's
+// mined values: 963 of 971 positions and 250 of 262 basenames are equal to it, and
+// every one of the 20 differences is the ORACLE being wrong — 13 of them a
+// substring artifact from the list above, and the other 7 the holes this file
+// already records (three values with no dot, four under the `kv.` prefix).
+//
+// # Why the AND is safe, verified rather than assumed
+//
+// ANDing a filter onto a search function loses every row the search function
+// missed, so the search function has to cover the filter. On the FILE column it
+// does: for all 1,233 mined values, `count(F)` equals `count(F AND Q)` — 0 terms
+// where the anchored comparison matches a row the search function did not.
+//
+// On the TEXT column it deliberately does not, and that is the intersection above
+// rather than a loss.
+func (c *compiler) sourceFileFragment(t *parser.Term) (fragment, bool, error) {
+	position, isPos, ok := c.sourceFileMatch(t)
+	if !ok {
+		return fragment{}, false, nil
+	}
+	role := c.schema.Fields[c.schema.SourceFile]
+	def := c.schema.Fields[c.schema.Default]
+
+	term := *t
+	term.Field = ""
+	term.Value = position
+	c.dropFuzzOnPosition(&term)
+	c.warnSourceFile(position, isPos, role)
+
+	// Fuzziness is a request for an approximate answer, so it keeps the
+	// approximate path — match() on each column, nothing literal beside it, since
+	// a literal filter would delete every row the edit distance was for. It needs
+	// an inverted index to be expressible at all.
+	if term.Fuzz > 0 && role.Kind == Text {
+		left, right := term, term
+		left.Field = c.schema.Default
+		right.Field = c.schema.SourceFile
+		f, err := c.render(&parser.Or{Children: []parser.Node{&left, &right}})
+		return f, true, err
+	}
+
+	filter := c.sourceFileFilter(def, role, position, isPos, term.Wildcard)
+
+	// Two cases have no search function to prune with, and the filter is then the
+	// whole answer: a role whose column carries no inverted index (the k8s-logs
+	// preset), and a wildcard, which cannot be spelled inside query() at all.
+	// Measured, both are exact and both are a scan: 0.28s for `manager.go` on
+	// k8s-logs against 0.15s for the token form it replaces, which returned
+	// 514,443 rows instead of 1,587.
+	if role.Kind != Text || term.Wildcard {
+		if term.Fuzz > 0 || term.Boost != "" {
+			// Neither is expressible on a comparison: fuzziness reaches the engine
+			// through match() and a boost only reorders score(), and this half of
+			// the search is compared rather than scored. Said out loud, because
+			// silently ignoring a modifier is how `^2` used to be a compile error
+			// here and is now a no-op.
+			c.warn("fuzziness and boost are dropped on %q: it is matched by literal comparison "+
+				"rather than through the index — %s carries no inverted index here, or the "+
+				"wildcard cannot be spelled inside a search function — so there is no analyzer "+
+				"to tolerate an edit and no relevance to weight", position, c.schema.SourceFile)
+		}
+		return fragment{sql: filter}, true, nil
+	}
+
+	c.noteText(def)
+	c.noteText(role)
+	expr := def.Column + ":" + quoteQueryValue(position, false)
+	if role.Column != def.Column {
+		// Two surfaces, one search function: legal because the schema layer
+		// refuses a text field outside the one inverted index group.
+		expr = "(" + expr + ") OR (" + role.Column + ":" +
+			quoteQueryValue(position, false) + ")"
+	}
+	// A boost wraps the whole union rather than each half; verified legal and
+	// row-identical — `query('((line:X) OR (source_file:X))^2')` returns the same
+	// 1,571 as the unboosted form.
+	expr = c.boost(expr, &term)
+	// plain is the filter on its own, for the two places a residual cannot travel:
+	// under an OR, where it would filter the other disjunct, and under a NOT,
+	// where it cannot be hoisted past the negation. It is EXACT — the same 1,590 /
+	// 3,790 / 1,571 — and only loses the pruning, which is 0.39s against 0.24s.
+	return fragment{text: expr, residual: filter, plain: filter}, true, nil
+}
+
+// sourceFileMatch decides whether a term is a source file, and returns the whole
+// call site it spells.
+//
+// Every guard here exists to keep a real lookup real; see the rule's description
+// at the top of this file.
+func (c *compiler) sourceFileMatch(t *parser.Term) (position string, isPos, ok bool) {
 	if c.schema.SourceFile == "" {
 		// No role declared: the rule is off and every spelling compiles exactly
 		// as it did before it existed. That is the whole of the promise made to a
 		// deployment that has not opted in.
-		return nil
+		return "", false, false
 	}
-	role, ok := c.schema.Fields[c.schema.SourceFile]
-	if !ok {
+	if _, declared := c.schema.Fields[c.schema.SourceFile]; !declared {
 		// Unreachable through a loaded descriptor — Def.Schema refuses a role
 		// naming an undeclared field — but Schema is a public struct anyone may
-		// build by hand, and expanding onto a field that does not resolve would
-		// emit a comparison against an empty column expression.
-		return nil
+		// build by hand, and compiling against a field that does not resolve
+		// would emit a comparison on an empty column expression.
+		return "", false, false
+	}
+	if _, ok := c.schema.Fields[c.schema.Default]; !ok {
+		return "", false, false
 	}
 
 	// A regex is a pattern the user wrote for a specific column, and an existence
 	// test asks about a KEY rather than about a value — expanding either would
 	// change the question rather than the surface.
 	if t.Regex || t.Exists {
-		return nil
+		return "", false, false
 	}
 	// A quoted BARE term is the escape hatch this rule needs to have: quoting is
 	// how someone searches the message text and nothing else, so
@@ -233,78 +394,138 @@ func (c *compiler) sourceFileNode(t *parser.Term) parser.Node {
 	// thing: the quotes are around the line number, and the term is still a file
 	// position.
 	if t.Phrase && t.Field == "" {
-		return nil
+		return "", false, false
 	}
 
-	position := t.Value
-	if t.Field != "" {
-		// `field:value`, where the field has to be a file and the value a line
-		// number. Every guard here exists to keep a real lookup real.
-		if !isSourceFileName(t.Field) || !isLineNumber(t.Value) {
-			return nil
+	if t.Field == "" {
+		// A bare word. Taken only when the WHOLE word is a file name or a whole
+		// file position; a word that merely contains one is text.
+		switch {
+		case isFilePosition(t.Value):
+			return t.Value, true, true
+		case isSourceFileName(t.Value):
+			return t.Value, false, true
 		}
-		if _, declared := c.schema.Fields[strings.ToLower(t.Field)]; declared {
-			// A declared field wins, whatever it is called. A deployment is
-			// allowed a column named `parse.go`, and allowed to alias one so.
-			return nil
-		}
-		if c.namesABag(t.Field) {
-			// `kv.compaction_runner.rs:360` is the user addressing the bag by
-			// name, and the tail looking like a file does not undo that.
-			return nil
-		}
-		position = t.Field + ":" + t.Value
-		c.warn("%q is a source file position, not a field lookup: %q is not a declared field and "+
-			"a file name is not a bag key, so read as `field:value` it asks for a key nothing "+
-			"writes — zero rows, and no error. It is searched in %q and %q instead",
-			position, t.Field, c.schema.Default, c.schema.SourceFile)
+		return "", false, false
+	}
+
+	// `field:value`, where the field has to be a file and the value a line number.
+	if !isSourceFileName(t.Field) || !isLineNumber(t.Value) {
+		return "", false, false
+	}
+	if _, declared := c.schema.Fields[strings.ToLower(t.Field)]; declared {
+		// A declared field wins, whatever it is called. A deployment is allowed a
+		// column named `parse.go`, and allowed to alias one so.
+		return "", false, false
+	}
+	if c.namesABag(t.Field) {
+		// `kv.compaction_runner.rs:360` is the user addressing the bag by name,
+		// and the tail looking like a file does not undo that.
+		return "", false, false
+	}
+	c.warn("%q is a source file position, not a field lookup: %q is not a declared field and "+
+		"a file name is not a bag key, so read as `field:value` it asks for a key nothing "+
+		"writes — zero rows, and no error. It is searched in %q and %q instead",
+		t.Field+":"+t.Value, t.Field, c.schema.Default, c.schema.SourceFile)
+	return t.Field + ":" + t.Value, true, true
+}
+
+// sourceFileFilter is the literal predicate that makes the file half exact.
+//
+// The shapes are in the doc comment on sourceFileFragment. Everything here is
+// built with the same two helpers the rest of the compiler uses, so the escaping
+// of a name full of `_` — a LIKE wildcard — is the escaping that is already
+// tested: `compaction_runner.rs` becomes `compaction\_runner.rs`.
+func (c *compiler) sourceFileFilter(def, role Field, value string, isPos, wild bool) string {
+	pat := escapeLike(value)
+	if wild {
+		// The user's own `*` and `?` become LIKE wildcards, and the literal runs
+		// between them are escaped one run at a time; see likePattern.
+		pat = likePattern(value)
+	}
+	// One column serving both roles is one reading: if the source-file field IS
+	// the default surface, a mention and an emission are the same row, so the
+	// substring test is the whole of the union.
+	if role.Column == def.Column {
+		return "(" + c.likePattern(def.Column, surround(pat)) + ")"
+	}
+	var parts []string
+	if isPos && !wild {
+		// A position names one line, so the value is the whole of it.
+		parts = append(parts, c.equals(role.Column, value))
+		parts = append(parts, c.likePattern(role.Column, "%/"+pat))
 	} else {
-		// A bare word. Expanded only when the WHOLE word is a file name or a whole
-		// file position; a word that merely contains one is text, and a phrase is
-		// text by the guard above.
-		if !isSourceFileName(t.Value) && !isFilePosition(t.Value) {
-			return nil
-		}
+		parts = append(parts, c.likePattern(role.Column, suffixStar(pat)))
+		parts = append(parts, c.likePattern(role.Column, "%/"+suffixStar(pat)))
 	}
+	parts = append(parts, c.likePattern(def.Column, surround(pat)))
+	return "(" + strings.Join(parts, " OR ") + ")"
+}
 
-	// One warning, whichever spelling arrived, and it has to carry two things: the
-	// mechanism, and the choice this compiler made on the reader's behalf.
-	//
-	// The mechanism is that a call site lives in different places on the same
-	// table depending on the log format, so one surface is never the whole answer.
-	// The choice is that "lines that mention client.go" and "lines emitted by
-	// client.go" are different questions and neither contains the other — on this
-	// table a basename can be both — so the union answers both and the spellings
-	// that separate them are handed over. Silently picking one is exactly what
-	// this rule exists to stop, and picking one loudly is not much better.
+// surround opens both ends of a pattern for the substring test on the text
+// surface, without doubling a wildcard the user's own pattern already put there.
+func surround(pat string) string {
+	if !strings.HasPrefix(pat, "%") {
+		pat = "%" + pat
+	}
+	return suffixStar(pat)
+}
+
+// suffixStar appends the trailing wildcard that turns a name into a prefix match,
+// unless the pattern already ends in one.
+func suffixStar(pat string) string {
+	if strings.HasSuffix(pat, "%") {
+		return pat
+	}
+	return pat + "%"
+}
+
+// equals renders a case-folded equality, the way stringTerm does.
+func (c *compiler) equals(col, value string) string {
+	lit := "'" + escapeString(value) + "'"
+	if c.schema.CaseInsensitive {
+		return fmt.Sprintf("lower(%s) = lower(%s)", col, lit)
+	}
+	return col + " = " + lit
+}
+
+// likePattern renders a LIKE against an already-built pattern, the way like() and
+// contains() do — case-folded on both sides when the schema asks for it, because
+// there is no case-insensitive comparison operator on this engine.
+func (c *compiler) likePattern(col, pattern string) string {
+	lit := "'" + escapeString(pattern) + "'"
+	if c.schema.CaseInsensitive {
+		return fmt.Sprintf("lower(%s) LIKE lower(%s)", col, lit)
+	}
+	return fmt.Sprintf("%s LIKE %s", col, lit)
+}
+
+// warnSourceFile says what was searched, and hands over the one spelling that
+// narrows it.
+//
+// It carries no row counts on purpose. The text it replaced named the suffix
+// family — `manager.go also finds tiflash_manager.go` — which was true of the
+// token search and is no longer true of what this compiler emits; a warning that
+// describes an older version of the code is worse than none.
+func (c *compiler) warnSourceFile(position string, isPos bool, role Field) {
+	whole := "the whole name"
+	if isPos {
+		whole = "the whole position"
+	}
 	c.warn("%q reads as a source file, and a source file lives in two places on this table: a "+
 		"collector that parses `[file.rs:360]` out of a bracket-format line puts it in %q and "+
-		"leaves it out of the message, while a logfmt line carrying `caller=` or `source=` leaves "+
-		"it in the text. Both are searched and the results ORed, because searching one alone "+
-		"answers zero for the components that use the other format. That is two questions, so if "+
-		"you meant one of them: %s:%s finds the lines that MENTION it, %s:%s the lines EMITTED by "+
-		"it, and neither contains the other. Note that %q is matched by name rather than pinned: "+
-		"this analyzer splits on `_` as well as `.`, so a file whose name ENDS with the one you "+
-		"typed matches too — manager.go also finds tiflash_manager.go — and adding the line number "+
-		"narrows that without closing it",
-		position, c.schema.SourceFile,
-		c.schema.Default, quotedIfNeeded(position),
-		c.schema.SourceFile, quotedIfNeeded(position),
-		c.schema.SourceFile)
-
-	shared := *t
-	shared.Field = ""
-	shared.Value = position
-	c.dropFuzzOnPosition(&shared)
-
-	if strings.EqualFold(c.schema.Default, c.schema.SourceFile) {
-		// A schema whose default field IS the source-file field wants one term,
-		// not the same term twice.
-		return c.roleSide(shared, role)
-	}
-	text := shared
-	text.Field = c.schema.Default
-	return &parser.Or{Children: []parser.Node{&text, c.roleSide(shared, role)}}
+		"leaves it out of the message, while a logfmt line carrying `caller=` or `source=` "+
+		"leaves it in the text. Both are searched and the results ORed, because searching one "+
+		"alone answers zero for the components that use the other format. Quote the term to "+
+		"search the message text alone",
+		position, c.schema.SourceFile)
+	c.warn("%q is matched on %s — the value of %q, or a path ending in it — and the text half "+
+		"is matched as a literal substring. Both are comparisons rather than token searches, "+
+		"and that is what makes the answer exact: the analyzer splits on `_` and `-` as well "+
+		"as `.`, so a token search cannot tell `manager.go` from `tiflash_manager.go` nor "+
+		"`client.go` from the module `client-go`. %s:%s typed explicitly is still a token "+
+		"search and answers for all of them",
+		position, whole, c.schema.SourceFile, c.schema.SourceFile, quotedIfNeeded(position))
 }
 
 // dropFuzzOnPosition removes the one modifier a file POSITION cannot carry.
@@ -312,7 +533,7 @@ func (c *compiler) sourceFileNode(t *parser.Term) parser.Node {
 // The reason is the colon rather than the shape. Fuzziness reaches this engine
 // only as match()'s option argument, and match()'s query text is parsed as
 // `field:value` — so a value containing a colon is read as a field reference and
-// the statement fails. Same window:
+// the statement fails. Measured over [2026-08-20 16:00:00, 16:25:00):
 //
 //	match(source_file, 'compaction_runner.rs:360', 'fuzziness=2')
 //	                          [1903] Field does not exist: 'compaction_runner.rs'
@@ -335,37 +556,6 @@ func (c *compiler) dropFuzzOnPosition(t *parser.Term) {
 		"not exist: 'compaction_runner.rs'`. Matching the position exactly instead; a file NAME "+
 		"has no colon and keeps its ~N", t.Fuzz, t.Value)
 	t.Fuzz = 0
-}
-
-// roleSide renders the source-file half of the disjunction, adapted to the KIND
-// of field the role names.
-//
-// A text field is in the inverted index group, so it joins the same query() call
-// as the default surface and the pair costs one search function.
-//
-// A plain column has no tokens to search, and an equality is the wrong reading of
-// both spellings: the stored value is the whole call site, so
-// `source_file = 'compaction_runner.rs'` is zero rows for every one of that
-// file's lines. The substring is the reading that holds either way — with the
-// line number and without it — so the term becomes a wildcard one and is left to
-// the ordinary LIKE path, which already says that no NGRAM index serves it.
-// Measured on the k8s-logs preset, whose source_file is a plain VARCHAR:
-// `lower(source_file) LIKE lower('%compaction\_runner.rs:360%')` is 15 and
-// `…rs%'` is 30, the same as the indexed forms. It is a full scan of a 1.29M-row
-// column, and the LIKE path says so.
-func (c *compiler) roleSide(t parser.Term, role Field) parser.Node {
-	t.Field = c.schema.SourceFile
-	if role.Kind == Text {
-		return &t
-	}
-	t.Value = "*" + t.Value + "*"
-	t.Wildcard = true
-	c.warn("%q is a plain column rather than an indexed text field, so it cannot be searched by "+
-		"token and this half of the search is compiled as the substring %q: exact about the "+
-		"characters, but it also matches a longer file name ending with them, and it is a scan. "+
-		"The stars are this compiler's, not yours — which is why the wildcard advisory below "+
-		"quotes them", c.schema.SourceFile, t.Value)
-	return &t
 }
 
 // namesABag reports whether a dotted name addresses a bag rather than a file.

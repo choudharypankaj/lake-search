@@ -502,8 +502,8 @@ closed window.
 | `err:RemoteStopped`, bag in the index group | `lower(kv['err']::VARCHAR) = lower('RemoteStopped')`, 507 rows by full scan | `query('kv.err:RemoteStopped') AND` the same equality, **507** by index |
 | `request:command`, same | 0 | **0** — the index clause alone is 501, which is why the equality stays |
 | bare `RemoteStopped`, derived column | 0 | **605** |
-| `compaction_runner.rs:360`, source-file role declared | `query('kv.compaction_runner.rs:360') AND lower(COALESCE(kv['compaction_runner.rs'], …)) = lower('360')` — a bag key nothing writes, **0** | `query('(line:"compaction_runner.rs:360") OR (source_file:"compaction_runner.rs:360")')`, **15** over the closed window `[2026-08-20 16:00:00, 16:25:00)` (8,142 rows), plus a warning |
-| bare `compaction_runner.rs`, same | `query('line:compaction_runner.rs')`, **0** | both surfaces in one call, **30**, same window |
+| `compaction_runner.rs:360`, source-file role declared | `query('kv.compaction_runner.rs:360') AND lower(COALESCE(kv['compaction_runner.rs'], …)) = lower('360')` — a bag key nothing writes, **0** | `query('(line:…) OR (source_file:…)') AND (source_file = '…' OR source_file LIKE '%/…' OR line LIKE '%…%')` — the search function prunes, the comparison makes it exact: **15** over the closed window `[2026-08-20 16:00:00, 16:25:00)` (8,142 rows), plus a warning |
+| bare `compaction_runner.rs`, same | `query('line:compaction_runner.rs')`, **0** | both surfaces plus a prefix comparison, **30**, same window. Without the comparison a basename is a token search, and the analyzer splits on `_`: `manager.go` would be 514,446 rows against a true 1,590 over `ts < '2026-08-20 16:25:00'` |
 
 ### The one advisory that matters most is the one this channel cannot deliver
 

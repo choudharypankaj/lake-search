@@ -12,9 +12,36 @@ import (
 // [2026-08-20 16:00:00, 16:25:00) — 8,142 rows, 30 of them from
 // compaction_runner.rs and 15 from line 360 of it — and the counts are in the
 // case comments so a reader can check the compilation rather than trust it.
+//
+// Each predicate is a search function that PRUNES beside a literal comparison
+// that makes the answer EXACT. The search function alone was 2,584x too many rows
+// for `manager.go`; see the doc comment on sourceFileFragment for the arithmetic
+// and TestSourceFileIsExact for the oracle.
 func TestSourceFilePosition(t *testing.T) {
 	line := K8sLogsLine()
 	plain := K8sLogs()
+
+	// The literal filter, written once. `_` is a LIKE wildcard, so a file name
+	// full of them has to be escaped — that escaping is the compiler's existing
+	// escapeLike, and this is what it produces.
+	const (
+		posFilter = `(lower(source_file) = lower('compaction_runner.rs:360') OR ` +
+			`lower(source_file) LIKE lower('%/compaction\\_runner.rs:360') OR ` +
+			`lower(line) LIKE lower('%compaction\\_runner.rs:360%'))`
+		nameFilter = `(lower(source_file) LIKE lower('compaction\\_runner.rs%') OR ` +
+			`lower(source_file) LIKE lower('%/compaction\\_runner.rs%') OR ` +
+			`lower(line) LIKE lower('%compaction\\_runner.rs%'))`
+		posIdx  = `query('(line:"compaction_runner.rs:360") OR (source_file:"compaction_runner.rs:360")')`
+		nameIdx = `query('(line:compaction_runner.rs) OR (source_file:compaction_runner.rs)')`
+		// The same two filters over the k8s-logs preset, whose prose surface is
+		// msg and whose source_file carries no inverted index at all.
+		posPlain = `(lower(source_file) = lower('compaction_runner.rs:360') OR ` +
+			`lower(source_file) LIKE lower('%/compaction\\_runner.rs:360') OR ` +
+			`lower(msg) LIKE lower('%compaction\\_runner.rs:360%'))`
+		namePlain = `(lower(source_file) LIKE lower('compaction\\_runner.rs%') OR ` +
+			`lower(source_file) LIKE lower('%/compaction\\_runner.rs%') OR ` +
+			`lower(msg) LIKE lower('%compaction\\_runner.rs%'))`
+	)
 
 	cases := []struct {
 		name   string
@@ -22,98 +49,94 @@ func TestSourceFilePosition(t *testing.T) {
 		query  string
 		want   string
 	}{
-		// The defect. Before this rule the position was read as the field
+		// The defect. Before the role existed the position was read as the field
 		// `compaction_runner.rs` with the value 360, took the VARIANT path and
 		// asked for a bag key nothing writes — 0 rows, one warning, and the
 		// warning arrives in Grafana as a SQL comment nobody sees.
 		//
 		// Quoted inside query(), because the colon would otherwise be read as a
-		// field separator by the query language too. 15 rows.
+		// field separator by the query language too. 15 rows, and the filter is
+		// what makes it 15 rather than every file whose name ends this way.
 		{"a file position", line, "compaction_runner.rs:360",
-			`query('(line:"compaction_runner.rs:360") OR ` +
-				`(source_file:"compaction_runner.rs:360")')`},
-		// Unquoted: `.` and `_` are plain token characters and the analyzer splits
-		// on them, so this is the token search that finds every line of the file.
-		// 30 rows, all from the source_file side — but see
-		// TestSourceFileSearchesBothSurfaces for the terms where it is the other
-		// way round.
+			`(` + posIdx + ` AND ` + posFilter + `)`},
+		// A name is a PREFIX of the stored value, since the value is the whole
+		// call site: `compaction_runner.rs:360`, `:1075`, and so on. 30 rows.
 		{"a bare file name", line, "compaction_runner.rs",
-			`query('(line:compaction_runner.rs) OR (source_file:compaction_runner.rs)')`},
+			`(` + nameIdx + ` AND ` + nameFilter + `)`},
 		// A generated Go file has two dots and is still one file name.
 		{"a name with two dots", line, "descriptor.pb.go:41",
-			`query('(line:"descriptor.pb.go:41") OR (source_file:"descriptor.pb.go:41")')`},
+			`(query('(line:"descriptor.pb.go:41") OR (source_file:"descriptor.pb.go:41")') AND ` +
+				`(lower(source_file) = lower('descriptor.pb.go:41') OR ` +
+				`lower(source_file) LIKE lower('%/descriptor.pb.go:41') OR ` +
+				`lower(line) LIKE lower('%descriptor.pb.go:41%')))`},
 
 		// It composes inside the statement's ONE search function, which is the
 		// whole reason source_file is in the same inverted index group as msg,
-		// line and kv rather than beside it in an index of its own. Measured, 15.
+		// line and kv. The filter rides along as the fragment's residual, so it
+		// lands beside the merged call rather than spending a second one.
+		// Measured, 15.
 		{"beside a text term", line, "compaction_runner.rs:360 candidates",
-			`query('((line:"compaction_runner.rs:360") OR ` +
-				`(source_file:"compaction_runner.rs:360")) AND (line:candidates)')`},
+			`(query('((line:"compaction_runner.rs:360") OR ` +
+				`(source_file:"compaction_runner.rs:360")) AND (line:candidates)') AND ` +
+				posFilter + `)`},
 		{"beside a column filter", line, "compaction_runner.rs:360 level:INFO",
-			`(query('(line:"compaction_runner.rs:360") OR ` +
-				`(source_file:"compaction_runner.rs:360")') AND lower(level) = lower('INFO'))`},
-		// Negation keeps the position inside the same call. Measured 15: the 30
+			`((` + posIdx + ` AND ` + posFilter + `) AND lower(level) = lower('INFO'))`},
+		// A residual cannot travel under a NOT, so the leaf falls back to the
+		// filter alone — which is exact, and needs no anti-join at all. 15: the 30
 		// rows saying "compaction candidates" minus the 15 at line 360.
 		{"excluded beside a term", line, "candidates -compaction_runner.rs:360",
-			`query('(line:candidates) NOT ((line:"compaction_runner.rs:360") OR ` +
-				`(source_file:"compaction_runner.rs:360"))')`},
-		// Excluded alone it is an anti-join, exactly as any other lone exclusion
-		// is: 8,142 - 15 = 8,127, measured.
+			`(query('line:candidates') AND COALESCE(NOT (` + posFilter + `), TRUE))`},
+		// Excluded alone, the same: 8,142 - 15 = 8,127, measured. The search
+		// function is gone, so the anti-join it used to need is gone with it.
 		{"excluded alone", line, "-compaction_runner.rs:360",
-			`_row_id NOT IN (SELECT _row_id FROM logs.k8s_logs ` +
-				`WHERE query('(line:"compaction_runner.rs:360") OR ` +
-				`(source_file:"compaction_runner.rs:360")'))`},
-		// ORed with a column filter the whole disjunct moves into a row-key
-		// subquery, because a search function left in a disjunction prunes the
-		// scan and takes the other branch with it. Nothing about that is specific
-		// to this rule; the point of the case is that the expansion reaches it.
+			`COALESCE(NOT (` + posFilter + `), TRUE)`},
+		{"NOT before a bare name", line, "NOT compaction_runner.rs",
+			`COALESCE(NOT (` + nameFilter + `), TRUE)`},
+		// Under an OR a residual would filter the other disjunct, so the leaf is
+		// spent as the filter — and the row-key subquery the search function used
+		// to need disappears too. 4,818 ERROR rows + 15 = 4,833, measured.
 		{"ORed with a column filter", line, "compaction_runner.rs:360 OR level:ERROR",
-			`(_row_id IN (SELECT _row_id FROM logs.k8s_logs ` +
-				`WHERE query('(line:"compaction_runner.rs:360") OR ` +
-				`(source_file:"compaction_runner.rs:360")')) ` +
-				`OR lower(level) = lower('ERROR'))`},
+			`(` + posFilter + ` OR lower(level) = lower('ERROR'))`},
 
-		// A wildcard in the line number asks for a run of lines. It cannot be one
-		// token — the value carries `.` and `:` — so both halves keep the
-		// substring reading, which is what the existing wildcard rule already
-		// does for a pattern that spans tokens. Measured 15, the same as the
-		// exact position, because 360 is the only 36x line in the window.
+		// A wildcard cannot be spelled inside query(), so the filter is the whole
+		// answer — and it is anchored, where the old form was an unanchored
+		// substring on both columns. 15, the same as the exact position, because
+		// 360 is the only 36x line in the window.
 		{"a wildcard line number", line, "compaction_runner.rs:36*",
-			`(lower(line) LIKE lower('%compaction\\_runner.rs:36%') OR ` +
-				`lower(source_file) LIKE lower('%compaction\\_runner.rs:36%'))`},
-		// Boost rides along inside the one call, as it does on any text term.
-		// Measured 15, and the rows are unchanged — a boost only reorders score().
+			`(lower(source_file) LIKE lower('compaction\\_runner.rs:36%') OR ` +
+				`lower(source_file) LIKE lower('%/compaction\\_runner.rs:36%') OR ` +
+				`lower(line) LIKE lower('%compaction\\_runner.rs:36%'))`},
+		// Boost wraps the whole union rather than each half. Verified legal and
+		// row-identical: 15 either way, since a boost only reorders score().
 		{"boost", line, "compaction_runner.rs:360^2",
-			`query('((line:"compaction_runner.rs:360")^2) OR ` +
-				`((source_file:"compaction_runner.rs:360")^2)')`},
+			`(query('((line:"compaction_runner.rs:360") OR ` +
+				`(source_file:"compaction_runner.rs:360"))^2') AND ` + posFilter + `)`},
 		// Fuzziness is dropped, and only on the spelling that carries a colon:
 		// match()'s query text is parsed as `field:value`, so the position form is
 		// [1903] Field does not exist while the name form is a working match().
-		// See dropFuzzOnPosition.
 		{"fuzziness on a position is dropped", line, "compaction_runner.rs:360~2",
-			`query('(line:"compaction_runner.rs:360") OR ` +
-				`(source_file:"compaction_runner.rs:360")')`},
-		// A fuzzy NAME keeps its ~N, and a fuzzy term is a search function in its
-		// own right — so the two halves need a scan each, which is what the
-		// row-key subqueries are. Measured 30.
+			`(` + posIdx + ` AND ` + posFilter + `)`},
+		// A fuzzy NAME keeps its ~N and keeps the approximate path: a literal
+		// filter beside an edit-distance match would delete the rows the edit
+		// distance was for. Two search functions, so two scans. Measured 30.
 		{"fuzziness on a name is kept", line, "compaction_runner.rs~1",
 			`(_row_id IN (SELECT _row_id FROM logs.k8s_logs ` +
 				`WHERE match(line, 'compaction_runner.rs', 'fuzziness=1')) ` +
 				`OR _row_id IN (SELECT _row_id FROM logs.k8s_logs ` +
 				`WHERE match(source_file, 'compaction_runner.rs', 'fuzziness=1')))`},
+		// Only the VALUE is quoted here, so the term is still a file position.
+		{"a quoted line number", line, `compaction_runner.rs:"360"`,
+			`(` + posIdx + ` AND ` + posFilter + `)`},
 
 		// The same two spellings against a schema whose file column is a plain
-		// VARCHAR outside the index. An equality is the wrong reading of both,
-		// because the column holds the whole call site: measured, these return the
-		// same 15 and 30 as the indexed forms above.
-		{"a position on a plain column", plain, "compaction_runner.rs:360",
-			`(_row_id IN (SELECT _row_id FROM logs.k8s_logs ` +
-				`WHERE query('msg:"compaction_runner.rs:360"')) ` +
-				`OR lower(source_file) LIKE lower('%compaction\\_runner.rs:360%'))`},
-		{"a name on a plain column", plain, "compaction_runner.rs",
-			`(_row_id IN (SELECT _row_id FROM logs.k8s_logs ` +
-				`WHERE query('msg:compaction_runner.rs')) ` +
-				`OR lower(source_file) LIKE lower('%compaction\\_runner.rs%'))`},
+		// VARCHAR outside every index. There is no search function to prune with,
+		// so the filter is the whole predicate — exact, and a scan. Measured, the
+		// same 15 and 30 as the indexed preset.
+		{"a position on a plain column", plain, "compaction_runner.rs:360", posPlain},
+		{"a name on a plain column", plain, "compaction_runner.rs", namePlain},
+		{"a plain column composes with a text term", plain,
+			"compaction_runner.rs:360 candidates",
+			`(` + posPlain + ` AND query('msg:candidates'))`},
 	}
 
 	for _, tc := range cases {
@@ -369,11 +392,13 @@ func TestDeclaredNamesOutrankTheFileShape(t *testing.T) {
 	if got := mustCompile(t, "worker.go:12", s); !strings.Contains(got, "kv['worker.go']") {
 		t.Errorf("a declared bag key must keep its lookup, got %s", got)
 	}
-	// An undeclared file name still expands, and onto the deployment's own column
-	// name rather than a hardcoded one.
-	want := `query('(body:"peer.rs:360") OR (caller:"peer.rs:360")')`
+	// An undeclared file name still compiles, and onto the deployment's own column
+	// names rather than hardcoded ones — in the search function and in the filter.
+	want := `(query('(body:"peer.rs:360") OR (caller:"peer.rs:360")') AND ` +
+		`(lower(caller) = lower('peer.rs:360') OR lower(caller) LIKE lower('%/peer.rs:360') OR ` +
+		`lower(body) LIKE lower('%peer.rs:360%')))`
 	if got := mustCompile(t, "peer.rs:360", s); got != want {
-		t.Errorf("expansion should name the declared role\n got: %s\nwant: %s", got, want)
+		t.Errorf("compilation should name the declared role\n got: %s\nwant: %s", got, want)
 	}
 }
 
@@ -390,8 +415,12 @@ func TestSourceFileRoleOnTheDefaultField(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := mustCompile(t, "peer.rs:360", s); got != `query('body:"peer.rs:360"')` {
-		t.Errorf("one field means one clause, got %s", got)
+	// One clause in the search function, and one disjunct in the filter: if the
+	// file column IS the prose surface then a mention and an emission are the same
+	// row, so the substring test is the whole of the union.
+	want := `(query('body:"peer.rs:360"') AND (lower(body) LIKE lower('%peer.rs:360%')))`
+	if got := mustCompile(t, "peer.rs:360", s); got != want {
+		t.Errorf("one field means one clause\n got: %s\nwant: %s", got, want)
 	}
 }
 
@@ -459,12 +488,13 @@ func TestSourceFileRoleIsChecked(t *testing.T) {
 		t.Errorf("a numeric role must be refused, got %v", err)
 	}
 
-	// Both usable kinds load, and the SQL says which one it got: a token search
-	// inside the one query() call, or a substring scan beside it.
+	// Both usable kinds load, and the SQL says which one it got: a search function
+	// that prunes with a filter that refines, or the filter alone.
+	filter := `(lower(caller) = lower('peer.rs:360') OR ` +
+		`lower(caller) LIKE lower('%/peer.rs:360') OR lower(body) LIKE lower('%peer.rs:360%'))`
 	for kind, want := range map[string]string{
-		"text": `query('(body:"peer.rs:360") OR (caller:"peer.rs:360")')`,
-		"string": `(_row_id IN (SELECT _row_id FROM t WHERE query('body:"peer.rs:360"')) OR ` +
-			`lower(caller) LIKE lower('%peer.rs:360%'))`,
+		"text":   `(query('(body:"peer.rs:360") OR (caller:"peer.rs:360")') AND ` + filter + `)`,
+		"string": filter,
 	} {
 		s, notes, err := base(kind).Schema()
 		if err != nil {
@@ -519,13 +549,26 @@ func TestSourceFileExtensionIsStructural(t *testing.T) {
 	s := K8sLogsLine()
 	for _, tc := range []struct{ q, want string }{
 		{"db_impl_compaction_flush.cc:1042",
-			`query('(line:"db_impl_compaction_flush.cc:1042") OR ` +
-				`(source_file:"db_impl_compaction_flush.cc:1042")')`},
+			`(query('(line:"db_impl_compaction_flush.cc:1042") OR ` +
+				`(source_file:"db_impl_compaction_flush.cc:1042")') AND ` +
+				`(lower(source_file) = lower('db_impl_compaction_flush.cc:1042') OR ` +
+				`lower(source_file) LIKE lower('%/db\\_impl\\_compaction\\_flush.cc:1042') OR ` +
+				`lower(line) LIKE lower('%db\\_impl\\_compaction\\_flush.cc:1042%')))`},
 		{"handler.py:88",
-			`query('(line:"handler.py:88") OR (source_file:"handler.py:88")')`},
+			`(query('(line:"handler.py:88") OR (source_file:"handler.py:88")') AND ` +
+				`(lower(source_file) = lower('handler.py:88') OR ` +
+				`lower(source_file) LIKE lower('%/handler.py:88') OR ` +
+				`lower(line) LIKE lower('%handler.py:88%')))`},
 		{"Server.java:12",
-			`query('(line:"Server.java:12") OR (source_file:"Server.java:12")')`},
-		{"main.c:5", `query('(line:"main.c:5") OR (source_file:"main.c:5")')`},
+			`(query('(line:"Server.java:12") OR (source_file:"Server.java:12")') AND ` +
+				`(lower(source_file) = lower('Server.java:12') OR ` +
+				`lower(source_file) LIKE lower('%/Server.java:12') OR ` +
+				`lower(line) LIKE lower('%Server.java:12%')))`},
+		{"main.c:5",
+			`(query('(line:"main.c:5") OR (source_file:"main.c:5")') AND ` +
+				`(lower(source_file) = lower('main.c:5') OR ` +
+				`lower(source_file) LIKE lower('%/main.c:5') OR ` +
+				`lower(line) LIKE lower('%main.c:5%')))`},
 	} {
 		if got := mustCompile(t, tc.q, s); got != tc.want {
 			t.Errorf("CompileString(%q)\n got: %s\nwant: %s", tc.q, got, tc.want)
@@ -533,30 +576,78 @@ func TestSourceFileExtensionIsStructural(t *testing.T) {
 	}
 }
 
-// The expansion must be a strict superset of what the default surface answered
-// before, which is what makes a loose shape rule affordable: a term the rule
-// takes for a file and which is not one still finds everything it used to.
+// The compiler must land on the SQL oracle, not near it. This is the test the
+// first version of this rule would have failed: it emitted the search function
+// alone, which is a token search, and the analyzer splits on `_` as well as `.` —
+// so `manager.go` answered for every `*_manager.go` in the table.
 //
-// Asserted structurally rather than by row count — the pre-fix clause has to
-// appear verbatim inside the post-fix predicate — so it holds for every term
-// rather than for the ones somebody thought to count.
-func TestSourceFileExpansionCannotLoseRows(t *testing.T) {
-	with := K8sLogsLine()
-	without := K8sLogsLine()
-	without.SourceFile = ""
+// Measured over `ts < '2026-08-20 16:25:00'` (1,292,338 rows), oracle computed in
+// pure SQL with no compiler in the loop:
+//
+//	term                      token union   oracle   this compiler
+//	manager.go                    514,446    1,590           1,590
+//	client.go                      41,086   17,487          17,487
+//	compaction_runner.rs            3,790    3,790           3,790
+//	compaction_runner.rs:360        1,571    1,571           1,571
+//	server.go:342                   1,720    1,720           1,720
+//
+// The structural half of that is what this test can assert: the predicate has to
+// contain an ANCHORED comparison on the role's column — a prefix for a name, an
+// equality for a position — because an unanchored one is how the over-match got
+// in. A token clause on its own is not enough.
+func TestSourceFileIsExact(t *testing.T) {
+	s := K8sLogsLine()
+	for _, tc := range []struct{ q, anchored string }{
+		{"manager.go", `lower(source_file) LIKE lower('manager.go%')`},
+		{"client.go", `lower(source_file) LIKE lower('client.go%')`},
+		{"compaction_runner.rs", `lower(source_file) LIKE lower('compaction\\_runner.rs%')`},
+		{"compaction_runner.rs:360", `lower(source_file) = lower('compaction_runner.rs:360')`},
+		{"server.go:342", `lower(source_file) = lower('server.go:342')`},
+	} {
+		got := mustCompile(t, tc.q, s)
+		if !strings.Contains(got, tc.anchored) {
+			t.Errorf("CompileString(%q) has no anchored file comparison (%s):\n%s",
+				tc.q, tc.anchored, got)
+		}
+		// The path form is what keeps this honest on a deployment whose collector
+		// stores `components/raftstore/src/peer.rs:100`; the role promises a call
+		// site, not a basename.
+		if !strings.Contains(got, `lower(source_file) LIKE lower('%/`) {
+			t.Errorf("CompileString(%q) has no path-form comparison:\n%s", tc.q, got)
+		}
+	}
+}
 
+// The text half is a literal substring, which is NARROWER than the analyzed match
+// the search function makes, and that is a deliberate trade rather than a side
+// effect.
+//
+// It changes exactly one of the nine terms measured: `client.go` is 16,501 rows
+// through the index and 11,769 as a literal over `ts < '2026-08-20 16:25:00'`, and
+// every one of the 4,732 rows it drops carries `client-go` rather than
+// `client.go` — `/go/pkg/mod/k8s.io/client-go` (3,548),
+// `github.com/tikv/client-go/v2/tikv.` (852), `pkg/mod/k8s.io/client-go` (230),
+// `k8s.io/client-go/informers/factory.go` (79) and
+// `/gomodcache/k8s.io/client-go` (23), which is 4,732 exactly.
+//
+// The analyzer treats `-` and `.` as the same separator, so it cannot tell the Go
+// MODULE from the FILE; the literal comparison can. What this test pins is that
+// the text surface is still searched at all — the file column must never become
+// the only one, because a logfmt collector leaves the call site in the message and
+// `factory.go` is 6,887 rows of exactly that.
+func TestSourceFileKeepsTheTextSurface(t *testing.T) {
+	s := K8sLogsLine()
 	for _, q := range []string{
 		"foo.bar", "example.com", "k8s_logs.ts", "us-west-2.compute.internal",
 		"client.go", "factory.go", "compaction_runner.rs", "handler.py",
+		"warnings.go:110", "compaction_runner.rs:360",
 	} {
-		base := mustCompile(t, q, without)
-		got := mustCompile(t, q, with)
-		inner := strings.TrimSuffix(strings.TrimPrefix(base, "query('"), "')")
-		if inner == base {
-			t.Fatalf("%q: baseline is not a single query() call: %s", q, base)
+		got := mustCompile(t, q, s)
+		if !strings.Contains(got, "line:") {
+			t.Errorf("CompileString(%q) does not search the text surface:\n%s", q, got)
 		}
-		if !strings.Contains(got, inner) {
-			t.Errorf("%q drops the pre-fix clause %q:\n got: %s", q, inner, got)
+		if !strings.Contains(got, "lower(line) LIKE") {
+			t.Errorf("CompileString(%q) has no literal test on the text surface:\n%s", q, got)
 		}
 	}
 }

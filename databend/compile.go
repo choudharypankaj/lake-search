@@ -1427,10 +1427,12 @@ func (c *compiler) render(n parser.Node) (fragment, error) {
 		// A source file position is neither a field lookup nor a term on the
 		// default surface alone: the collector puts it in a column of its own for
 		// one log format and leaves it in the text for another, and both formats
-		// are in one table. It expands into a disjunction over the two. See
-		// sourcefile.go.
-		if n := c.sourceFileNode(t); n != nil {
-			return c.render(n)
+		// are in one table. It compiles to a search over both, made exact by a
+		// literal comparison beside it. See sourcefile.go.
+		if f, ok, err := c.sourceFileFragment(t); err != nil {
+			return fragment{}, err
+		} else if ok {
+			return f, nil
 		}
 		return c.term(t)
 	case *parser.Range:

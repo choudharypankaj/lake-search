@@ -137,7 +137,7 @@ and their disjunction 118,896 — the union to the row.
 | `and`, `or`, `not` — any case | an operator only where an operator is **grammatical**: `and`, `or`, `&&` and `\|\|` between two terms, `NOT` before a term. Anywhere else — the whole query, a field's value, the only thing inside a `field:(…)` group, leading with nothing to its left — it is the word the user typed, matched by a word-boundary scan; read as an operator there, `msg:(not)` and a bare `not` compiled to a filter that matched everything. `NOT` is the one that must be capitalised, because it **inverts** the term it takes while `and`/`or` only join terms that keep their own meaning either way: `msg:(not ready)` is the two words, `msg:(NOT ready)` is the complement of `ready` — 3,537 rows against 711,157 over `ts < '2026-08-19 08:00:00'` (715,185 rows). A *trailing* `and`/`or` is dropped rather than demoted — `region or` is someone mid-keystroke, so it still returns `region`. The cost of the word reading, stated rather than hidden: on a single-valued column `level:(error not warn)` is three ANDed equalities and can never match — write `level:(error -warn)` or `level:(error NOT warn)` |
 | `term^2` | `(col:term)^2` inside the one `query()` — reorders `score()`, matches the same rows |
 | `/re/`, `field:/re/` | `col RLIKE 're'` — not a search function, but no index serves it |
-| `file.rs:360`, `file.rs` | a source **file position**: `query('(line:"file.rs:360") OR (source_file:"file.rs:360")')` — one call, both surfaces, because the collector parses the position out of a bracket-format line into its own column and leaves it in the text of a logfmt one. Read as `field:value` it was a bag key nothing writes, and 0 rows. Needs a declared `source_file` role; without one nothing changes |
+| `file.rs:360`, `file.rs` | a source **file position**: `query('(line:…) OR (source_file:…)') AND (source_file = 'file.rs:360' OR source_file LIKE '%/file.rs:360' OR line LIKE '%file.rs:360%')` — one call over both surfaces to prune, a literal comparison to make it exact. Read as `field:value` it was a bag key nothing writes, and 0 rows; read as a token search alone it was 40% of the table. Needs a declared `source_file` role; without one nothing changes |
 | `field:value` | `lower(field) = lower('value')` — there is no case-insensitive `=` here |
 | `field:(a OR b)` | the group compiles under the field: SQL on a plain column, one `query()` on the text one |
 | `-field:value` | `COALESCE(NOT (…), TRUE)` — so `x` and `-x` partition the table |
@@ -614,7 +614,43 @@ comment nobody sees.
 
 A schema that declares the **`source_file` role** gets both spellings compiled against the field that
 holds a call site. `name.ext` is a file name, `name.ext:digits` is a file position, and each is
-searched in the default surface **and** in that field, ORed inside the statement's one `query()` call.
+searched in the default surface **and** in that field — one `query()` call that PRUNES the scan, with
+a literal comparison ANDed on top that makes the answer EXACT:
+
+```sql
+query('(line:"manager.go:124") OR (source_file:"manager.go:124")')
+  AND (lower(source_file) = lower('manager.go:124')
+       OR lower(source_file) LIKE lower('%/manager.go:124')
+       OR lower(line) LIKE lower('%manager.go:124%'))
+```
+
+Both halves are load-bearing. `source_file:` is a **token** search and this analyzer splits on `_` as
+well as `.`, so the search function alone answers for every file whose name *ends* with the one you
+typed: over `ts < '2026-08-20 16:25:00'` (1,292,338 rows) `query('source_file:manager.go')` is
+**513,055** rows — 40% of the table — of which 199 are that file and 512,856 are `*_manager.go`
+(199 + 512,856 = 513,055 exactly). The literal comparison cannot prune, and the search function
+cannot anchor; together they land on the oracle. Measured against a SQL truth computed with no
+compiler in the loop:
+
+| bare term | search function alone | this compiler | SQL oracle |
+| --- | --- | --- | --- |
+| `manager.go` | 514,446 | **1,590** | 1,590 |
+| `client.go` | 41,086 | **17,487** | 17,487 |
+| `compaction_runner.rs` | 3,790 | **3,790** | 3,790 |
+| `compaction_runner.rs:360` | 1,571 | **1,571** | 1,571 |
+| `server.go:342` | 1,720 | **1,720** | 1,720 |
+| `tidb_monitor_controller.go:101` | 7,752 | **7,752** | 7,752 |
+
+Eleven terms were checked on both presets, 22 of 22 exact. The refinement roughly doubles a
+sub-second query and the search function still earns its place: for `compaction_runner.rs`, 0.12s for
+the search function alone (wrong), **0.24s** for search-plus-filter, 0.39s for the filter with no
+search function, best of three over the same window. On the plain-column preset exactness is free —
+0.15s before, 0.16s after — because there was no search function to keep.
+
+The `%/X` disjuncts are what keep this honest on a deployment whose collector stores a path
+(`components/raftstore/src/peer.rs:100`): the role promises a call site, not a basename. And
+`LIKE 'X%'` rather than `LIKE 'X:%'` assumes nothing about the separator, so `file.rs:360`,
+`file.rs 360` and a bare `file.rs` all match.
 
 **It is a union rather than a redirect, and this table is what refuses the redirect.** Three log
 formats arrive here and they do not agree on where the call site ends up. Measured over the closed
@@ -633,9 +669,13 @@ The bracket format has its position parsed out, so only `source_file` holds it. 
 is empty and the position survives in the bag and therefore in `line`. 143 of those 8,142 rows carry
 a `.rs`/`.go` file-shaped token in `line`, so this is not a corner; over the wider closed window
 `[2026-08-20 00:00:00, 16:00:00)` (286,604 rows) `factory.go` is 2,559 in the text against 0 in the
-column and `warnings.go` splits 1,280 against 128. The union is a strict superset of what the default
-surface answered before, and the two sides are disjoint wherever both are non-zero — 1,280 + 128 =
-1,408 and 19 + 16 = 35, measured.
+column and `warnings.go` splits 1,280 against 128, the two sides disjoint wherever both are non-zero
+— 1,280 + 128 = 1,408 and 19 + 16 = 35, measured.
+
+The text half is therefore never *absent*, but it is no longer a strict superset of what a bare term
+answered before: the literal comparison described below narrows it, deliberately and in one measured
+family. What is pinned structurally is presence, not size — see
+`TestSourceFileKeepsTheTextSurface`.
 
 **The shape rule is structural, not a list of known extensions.** `name.ext` needs name segments of
 file-name characters and an **all-letters** extension, so `10.0.0.1`, `192.168.176.28` and `v8.5.7`
@@ -655,16 +695,30 @@ by column or prefix (`kv.compaction_runner.rs:360` is the bag), or a bag key dec
 that spelling. Quotes narrow the search back to the text surface, which is what makes them the escape
 hatch — `"compaction_runner.rs:360"` is the message and nothing else — and so does naming a field.
 
-**What the token search costs.** `source_file:` is a token search and this analyzer splits on `_` as
-well as `.`, so a name that *ends* another name matches both. Over `ts < '2026-08-20 16:25:00'`
-(1,292,338 rows) `query('source_file:manager.go')` is 513,055 rows, of which 199 are that file and
-512,856 are `*_manager.go` — 199 + 512,856 = 513,055 exactly, so the whole excess is the suffix
-family. This is not new: the explicitly-scoped `source_file:manager.go` has answered exactly that
-since the column joined the index group, and what the expansion does is make the bare spelling agree
-with the scoped one. The exact alternative, `source_file LIKE 'manager.go:%'`, is refused because it
-is anchored at character 0 and the role promises only that the field holds a call site — a deployment
-storing `components/raftstore/src/peer.rs:100` would get **0** rows from it, which is the silent zero
-this rule exists to remove. The warning says which reading was used.
+**The text half is an intersection, and that is the point.** The prose disjunct is
+`line LIKE '%X%'` ANDed with the analyzed match beside it, because neither test is right alone and
+their blind spots are opposite. The **analyzer** splits on `-` and `.` alike, so it cannot tell the Go
+module `client-go` from the file `client.go`: `query('line:client.go')` is 16,501 rows and the literal
+11,769, and all 4,732 it drops carry `client-go` — `/go/pkg/mod/k8s.io/client-go` (3,548),
+`github.com/tikv/client-go/v2/tikv.` (852), `pkg/mod/k8s.io/client-go` (230),
+`k8s.io/client-go/informers/factory.go` (79), `/gomodcache/k8s.io/client-go` (23), summing to 4,732
+exactly. The **literal** has no word boundaries, so it cannot tell `grpcutil.go` from `util.go`,
+`leaderelection.go` from `election.go`, `sysinfo.go` from `info.go`, `terror.go` from `error.go`,
+`runtime.goexit` from `runtime.go`, or `main.go:1542` from `main.go:154`. Together they reject both
+families.
+
+Which is why the exactness claim is checked against every value the table has, not a handful:
+compiled and executed for all **971** distinct `source_file` values and all **262** distinct
+basenames over `ts < '2026-08-20 16:25:00'`, the answer equals
+`source_file LIKE 'X%' OR line LIKE '%X%'` for **963** and **250** of them, with **zero**
+over-matches — and every one of the 20 differences is that oracle being wrong (13 substring artifacts
+from the list above; the other 7 are the two holes recorded below). ANDing a filter onto a search
+function is only safe if the search function covers it, so that was checked too: for all 1,233 values,
+`count(anchored)` equals `count(anchored AND query(…))` — the file half loses nothing.
+
+**The explicitly-scoped spellings are untouched.** `source_file:manager.go` typed by hand is still a
+token search and still 513,055 rows; only the spelling this rule owns is made exact. The warning says
+so, so nobody concludes the scoped form is a narrower way to ask.
 
 **Every expansion says so**, because searching a column the user did not name is exactly the class of
 thing this compiler warns about. In Grafana that warning is still a SQL comment

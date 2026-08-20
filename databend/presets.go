@@ -40,13 +40,16 @@ package databend
 //
 // The `source_file` role is declared even though the field is a plain column
 // here, and this preset is what demonstrates the half of the rule that does not
-// need an index. `compaction_runner.rs:360` is matched as a literal substring
-// rather than by token — a full scan of the column, and the compiler says so —
-// where the migrated preset below compiles it into the statement's one query()
-// call. Both are right; only one is cheap, and both return the same 15 rows over
-// [2026-08-20 16:00:00, 16:25:00). What neither can be is an equality: the column
-// holds the whole call site, so `source_file = 'compaction_runner.rs'` is zero
-// rows for every one of that file's 30 lines in that window.
+// need an index. With no inverted index on the column there is no search function
+// to prune with, so the literal comparison is the whole predicate — a scan, and the
+// compiler says so — where the migrated preset below puts a query() call in front
+// of the same comparison. Both are right and both return the same 15 rows over
+// [2026-08-20 16:00:00, 16:25:00); measured over `ts < '2026-08-20 16:25:00'` the
+// scan costs 0.28s against 0.15s for the token form it replaces, which answered
+// 514,443 rows instead of 1,587. What neither form can be is a bare equality on the
+// name: the column holds the whole call site, so
+// `source_file = 'compaction_runner.rs'` is zero rows for every one of that file's
+// 30 lines — which is why the comparison is a prefix.
 const k8sLogsDef = `{
   "table": "logs.k8s_logs",
   "default": "msg",
@@ -210,10 +213,13 @@ const k8sLogsDef = `{
 //	compaction_runner.rs:360    0 (bag key) ->  15 = that line
 //
 // Both compile into the one query() call the statement is allowed, as
-// `(line:…) OR (source_file:…)` — the position is searched in the message text
-// too, because a logfmt component leaves its call site there rather than in the
-// column, and searching one surface alone answers zero for the other. See
-// sourcefile.go, which carries the measurement that refuses the redirect.
+// `(line:…) OR (source_file:…)`, with a literal comparison ANDed on top. The
+// position is searched in the message text too, because a logfmt component leaves
+// its call site there rather than in the column, and searching one surface alone
+// answers zero for the other. The comparison is what makes it exact: `source_file:`
+// is a token search and this analyzer splits on `_`, so the search function alone
+// answers for every `*_manager.go` — 513,055 rows against a true 199 over
+// `ts < '2026-08-20 16:25:00'`. See sourcefile.go, which carries both measurements.
 //
 // # A divergence worth stating
 //
