@@ -293,18 +293,50 @@ func introVerify(args []string) int {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
-	findings := databend.Drift(shape, schema, sf.digest())
-	if len(findings) == 0 {
-		fmt.Printf("%s: no drift. %d columns and %d indexes, all declared.\n",
-			shape.Table, len(shape.Columns), len(shape.Indexes))
-		return 0
+	rep := databend.DriftDetail(shape, schema, sf.digest())
+
+	if len(rep.Drift) == 0 {
+		fmt.Printf("%s: no drift. %d columns, %d indexes and %d declared bag key(s), all "+
+			"accounted for.\n", shape.Table, len(shape.Columns), len(shape.Indexes),
+			declaredKeys(schema))
+	} else {
+		fmt.Printf("%s: %d drift finding(s).\n\n", shape.Table, len(rep.Drift))
+		for _, f := range rep.Drift {
+			fmt.Println("  \u2022", f)
+		}
 	}
-	fmt.Printf("%s: %d drift finding(s).\n\n", shape.Table, len(findings))
-	for _, f := range findings {
-		fmt.Println("  \u2022", f)
+
+	// Hazards print whether or not there is drift, and never change the
+	// verdict. They are standing facts rather than changes, so failing on them
+	// would make `verify` fail on every run against a correct descriptor — and
+	// a check that cries wolf gets turned off. Hiding them would be the silence
+	// this tool exists to remove, so they are said and not counted.
+	if len(rep.Hazards) > 0 {
+		fmt.Printf("\n%d standing hazard(s) — true now and when the descriptor was written, "+
+			"not drift:\n\n", len(rep.Hazards))
+		for _, h := range rep.Hazards {
+			fmt.Println("  ~", h)
+		}
+	}
+	if len(rep.Limits) > 0 {
+		fmt.Printf("\nWhat this check could NOT see:\n\n")
+		for _, l := range rep.Limits {
+			fmt.Println("  ?", l)
+		}
+	}
+	if len(rep.Drift) == 0 {
+		return 0
 	}
 	fmt.Println("\nRe-run `introspect probe` and `build` to regenerate, or edit the descriptor.")
 	return 1
+}
+
+func declaredKeys(s databend.Schema) int {
+	n := 0
+	for _, b := range s.Bags {
+		n += len(b.Keys)
+	}
+	return n
 }
 
 func readShape(path, table string) (databend.Shape, bool) {

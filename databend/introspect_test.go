@@ -1,6 +1,7 @@
 package databend
 
 import (
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -868,5 +869,623 @@ func TestNormaliseType(t *testing.T) {
 		if got := normaliseType(in); got != want {
 			t.Errorf("normaliseType(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The attribute bag was the one thing `verify` could not see: DESCRIBE does not
+// enumerate a VARIANT's keys, so a declared key that vanished, changed shape or
+// stopped casting was invisible. It is also the drift most likely to happen —
+// log formats change without anyone touching code — and its consequence is the
+// silent row drop this project exists to remove.
+//
+// Every assertion here is measured on logs.a2_bagdrift, a table built with two
+// eras: an older one where every declared key is present, clean and scalar, and
+// a recent one where latency_ms gained a unit suffix, gone_key stopped being
+// written, shape_key became an object, and retries stayed clean as a control.
+func TestBagDrift(t *testing.T) {
+	schema := mustSchemaFile(t, "../testdata/schema-bagdrift.json")
+	sh := mustShape(t, "../testdata/verify-bagdrift.txt", "logs.a2_bagdrift")
+	rep := DriftDetail(sh, schema, "")
+	got := strings.Join(rep.Drift, "\n")
+
+	for _, tc := range []struct{ name, want string }{
+		// A declared key that is no longer in the data: its typed comparisons
+		// match nothing, silently and forever.
+		{"key vanished", `declared key kv['gone_key'] appears in 0 of 7 rows`},
+		// A declared numeric key whose values stopped casting. The ratio, not a
+		// boolean: 2 of 7 and 3 of 250,036 want different reactions.
+		{"stopped casting", `only 2 of its 7 values cast`},
+		{"ratio is quantified", `(28.6%)`},
+		{"and says what is lost", `silently drops the other 5 rows`},
+		// Scalar to object: a path lookup means something different.
+		{"shape changed", `kv['shape_key'] is not a scalar on 7 of its 7 rows (7 object, 0 array)`},
+		// Shadowing: the shape that made `raw` answer nothing forever.
+		{"shadowed by a column", `kv['latency_ms'] exists on 12 rows and "latency_ms" is ALSO an undeclared column`},
+	} {
+		if !strings.Contains(got, tc.want) {
+			t.Errorf("%s: drift should mention %q; got:\n%s", tc.name, tc.want, got)
+		}
+	}
+
+	// The control. `retries` is present on every row, casts on every row and is
+	// a scalar, so it must produce nothing — otherwise the check is noise and
+	// gets turned off.
+	for _, line := range rep.Drift {
+		if strings.Contains(line, "retries") {
+			t.Errorf("retries is clean and must not be reported: %s", line)
+		}
+	}
+
+	// The windows have to be stated, because existence and ratio want different
+	// ones and a reader cannot judge the findings without knowing which.
+	limits := strings.Join(rep.Limits, "\n")
+	if !strings.Contains(limits, "statistics cover") || !strings.Contains(limits, "enumeration covers") {
+		t.Errorf("both windows must be reported: %v", rep.Limits)
+	}
+	if !strings.Contains(limits, "a new key is not drift") {
+		t.Errorf("the limits must say new keys are not reported: %v", rep.Limits)
+	}
+}
+
+// Each check must fail when it is reverted, which for a pure function over probe
+// text means mutating the text so the observation it reads goes away.
+func TestBagDriftChecksAreLoadBearing(t *testing.T) {
+	schema := mustSchemaFile(t, "../testdata/schema-bagdrift.json")
+	raw, err := os.ReadFile("../testdata/verify-bagdrift.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct{ name, from, to, gone string }{
+		// Present = 0 is the only thing that says a key vanished. Give it rows
+		// and the finding must disappear.
+		{"key vanished", "bagstat|kv|gone_key|7|0|0|0|0", "bagstat|kv|gone_key|7|7|0|0|0",
+			"gone_key"},
+		// All values casting is the only thing that clears a numeric key.
+		{"stopped casting", "bagstat|kv|latency_ms|7|7|2|0|0", "bagstat|kv|latency_ms|7|7|7|0|0",
+			"only 2 of its 7"},
+		// Zero objects and arrays is the only thing that clears a shape change.
+		{"shape changed", "bagstat|kv|shape_key|7|7|0|7|0", "bagstat|kv|shape_key|7|7|0|0|0",
+			"not a scalar"},
+		// The enumeration row is the only thing that reports shadowing.
+		{"shadowing", "bagname|kv|latency_ms|12", "bagname|kv|latency_ms|0", "exists on 12 rows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base, err := ParseShape(string(raw), "logs.a2_bagdrift")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !strings.Contains(strings.Join(Drift(base, schema, ""), "\n"), tc.gone) {
+				t.Fatalf("the finding is not present to begin with: %q", tc.gone)
+			}
+			mutated := strings.Replace(string(raw), tc.from, tc.to, 1)
+			if mutated == string(raw) {
+				t.Fatalf("fixture does not contain %q", tc.from)
+			}
+			sh, err := ParseShape(mutated, "logs.a2_bagdrift")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Join(Drift(sh, schema, ""), "\n"); strings.Contains(got, tc.gone) {
+				t.Errorf("%q should be gone once the observation is; got:\n%s", tc.gone, got)
+			}
+		})
+	}
+}
+
+// A shadowing key where the descriptor DOES declare the column is a standing
+// hazard, not drift — the field wins, which is documented precedence, so it is
+// not a wrong answer. Reporting it as drift would make `verify` fail on every
+// run against a correct descriptor, and a check that cries wolf gets turned off.
+//
+// Measured on the live table: kv['namespace'] exists on tens of thousands of
+// rows while `namespace` is a declared column, and kv['body'] on 3 while `body`
+// is a declared alias of `line`.
+func TestShadowingIsAHazardNotDrift(t *testing.T) {
+	line, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sh := mustShape(t, "../testdata/verify-k8s-logs.txt", "logs.k8s_logs")
+	rep := DriftDetail(sh, line, "")
+
+	if len(rep.Drift) != 0 {
+		t.Errorf("the no-drift control must stay quiet; got:\n  %s",
+			strings.Join(rep.Drift, "\n  "))
+	}
+	haz := strings.Join(rep.Hazards, "\n")
+	for _, want := range []string{"kv['namespace']", "kv['body']", "kv['node']", "kv['component']"} {
+		if !strings.Contains(haz, want) {
+			t.Errorf("hazards should mention %s; got:\n%s", want, haz)
+		}
+	}
+	// It has to say which side wins and how to reach the other, or it is a
+	// worry rather than information.
+	if !strings.Contains(haz, "The field wins") || !strings.Contains(haz, "kv.namespace:value") {
+		t.Errorf("the hazard must say which side wins and how to reach the rows: %s", haz)
+	}
+	// And it must not be counted as drift by the flat accessor either.
+	if len(Drift(sh, line, "")) != 0 {
+		t.Error("Drift() must return only things that changed")
+	}
+}
+
+// A descriptor with typed keys whose probe output has no bag section at all must
+// say the bag was not looked at, rather than reporting nothing and reading as a
+// clean bill of health.
+func TestBagNotProbedIsALimitNotSilence(t *testing.T) {
+	schema := mustSchemaFile(t, "../testdata/schema-bagdrift.json")
+	// The old two-section verify output, before the bag statements existed.
+	sh := mustShape(t, "../testdata/shape-k8s-logs.txt", "logs.k8s_logs")
+	sh.Table = "logs.a2_bagdrift"
+	rep := DriftDetail(sh, schema, "")
+	if !strings.Contains(strings.Join(rep.Limits, "\n"), "attribute bag was not probed") {
+		t.Errorf("an unprobed bag must be reported as a limit: %v", rep.Limits)
+	}
+}
+
+// The emitted statements have to be the ones that were measured, and the two
+// windows have to differ.
+func TestBagDriftProbeEmission(t *testing.T) {
+	line, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := BagDriftProbe(line, ProbeWindow{Hours: "24"}, ProbeWindow{})
+
+	if !strings.Contains(sql, "LATERAL FLATTEN(input => kv)") {
+		t.Error("the enumeration needs FLATTEN")
+	}
+	// Name-directed, not top-N: an exact IN list of the names the descriptor
+	// claims, and no LIMIT, so the output cannot be mistaken for "all the keys".
+	if !strings.Contains(sql, "WHERE lower(f.key) IN (") {
+		t.Error("the enumeration must be name-directed")
+	}
+	if strings.Contains(sql, "ORDER BY count(*) DESC;\nLIMIT") || strings.Contains(sql, "LIMIT 3") {
+		t.Error("the name enumeration must not be truncated")
+	}
+	// With no typed keys there is no per-key statement, so the marker must not
+	// claim a statistics window that measured nothing.
+	if !strings.Contains(sql, "bagwindow|stats|not measured") {
+		t.Error("with no typed keys the statistics window must say nothing was measured")
+	}
+	if !strings.Contains(sql, "bagwindow|enum|") || !strings.Contains(sql, "bagwindow|stats|") {
+		t.Error("both windows must be carried in the output")
+	}
+	// No bound whose upper edge has not happened yet.
+	if strings.Contains(sql, "ts < '") {
+		t.Error("an upper bound in the emitted probe risks an instant that has not happened")
+	}
+	// A bag with no typed keys emits no per-key statements, only the
+	// enumeration — the shipped preset declares none.
+	if strings.Contains(sql, "bagstat") {
+		t.Error("k8s-logs-line declares no typed keys, so no per-key statement should be emitted")
+	}
+
+	// With typed keys, one branch each, and the cap is announced when it bites.
+	withKeys := mustSchemaFile(t, "../testdata/schema-bagdrift.json")
+	sql = BagDriftProbe(withKeys, ProbeWindow{Hours: "24"}, ProbeWindow{})
+	for _, k := range []string{"gone_key", "latency_ms", "retries", "shape_key"} {
+		if !strings.Contains(sql, "bagstat|kv|"+k) {
+			t.Errorf("no statement for declared key %q", k)
+		}
+	}
+	if !strings.Contains(sql, "json_typeof(") {
+		t.Error("shape detection needs json_typeof")
+	}
+	// Now the statistics window is real and bounded, and the enumeration still
+	// is not — the two questions want different windows.
+	if !strings.Contains(sql, "subtract_hours(now(), 24)") {
+		t.Error("the per-key statistics window should be bounded and recent")
+	}
+	if strings.Count(sql, "subtract_hours(now(), 24)") != 4 {
+		t.Errorf("every per-key branch should carry the bound, got %d",
+			strings.Count(sql, "subtract_hours(now(), 24)"))
+	}
+
+	big := withKeys
+	big.Bags = []Bag{{Column: "kv", Keys: map[string]Kind{}}}
+	for i := 0; i < maxDeclaredKeysProbed+5; i++ {
+		big.Bags[0].Keys[fmt.Sprintf("k%03d", i)] = String
+	}
+	sql = BagDriftProbe(big, ProbeWindow{Hours: "24"}, ProbeWindow{})
+	if !strings.Contains(sql, "baglimit|") {
+		t.Error("a capped key list must say so in the output")
+	}
+	if n := strings.Count(sql, "bagstat|kv|"); n != maxDeclaredKeysProbed {
+		t.Errorf("emitted %d per-key statements, want the cap of %d", n, maxDeclaredKeysProbed)
+	}
+}
+
+// Paste fidelity has to keep working now that verify emits a third section.
+func TestVerifyOutputRefusesBadInput(t *testing.T) {
+	raw, err := os.ReadFile("../testdata/verify-bagdrift.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := string(raw)
+
+	if _, err := ParseShape(full, "logs.somewhere_else"); err == nil {
+		t.Error("a paste from another table must be refused")
+	}
+	cut := full[:strings.Index(full, ") ENGINE")]
+	if _, err := ParseShape(cut, "logs.a2_bagdrift"); err == nil {
+		t.Error("a truncated CREATE TABLE must be refused even with bag rows present")
+	}
+
+	// Noise tolerance: a client banner, box drawing, ANSI colour and a row
+	// count must not stop the bag rows parsing.
+	noisy := "Welcome to some client 1.2.3\n\x1b[32m+------+\x1b[0m\n" + full + "\n(12 rows)\n"
+	sh, err := ParseShape(noisy, "logs.a2_bagdrift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sh.BagKeys) != 4 {
+		t.Errorf("bag rows should survive noise: got %d", len(sh.BagKeys))
+	}
+	if sh.BagWindow == "" || sh.BagEnumWindow == "" {
+		t.Error("both windows should survive noise")
+	}
+}
+
+func mustSchemaFile(t *testing.T, path string) Schema {
+	t.Helper()
+	s, _, err := LoadSchema(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s
+}
+
+// A VARIANT key's SPELLING is its identity on this engine, so a declared key
+// must never be folded. Measured on the live table: kv['tableID'] is present on
+// 280,556 rows and kv['tableid'] on 0.
+//
+// Folding it made the bag-statistics probe ask about a key that does not exist,
+// so a descriptor correctly declaring `tableID` — one the tool GENERATED —
+// reported the key as vanished and exited 1. That is the cry-wolf failure the
+// whole check is premised on avoiding, and the library was making the exact
+// mistake its own advisory warns users about.
+func TestBagKeySpellingIsPreserved(t *testing.T) {
+	def := Def{
+		Table: "t", Default: "body", Time: "ts",
+		Indexes: []IndexDef{{Name: "i", Kind: "inverted", Columns: []string{"body"}}},
+		Fields: []FieldDef{
+			{Name: "body", Kind: "text"},
+			{Name: "ts", Kind: "timestamp"},
+		},
+		Bags: []BagDef{{Column: "kv", Keys: map[string]string{
+			"tableID": "number", "reconcileID": "string",
+		}}},
+	}
+	s, _, err := def.Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Stored exactly as declared. Under the fold these keys were `tableid` and
+	// `reconcileid`.
+	if _, ok := s.Bags[0].Keys["tableID"]; !ok {
+		t.Fatalf("the declared spelling must survive: %v", s.Bags[0].Keys)
+	}
+	if _, ok := s.Bags[0].Keys["tableid"]; ok {
+		t.Error("a folded spelling must NOT be stored")
+	}
+
+	// Looked up exactly. `tableID:5` gets the declared numeric kind; `tableid:5`
+	// is a different key and must not inherit it, because the subscript the
+	// Field carries is built from the name the user typed.
+	if got := mustCompile(t, "tableID:5", s); got != "TRY_CAST(kv['tableID']::VARCHAR AS DOUBLE) = 5" {
+		t.Errorf("declared spelling: %s", got)
+	}
+	if got := mustCompile(t, "tableid:5", s); strings.Contains(got, "TRY_CAST") {
+		t.Errorf("a differently-cased key must not inherit the declaration: %s", got)
+	}
+
+	// And the probe asks about the declared spelling, which is the half that
+	// was broken.
+	sql := BagDriftProbe(s, ProbeWindow{Hours: "24"}, ProbeWindow{})
+	if !strings.Contains(sql, "kv['tableID']") {
+		t.Error("the probe must subscript the declared spelling")
+	}
+	if strings.Contains(sql, "kv['tableid']") {
+		t.Error("the probe must not subscript a folded spelling")
+	}
+	if !strings.Contains(sql, "bagstat|kv|tableID") {
+		t.Error("the marker must carry the declared spelling, or Drift cannot match the stat")
+	}
+
+	// End to end: the probe output a correct descriptor produces must report no
+	// drift. This is Agent 3's blocking case.
+	out := "lsprobe|v1|section|columns|t\nbody\tVARCHAR\tYES\tNULL\t\nts\tTIMESTAMP\tYES\tNULL\t\n" +
+		"kv\tVARIANT\tYES\tNULL\t\n" +
+		"lsprobe|v1|section|create|t\nt\t\"CREATE TABLE t (\n  body VARCHAR NULL,\n" +
+		"  ts TIMESTAMP NULL,\n  kv VARIANT NULL,\n" +
+		"  SYNC INVERTED INDEX i (body)\n) ENGINE=FUSE\"\n" +
+		"lsprobe|v1|section|bagkeys|t\n" +
+		"lsprobe|v1|bagwindow|stats|the last 24 hour(s) of ts\n" +
+		"lsprobe|v1|bagwindow|enum|no bound\n" +
+		"lsprobe|v1|bagstat|kv|tableID|300|300|300|0|0\n" +
+		"lsprobe|v1|bagstat|kv|reconcileID|300|300|0|0|0\n" +
+		"lsprobe|v1|bagname|kv|tableID|300\n" +
+		"lsprobe|v1|bagname|kv|reconcileID|300\n"
+	sh, err := ParseShape(out, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := Drift(sh, s, ""); len(got) != 0 {
+		t.Errorf("a correct camelCase descriptor must report no drift; got:\n  %s",
+			strings.Join(got, "\n  "))
+	}
+}
+
+// The other direction of the same fact: a hand-written descriptor that declares
+// the wrong case is a real and silent mistake, and it deserves its own sentence
+// rather than being reported as a key that vanished.
+func TestBagKeyCaseMismatchIsAHazard(t *testing.T) {
+	def := Def{
+		Table: "t", Default: "body", Time: "ts",
+		Indexes: []IndexDef{{Name: "i", Kind: "inverted", Columns: []string{"body"}}},
+		Fields: []FieldDef{
+			{Name: "body", Kind: "text"},
+			{Name: "ts", Kind: "timestamp"},
+		},
+		// Declared lowercase; the data has camelCase.
+		Bags: []BagDef{{Column: "kv", Keys: map[string]string{"tableid": "number"}}},
+	}
+	s, _, err := def.Schema()
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := "lsprobe|v1|section|columns|t\nbody\tVARCHAR\tYES\tNULL\t\nts\tTIMESTAMP\tYES\tNULL\t\n" +
+		"kv\tVARIANT\tYES\tNULL\t\n" +
+		"lsprobe|v1|section|create|t\nt\t\"CREATE TABLE t (\n  body VARCHAR NULL,\n" +
+		"  ts TIMESTAMP NULL,\n  kv VARIANT NULL,\n" +
+		"  SYNC INVERTED INDEX i (body)\n) ENGINE=FUSE\"\n" +
+		"lsprobe|v1|section|bagkeys|t\n" +
+		"lsprobe|v1|bagwindow|stats|the last 24 hour(s) of ts\n" +
+		"lsprobe|v1|bagwindow|enum|no bound\n" +
+		"lsprobe|v1|bagstat|kv|tableid|300|0|0|0|0\n" +
+		"lsprobe|v1|bagname|kv|tableID|300\n"
+	sh, err := ParseShape(out, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep := DriftDetail(sh, s, "")
+
+	// Not drift: the key did not vanish, it was misspelled.
+	for _, d := range rep.Drift {
+		if strings.Contains(d, "outlived it") {
+			t.Errorf("a case mismatch must not be reported as a vanished key: %s", d)
+		}
+	}
+	haz := strings.Join(rep.Hazards, "\n")
+	for _, want := range []string{
+		"kv['tableid'] is absent", "different case: kv['tableID'] on 300 rows",
+		"case-sensitive", `Re-declare it as "tableID"`,
+	} {
+		if !strings.Contains(haz, want) {
+			t.Errorf("the hazard should mention %q; got:\n%s", want, haz)
+		}
+	}
+
+	// Two spellings, both live. This is not hypothetical: on logs.k8s_logs
+	// kv['safepoint'] is present on 1,740 rows and kv['safePoint'] on 459, so a
+	// case-insensitive lookup has two right answers and must not pick one.
+	both := strings.Replace(out, "lsprobe|v1|bagname|kv|tableID|300\n",
+		"lsprobe|v1|bagname|kv|tableID|300\nlsprobe|v1|bagname|kv|TableID|7\n", 1)
+	shBoth, err := ParseShape(both, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hazBoth := strings.Join(DriftDetail(shBoth, s, "").Hazards, "\n")
+	for _, want := range []string{
+		"kv['TableID'] on 7 rows", "kv['tableID'] on 300 rows",
+		"There are 2 of them", "nothing can choose for you",
+	} {
+		if !strings.Contains(hazBoth, want) {
+			t.Errorf("with two candidate spellings the hazard should mention %q; got:\n%s",
+				want, hazBoth)
+		}
+	}
+	if strings.Contains(hazBoth, "Re-declare it as") {
+		t.Error("with two candidates it must not name one as though it were the answer")
+	}
+
+	// And a key that genuinely vanished — no spelling of it in the data — is
+	// still drift, or the hazard would swallow the real finding.
+	out2 := strings.Replace(out, "lsprobe|v1|bagname|kv|tableID|300\n", "", 1)
+	sh2, err := ParseShape(out2, "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(Drift(sh2, s, ""), "\n"); !strings.Contains(got, "outlived it") {
+		t.Errorf("a genuinely absent key must still be drift; got:\n%s", got)
+	}
+}
+
+// Every script this tool emits must survive the procedure this project documents
+// everywhere: strip `--` lines, then split on `;`.
+//
+// The `baglimit` marker did not. Its payload contained a semicolon, so the
+// statement was cut in half, both halves failed [1005], the cap was never
+// announced, and the operator got two spurious parse errors on an otherwise
+// clean probe — a marker whose entire job is to prevent a silent partial answer,
+// going silently missing.
+//
+// Asserted generically rather than for that one marker, so the next sentence
+// somebody writes into a literal cannot reintroduce it: every statement the
+// documented split produces must have balanced quotes.
+func TestEmittedScriptsSurviveTheDocumentedSplit(t *testing.T) {
+	line, _, err := Preset("k8s-logs-line")
+	if err != nil {
+		t.Fatal(err)
+	}
+	shape := mustShape(t, "../testdata/shape-k8s-logs.txt", "logs.k8s_logs")
+	prof, err := ProfileProbe(shape, ProbeWindow{Hours: "1"}, 32)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keys, err := BagKeyProfileProbe(shape, "kv", []string{"duration", "store_id"},
+		ProbeWindow{Hours: "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A schema whose typed-key count trips the cap, so the baglimit marker is
+	// actually in the corpus under test.
+	capped := line
+	capped.Bags = []Bag{{Column: "kv", Keys: map[string]Kind{}}}
+	for i := 0; i < maxDeclaredKeysProbed+5; i++ {
+		capped.Bags[0].Keys[fmt.Sprintf("k%03d", i)] = String
+	}
+
+	scripts := map[string]string{
+		"shape":    ShapeProbe("logs.k8s_logs"),
+		"profile":  prof,
+		"bagkeys":  keys,
+		"verify":   VerifyProbe(line),
+		"bagdrift": BagDriftProbe(capped, ProbeWindow{Hours: "24"}, ProbeWindow{}),
+	}
+	for name, script := range scripts {
+		t.Run(name, func(t *testing.T) {
+			for _, stmt := range splitLikeTheDocs(script) {
+				if strings.Count(stmt, "'")%2 != 0 {
+					t.Errorf("a statement has unbalanced quotes after the documented split, so "+
+						"a literal contains a semicolon:\n%s", stmt)
+				}
+			}
+		})
+	}
+
+	// And the cap text specifically must arrive whole, in one statement.
+	const want = "only the first 64 are checked"
+	found := 0
+	for _, stmt := range splitLikeTheDocs(scripts["bagdrift"]) {
+		if strings.Contains(stmt, want) {
+			found++
+		}
+	}
+	if found != 1 {
+		t.Errorf("the cap announcement should survive as exactly one statement, got %d", found)
+	}
+}
+
+// splitLikeTheDocs is the procedure every instruction in this project specifies:
+// strip comment lines, then split on `;`.
+func splitLikeTheDocs(script string) []string {
+	var kept []string
+	for _, l := range strings.Split(script, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(l), "--") {
+			continue
+		}
+		kept = append(kept, l)
+	}
+	var out []string
+	for _, stmt := range strings.Split(strings.Join(kept, " "), ";") {
+		if strings.TrimSpace(stmt) != "" {
+			out = append(out, stmt)
+		}
+	}
+	return out
+}
+
+// A window the report cannot see is reported as unseen, not explained away.
+//
+// The fallback previously asserted "this schema declares no time column", which
+// is false for a descriptor that declares one and whose marker was trimmed — and
+// it said it of the ENUMERATION window too, which is never time-bounded under
+// any circumstances. The reason is knowable only where the schema is in hand, so
+// the probe writes it into the marker and the report never guesses.
+func TestWindowFallbackDoesNotInventAReason(t *testing.T) {
+	withTime := mustSchemaFile(t, "../testdata/schema-bagdrift.json")
+	raw, err := os.ReadFile("../testdata/verify-bagdrift.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Strip both window markers, as an older or trimmed capture would.
+	var kept []string
+	for _, l := range strings.Split(string(raw), "\n") {
+		if !strings.Contains(l, "|bagwindow|") {
+			kept = append(kept, l)
+		}
+	}
+	sh, err := ParseShape(strings.Join(kept, "\n"), "logs.a2_bagdrift")
+	if err != nil {
+		t.Fatal(err)
+	}
+	limits := strings.Join(DriftDetail(sh, withTime, "").Limits, "\n")
+	if strings.Contains(limits, "declares no time column") {
+		t.Errorf("the report must not claim a reason it cannot know: %s", limits)
+	}
+	if !strings.Contains(limits, "not stated in this output") {
+		t.Errorf("an absent marker should say it is absent: %s", limits)
+	}
+
+	// Probe side, where the reason IS knowable: both cases, distinctly.
+	noTime := withTime
+	noTime.Time = ""
+	sql := BagDriftProbe(noTime, ProbeWindow{}, ProbeWindow{})
+	if !strings.Contains(sql, "this schema declares no time column") {
+		t.Error("with no time column the probe should say that is why it is unbounded")
+	}
+	sql = BagDriftProbe(withTime, ProbeWindow{}, ProbeWindow{})
+	if strings.Contains(sql, "declares no time column") {
+		t.Error("with a time column the probe must not claim there is none")
+	}
+	if !strings.Contains(sql, "no bound was requested") {
+		t.Errorf("it should say what actually happened: %s", sql)
+	}
+}
+
+// Both directions of the statistics window's blind spot must be disclosed. Only
+// the absence direction was, and the presence direction is the one that returns
+// a wrong answer rather than no answer: a key clean in the window and dirty
+// outside it reports nothing.
+func TestLimitsDiscloseBothDirections(t *testing.T) {
+	schema := mustSchemaFile(t, "../testdata/schema-bagdrift.json")
+	sh := mustShape(t, "../testdata/verify-bagdrift.txt", "logs.a2_bagdrift")
+	limits := strings.Join(DriftDetail(sh, schema, "").Limits, "\n")
+	for _, want := range []string{
+		"ABSENT from it may still exist in history",
+		"PRESENT and clean in it may be dirty outside it",
+		"a new key is not drift",
+	} {
+		if !strings.Contains(limits, want) {
+			t.Errorf("limits should disclose %q; got:\n%s", want, limits)
+		}
+	}
+}
+
+// A marker carrying the protocol's prefix and not its shape is refused, because
+// the point of tagging is that malformed input cannot be mistaken for a
+// measurement. An extra pipe field previously made the report say "statistics
+// cover enum; the enumeration covers stats".
+func TestMalformedBagWindowIsRefused(t *testing.T) {
+	raw, err := os.ReadFile("../testdata/verify-bagdrift.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, from, to string }{
+		{"extra field", "|bagwindow|stats|", "|bagwindow|stats|extra|"},
+		{"unknown scope", "|bagwindow|stats|", "|bagwindow|middle|"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mutated := strings.Replace(string(raw), tc.from, tc.to, 1)
+			if mutated == string(raw) {
+				t.Fatalf("fixture does not contain %q", tc.from)
+			}
+			_, err := ParseShape(mutated, "logs.a2_bagdrift")
+			if err == nil {
+				t.Fatal("a malformed bagwindow marker must be refused")
+			}
+			if !strings.Contains(err.Error(), "malformed") {
+				t.Errorf("unhelpful error: %v", err)
+			}
+		})
+	}
+	// Control: the unmutated fixture parses.
+	if _, err := ParseShape(string(raw), "logs.a2_bagdrift"); err != nil {
+		t.Fatalf("the valid fixture must still parse: %v", err)
 	}
 }

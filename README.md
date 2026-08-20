@@ -713,8 +713,127 @@ logs.k8s_logs: 1 drift finding(s).
 ```
 
 It reports the other directions too — a column the descriptor names and the table has lost, an index
-that grew or lost its filters, a moved column digest. Against the pre-migration `k8s-logs` preset the
+that grew or lost its filters, a column whose declared **type** changed, a STORED expression the table
+has redefined, and a moved column digest. Against the pre-migration `k8s-logs` preset the
 same live table gives four findings, two of them index growth.
+
+#### The attribute bag
+
+`DESCRIBE` does not enumerate a `VARIANT`'s keys, so a declared bag key that vanished, changed shape
+or stopped casting used to be invisible to drift detection. That is the drift **most likely to
+happen** — log formats change without anyone touching code — and its consequence is the silent row
+drop this whole project is about. `verify` emits a third section for it.
+
+Four things, measured on `logs.a2_bagdrift`, a table built with an older era where every declared key
+is present, clean and scalar, and a recent one where the writer changed:
+
+| finding | measured |
+| --- | --- |
+| a declared key is **no longer in the data** | `kv['gone_key']` in 0 of 7 rows — its typed comparisons match nothing, silently, forever |
+| a declared numeric key **stopped casting** | `kv['latency_ms']`: only **2 of 7** values cast (28.6%) — a bound drops the other 5 |
+| a declared key **stopped being a scalar** | `kv['shape_key']` is an object on 7 of 7 — `shape_key:value` compares against rendered JSON |
+| a key **shadows a column**, either direction | `kv['latency_ms']` on 12 rows *and* `latency_ms` is an undeclared column — the shape that made `raw` answer nothing |
+
+`kv['retries']` is present, clean and scalar throughout and is reported **nothing**, which is the
+half that matters: a check that cries wolf gets turned off.
+
+**What neither window sees.** A key clean *inside* the statistics window and dirty *outside* it
+reports nothing: 500 recent rows that cast and 500 older ones that do not is "no drift", while a bound
+on that key silently drops the older half. The Limits clause discloses both directions rather than
+just absence, and names the check that does see it — the compiler's own cast advisory fires on that
+query and hands over a count predicate. Run verbatim against a table built that way, it returns
+exactly the dropped rows.
+
+**Two windows, because the questions differ.** Per-key statistics are bounded and recent — "has this
+key stopped appearing" is a question about now, and an unbounded window answers it wrongly because a
+key abandoned an hour ago is still all over the history. The name enumeration is **unbounded**,
+because existence is not a question about now and a bounded window can hide a key entirely. Both are
+measured, both directions:
+
+| | recent 24h | unbounded |
+| --- | --- | --- |
+| `kv['gone_key']` present | **0 of 7** → drift | 5 of 12 → nothing |
+| `kv['latency_ms']` casts | **2 of 7** (28.6%) | 7 of 12 (58.3%) → understated |
+| `kv['body']` on the live table | 0 over `[00:00, 02:00)` → hazard **lost** | **3 rows** → hazard found |
+
+Both windows are carried in the probe's own output and read back from it, the way the value profile
+does, so neither can be laundered by a flag that defaulted differently. Neither has an upper edge in
+the future.
+
+**The enumeration is name-directed, not top-N.** It lists only keys whose names something in the
+descriptor already claims — a column, a field, an alias, a typed key — with an exact `IN` list. That
+is *complete* for the question rather than truncated, so its output can never read as "these are all
+the keys": it never claims to be about all keys. A top-N would be more expensive and less
+conclusive, because the dangerous shadowing key is a rare one — `kv['body']` is three rows — and that
+is exactly what a top-N drops. The per-key statements are capped at 64 per bag and say so when the cap
+bites.
+
+**New keys are not drift.** A schemaless bag gains keys constantly; reporting those would be noise.
+The signal is declared keys plus the shadowing hazard.
+
+**A bag key's spelling is its identity.** On this engine `kv['tableID']` and `kv['tableid']` are
+different keys — measured on the live table, the first is present on 282,718 rows and the second on
+**0** — so a declared key is stored, looked up and subscripted under the exact spelling the descriptor
+gives it. This is not a corner case: over the settled hour `[2026-08-20 02:00, 03:00)` the bag holds
+**78 distinct keys and 26 of them carry uppercase**, and the busiest key of the hour *is* `tableID`.
+The names are ordinary Go logger output — `controllerGroup`, `reconcileID`, `TiFlash`, `needWait`,
+`safePoint`, `startKey`, `indexID`.
+
+Folding is not merely wrong, it is **inexpressible**, and that is what rules out the tempting middle
+road of folding for lookup while keeping the original for SQL. Two live keys on this table differ only
+by case:
+
+| | rows |
+| --- | --- |
+| `kv['safepoint']` | 1,740 |
+| `kv['safePoint']` | 459 |
+
+A folded declaration cannot say which one it means, so a folding schema cannot describe this table at
+all — and a case-insensitive lookup over it has *two* right answers, which makes it an error or a
+warning rather than a silent pick.
+
+That is the opposite of how *field* names work, and the difference is deliberate:
+
+| | folded? | why |
+| --- | --- | --- |
+| field names | **yes** — `Level:error` is `level:error` | a field name is a label this library chose, and users type it how they like |
+| bag keys | **no** | the key is data, and the engine treats its case as identity, so folding one into the other silently retargets the lookup |
+
+Getting that wrong is how the check first failed: a descriptor correctly declaring `tableID` — one the
+introspector had *generated* — was probed as `kv['tableid']`, found nothing, and reported the key as
+vanished. The library was making the exact mistake its own compiler advisory warns users about.
+
+A declared spelling the data does not use is now a **hazard** with its own sentence, because that is a
+different mistake from a key going away and a person can make it by hand:
+
+```
+~ declared key kv['tableid'] is absent, but the data has kv['tableID'] on 5 rows — the same name in
+  a different case. VARIANT keys are case-sensitive on this engine, so the declaration reaches
+  nothing and `tableid:value` queries a key that does not exist. Re-declare it as "tableID"
+```
+
+When more than one spelling matches it names them all and refuses to choose, because on this table
+that situation is real:
+
+```
+~ declared key kv['SAFEPOINT'] is absent, but the data has the same name in a different case:
+  kv['safePoint'] on 459 rows and kv['safepoint'] on 1743 rows. … There are 2 of them, so nothing
+  can choose for you — declare the one you mean
+```
+
+A key with no spelling in the data at all is still drift.
+
+#### Drift versus standing hazards
+
+Some findings are not changes. `kv['namespace']` exists on ~29,700 rows of the live table while the
+descriptor declares a `namespace` **column** — the field wins, which is documented precedence, so it
+is not a wrong answer, but the obvious spelling cannot see those rows. Reporting that as drift would
+make `verify` fail on every run against a correct descriptor.
+
+So they are separated. **Drift** is what changed and sets the exit status; **hazards** are standing
+ambiguities that print and do not; and **limits** say what the probe could not see, so silence is
+never mistaken for absence. Against the shipped preset the live table reports *no drift*, four
+hazards (`namespace`, `node`, `body`, `component` — all real keys), and one limit naming both windows.
 
 ## Pipeline
 

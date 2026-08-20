@@ -71,6 +71,31 @@ type Shape struct {
 	// Digest is a stable fingerprint of the column list, so `verify` can report
 	// that the table has drifted since the descriptor was written.
 	Digest string
+
+	// BagKeys are the declared bag keys' observations, keyed `<bag>.<key>`.
+	BagKeys map[string]BagKeyStat
+
+	// BagNames are keys observed under a name that the descriptor declares for
+	// something else — a column, a field or an alias — keyed `<bag>.<key>`,
+	// valued by the rows carrying them. This is the shadowing hazard, and it is
+	// how `raw` bit us: the descriptor routed a name to the bag while the data
+	// lived in a column of that name.
+	BagNames map[string]int64
+
+	// BagWindow is the bound the per-key statistics used and BagEnumWindow the
+	// bound the name enumeration used. They differ on purpose; see
+	// BagDriftProbe.
+	BagWindow     string
+	BagEnumWindow string
+
+	// BagLimited, when non-empty, says the per-key statements were capped, so a
+	// silent partial answer cannot read as a complete one.
+	BagLimited string
+
+	// bad collects markers that carried the protocol's prefix and then did not
+	// match its shape. They are refused rather than guessed at, because a
+	// misparsed marker reads as a measurement.
+	bad []string
 }
 
 // Column is one column as the table describes itself.
@@ -142,6 +167,37 @@ func (p ProfileRow) NumericOKTimestamps() int64 { return p.TimestampOK }
 
 func (p ProfileRow) allTimestamps() bool {
 	return p.NonNull > 0 && p.TimestampOK == p.NonNull
+}
+
+// BagKeyStat is one DECLARED bag key's observation, as the verify probe reports
+// it.
+//
+// A bag key has no schema, which is the point of a bag and also why it is the
+// one thing `verify` could not see: DESCRIBE does not enumerate keys, so a key
+// that vanished, changed type, or stopped casting was invisible to drift
+// detection. It is the drift most likely to happen — log formats change without
+// anyone touching code — and its consequence is precisely the silent row drop
+// this project exists to remove.
+type BagKeyStat struct {
+	Bag string
+	Key string
+
+	// Scanned is the rows the window covered, so "present in 0" can be
+	// distinguished from "the window was empty".
+	Scanned int64
+
+	// Present is the rows where the key exists at all.
+	Present int64
+
+	// NumericOK is the rows whose value casts to a number, for a key declared
+	// Number.
+	NumericOK int64
+
+	// Objects and Arrays count the rows where the value is not a scalar. A
+	// path lookup means something different against either: `k:v` is an
+	// equality against a rendered JSON document rather than against a value.
+	Objects int64
+	Arrays  int64
 }
 
 // Profile is the set of profile rows, keyed by Col.
@@ -461,7 +517,201 @@ DESCRIBE %s;
 SHOW CREATE TABLE %s;
 `, sectionMarker("columns", s.Table), s.Table,
 		sectionMarker("create", s.Table), s.Table)
+	b.WriteString(BagDriftProbe(s, ProbeWindow{Hours: "24"}, ProbeWindow{}))
 	return b.String()
+}
+
+// maxDeclaredKeysProbed caps the per-key statements one bag contributes, so a
+// descriptor declaring hundreds of typed keys cannot emit unbounded SQL.
+const maxDeclaredKeysProbed = 64
+
+// BagDriftProbe emits the statements that make a bag's keys visible to drift
+// detection.
+//
+// # Two windows, deliberately, because the questions are different
+//
+// The per-key statistics are bounded and RECENT, because "has this declared key
+// stopped appearing" and "have its values stopped casting" are questions about
+// now. An unbounded window answers them wrongly: a key that stopped being
+// written an hour ago is still all over the history, so the check would find it
+// and report nothing.
+//
+// The name enumeration is UNBOUNDED, because "is there a key shadowing a
+// declared name" is a question about existence, and a bounded window can hide a
+// key's existence entirely. That is measured rather than reasoned: `raw` is
+// forward-only and profiles 0 of 997,592 rows over `ts < 2026-08-20 00:00:00`,
+// so a historical window says it does not exist. A key present on three rows is
+// still a hazard — `kv['body']` is exactly three rows on the live table — and
+// missing it is the failure mode.
+//
+// Neither bound has an upper edge in the future. A `ts <` bound whose instant
+// has not happened yet reads as frozen and is not, which is a mistake this repo
+// has made twice.
+//
+// # Why the enumeration is name-directed rather than top-N
+//
+// Keys are unbounded in number, so the obvious shape is "the N most common keys,
+// and say it was limited". This asks a narrower question instead: it lists only
+// the keys whose names something in the descriptor already claims — a column, a
+// field, an alias, a typed key — with an exact IN list. That is COMPLETE for the
+// question being asked rather than truncated, so its output can never be
+// mistaken for "these are all the keys": it never claims to be about all keys.
+// A top-N enumeration would be both more expensive and less conclusive, because
+// the dangerous shadowing key is a rare one — three rows, not three hundred
+// thousand — and it is exactly what a top-N drops.
+//
+// What that leaves invisible is stated in the report rather than papered over: a
+// key that is neither declared nor named after anything declared is not looked
+// at, and a new key is not drift at all. A schemaless bag gains keys constantly;
+// reporting those would be noise, and a check that cries wolf gets turned off.
+func BagDriftProbe(s Schema, window ProbeWindow, enum ProbeWindow) string {
+	if len(s.Bags) == 0 {
+		return ""
+	}
+
+	// The names something in the descriptor claims. Sorted so the emitted SQL
+	// is stable between runs and a diff of two probes is readable.
+	claimed := map[string]bool{}
+	for name, f := range s.Fields {
+		claimed[strings.ToLower(name)] = true
+		if isBareIdent(f.Column) {
+			claimed[strings.ToLower(f.Column)] = true
+		}
+	}
+	for _, b := range s.Bags {
+		for k := range b.Keys {
+			claimed[strings.ToLower(k)] = true
+		}
+	}
+	names := make([]string, 0, len(claimed))
+	for n := range claimed {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+
+	where, desc := window.predicate(s.TimeColumn())
+	enumWhere, enumDesc := enum.predicate(s.TimeColumn())
+	typed := 0
+	for _, b := range s.Bags {
+		typed += len(b.Keys)
+	}
+	switch {
+	case typed == 0:
+		// Saying "statistics cover the last 24 hours" when no statement was
+		// emitted would claim a measurement that did not happen.
+		desc = "not measured: this descriptor types no bag key, so there is nothing to check " +
+			"per key. Only the shadowing enumeration below ran"
+	case desc == "":
+		// Unbounded, and the probe is the only place that knows WHY: it has the
+		// schema, so it can distinguish "no time column to bound on" from a
+		// caller that passed no window.
+		if s.TimeColumn() == "" {
+			desc = "the whole table — this schema declares no time column, so there is nothing " +
+				"to bound on, and a key that vanished recently is still visible in history " +
+				"and cannot be detected here"
+		} else {
+			desc = "the whole table — no bound was requested, so a key that vanished recently " +
+				"is still visible in history and cannot be detected here"
+		}
+	}
+	if enumDesc == "" {
+		enumDesc = "no bound (existence needs the widest window: a forward-only key is absent " +
+			"from history and a rare key is absent from a recent window)"
+	}
+
+	var b strings.Builder
+	fmt.Fprintf(&b, `
+-- The attribute bag. DESCRIBE does not enumerate a VARIANT's keys, so without
+-- these statements a declared key that vanished, changed shape, or stopped
+-- casting is invisible to the drift check above.
+%s
+%s
+%s
+`, sectionMarker("bagkeys", s.Table),
+		bagWindowMarker("stats", orNoWindow(desc)),
+		bagWindowMarker("enum", enumDesc))
+
+	for _, bag := range s.Bags {
+		keys := make([]string, 0, len(bag.Keys))
+		for k := range bag.Keys {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		if len(keys) > maxDeclaredKeysProbed {
+			fmt.Fprintf(&b, "%s\n", bagLimitMarker(fmt.Sprintf(
+				"bag %s declares %d typed keys — only the first %d are checked",
+				bag.Column, len(keys), maxDeclaredKeysProbed)))
+			keys = keys[:maxDeclaredKeysProbed]
+		}
+		if len(keys) > 0 {
+			branches := make([]string, 0, len(keys))
+			for _, k := range keys {
+				branches = append(branches, bagStatBranch(bag.Column, k, s.Table, where))
+			}
+			fmt.Fprintf(&b, "\n-- Declared keys of %s, over %s.\n%s;\n",
+				bag.Column, orNoWindow(desc), strings.Join(branches, "\nUNION ALL\n"))
+		}
+
+		if len(names) > 0 {
+			quoted := make([]string, 0, len(names))
+			for _, n := range names {
+				quoted = append(quoted, "'"+escapeString(n)+"'")
+			}
+			fmt.Fprintf(&b, `
+-- Keys of %[1]s whose name something in this descriptor already claims. An exact
+-- list, not a top-N: the dangerous one is rare, and a top-N drops exactly that.
+SELECT '%[5]s|%[6]s|bagname|%[1]s|' || f.key || '|' || to_string(count(*)) AS lake_search_probe
+FROM %[2]s, LATERAL FLATTEN(input => %[1]s) f%[4]s
+WHERE lower(f.key) IN (%[3]s)
+GROUP BY f.key
+ORDER BY count(*) DESC;
+`, quoteIdent(bag.Column), s.Table, strings.Join(quoted, ", "), enumWhere,
+				probeMarker, ProbeVersion)
+		}
+	}
+	return b.String()
+}
+
+// bagStatBranch renders one declared key's observation as a single marked
+// string, so no client's column formatting can garble it.
+func bagStatBranch(bag, key, table, where string) string {
+	v := fmt.Sprintf("%s['%s']", quoteIdent(bag), escapeString(key))
+	return fmt.Sprintf(`SELECT '%s|%s|bagstat|%s|%s|'
+    || to_string(count(*))                                      || '|'
+    || to_string(count(%s))                                     || '|'
+    || to_string(count(TRY_CAST(%s::VARCHAR AS DOUBLE)))         || '|'
+    || to_string(count_if(json_typeof(%s) = 'OBJECT'))           || '|'
+    || to_string(count_if(json_typeof(%s) = 'ARRAY')) AS lake_search_probe
+FROM %s%s`,
+		probeMarker, ProbeVersion, escapeString(bag), escapeString(key),
+		v, v, v, v, table, where)
+}
+
+func bagWindowMarker(scope, desc string) string {
+	return fmt.Sprintf("SELECT '%s|%s|bagwindow|%s|%s' AS lake_search_probe;",
+		probeMarker, ProbeVersion, scope, escapeString(desc))
+}
+
+// bagLimitMarker announces a capped key list.
+//
+// The payload must contain no semicolon. Every instruction in this project says
+// to strip `--` lines and then split on `;`, and this marker's text once did
+// contain one: the statement was cut in half, both halves failed [1005], the cap
+// was never announced, and the operator got two spurious parse errors on an
+// otherwise clean probe. A marker whose whole job is to prevent a silent partial
+// answer must not itself go missing.
+//
+// Enforced rather than remembered: the semicolon is replaced here, so a future
+// caller cannot reintroduce it by writing a different sentence.
+func bagLimitMarker(desc string) string {
+	return fmt.Sprintf("SELECT '%s|%s|baglimit|%s' AS lake_search_probe;",
+		probeMarker, ProbeVersion, escapeString(stripSemicolons(desc)))
+}
+
+// stripSemicolons makes a string safe to carry inside an emitted SQL literal
+// under the strip-then-split procedure this project documents everywhere.
+func stripSemicolons(s string) string {
+	return strings.ReplaceAll(s, ";", " —")
 }
 
 // Drift reports what the table has that the descriptor does not, and vice versa.
@@ -474,7 +724,45 @@ SHOW CREATE TABLE %s;
 // 3,711. So the query was silently empty forever AND the compiler's warning
 // asserted something false, that `raw` is not a column. Comparing the column
 // lists is the only thing that finds that.
+// DriftReport separates findings that mean something CHANGED from standing
+// facts that were always true, because the two want different reactions.
+//
+// The split is not tidiness. A shadowing bag key is a real hazard worth saying
+// out loud — `kv['namespace']` exists on tens of thousands of rows while the
+// descriptor declares a `namespace` COLUMN, so the obvious spelling cannot see
+// them — but it is not drift, and reporting it as drift would make `verify`
+// fail on every run against a correct descriptor. A check that cries wolf gets
+// turned off, which is worse than not having it. So hazards print and do not
+// affect the verdict; drift prints and does.
+type DriftReport struct {
+	// Drift is what changed. Non-empty means act.
+	Drift []string
+
+	// Hazards are standing ambiguities: true now, true when the descriptor was
+	// written, and worth knowing.
+	Hazards []string
+
+	// Limits are the things this probe could not see, stated so that silence is
+	// never mistaken for absence.
+	Limits []string
+}
+
+// Findings is every line, drift first, for a caller that just wants to print.
+func (r DriftReport) Findings() []string {
+	out := append([]string{}, r.Drift...)
+	out = append(out, r.Hazards...)
+	return out
+}
+
+// Drift reports the findings as a flat list of things that CHANGED, for callers
+// that want the verdict and nothing else.
 func Drift(shape Shape, s Schema, digest string) []string {
+	return DriftDetail(shape, s, digest).Drift
+}
+
+// DriftDetail is Drift with the hazards and limits kept separate.
+func DriftDetail(shape Shape, s Schema, digest string) DriftReport {
+	var rep DriftReport
 	var out []string
 
 	declared := map[string]bool{}
@@ -613,7 +901,238 @@ func Drift(shape Shape, s Schema, digest string) []string {
 		out = append(out, fmt.Sprintf(
 			"the column-list digest has changed: %s at probe time, %s now", digest, shape.Digest))
 	}
+
+	rep.Drift = out
+	bagDrift(&rep, shape, s)
+	sort.Strings(rep.Drift)
+	sort.Strings(rep.Hazards)
+	sort.Strings(rep.Limits)
+	return rep
+}
+
+// observedSpellings returns every spelling the data uses for a declared key whose
+// own spelling found nothing, sorted, or nil when the data does not have the
+// name in any case.
+//
+// It returns a LIST, not a match, and that is the whole point. This is the one
+// place a case-insensitive comparison is correct — the question is "did someone
+// type the right name in the wrong case", which is about human spelling rather
+// than key identity — but a case-insensitive comparison over real bag keys can
+// have more than one right answer, and picking one silently is the failure this
+// function exists to report. Measured on logs.k8s_logs: `kv['safepoint']` is
+// present on 1,740 rows and `kv['safePoint']` on 459. Both are live. A
+// case-insensitive lookup for "safepoint" therefore has two answers, and a
+// helper that returned the first one would return whichever the map iterated
+// first.
+func observedSpellings(shape Shape, bag, declared string) []string {
+	prefix := bag + "."
+	var out []string
+	for full, rows := range shape.BagNames {
+		if !strings.HasPrefix(full, prefix) || rows == 0 {
+			continue
+		}
+		observed := full[len(prefix):]
+		if observed != declared && strings.EqualFold(observed, declared) {
+			out = append(out, observed)
+		}
+	}
+	sort.Strings(out)
 	return out
+}
+
+// bagDrift compares the descriptor's claims about the attribute bag against what
+// the bag actually holds.
+//
+// Four things, and the priority order is by how silently each one fails.
+func bagDrift(rep *DriftReport, shape Shape, s Schema) {
+	if len(s.Bags) == 0 {
+		return
+	}
+	if shape.BagKeys == nil && shape.BagNames == nil {
+		rep.Limits = append(rep.Limits, "the attribute bag was not probed, so a declared key "+
+			"that vanished, changed shape or stopped casting is invisible here. Re-run the "+
+			"verify probe: DESCRIBE does not enumerate a VARIANT's keys, so those statements "+
+			"are the only thing that can see them")
+		return
+	}
+	if shape.BagLimited != "" {
+		rep.Limits = append(rep.Limits, shape.BagLimited)
+	}
+	rep.Limits = append(rep.Limits, fmt.Sprintf(
+		"bag key statistics cover: %s. The name enumeration covers: %s.",
+		orNoWindow(shape.BagWindow), orNoWindow(shape.BagEnumWindow)))
+	// Both directions of the window's blind spot, because disclosing only one
+	// of them is what made the second invisible. The absence direction was
+	// stated; the presence direction was not, and it is the one that returns a
+	// wrong answer rather than no answer.
+	rep.Limits = append(rep.Limits,
+		"a bounded statistics window sees only that slice: a declared key ABSENT from it may "+
+			"still exist in history, and — the direction that costs more — a key PRESENT and "+
+			"clean in it may be dirty outside it. A numeric key that casts on every recent row "+
+			"and on none of the older ones reports nothing here while a bound on it silently "+
+			"drops the older rows; the compiler's own cast advisory fires on that query and "+
+			"hands over a count predicate, which is the check that does see it")
+	rep.Limits = append(rep.Limits,
+		"only the names this descriptor already claims were enumerated, so a key named after "+
+			"nothing declared was not looked at — and a new key is not drift, because a "+
+			"schemaless bag gains keys constantly")
+
+	// (1) A declared key that is no longer in the data. Its typed comparisons
+	// then match nothing, silently and forever — the bag-level twin of the
+	// column that nobody declared.
+	// (2) A declared numeric key whose values stopped casting: round 4's silent
+	// row drop arriving through a data change rather than a code change. The
+	// ratio, not a boolean, because 3 of 250,036 and 923 of 6,604 want
+	// different reactions.
+	// (4) A declared key that stopped being a scalar. A path lookup against an
+	// object or an array is a comparison against a rendered JSON document, so
+	// `k:v` means something else than it did.
+	for _, bag := range s.Bags {
+		keys := make([]string, 0, len(bag.Keys))
+		for k := range bag.Keys {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			kind := bag.Keys[key]
+			st, ok := shape.BagKeys[bag.Column+"."+key]
+			if !ok {
+				rep.Limits = append(rep.Limits, fmt.Sprintf(
+					"declared key %s['%s'] was not in the probe output, so nothing is known "+
+						"about it", bag.Column, key))
+				continue
+			}
+			if st.Scanned == 0 {
+				rep.Limits = append(rep.Limits, fmt.Sprintf(
+					"the statistics window is empty, so %s['%s'] could not be checked",
+					bag.Column, key))
+				continue
+			}
+			if st.Present == 0 {
+				// Before calling it vanished, check whether it is merely spelled
+				// differently. A VARIANT key is case-sensitive, so declaring
+				// `tableid` against data holding `tableID` is a real and silent
+				// mistake a person can make by hand — and it is a different
+				// mistake from the key going away, so it gets a different
+				// sentence. The enumeration observed the data's own spelling,
+				// which is what makes this answerable.
+				if actual := observedSpellings(shape, bag.Column, key); len(actual) > 0 {
+					seen := make([]string, 0, len(actual))
+					for _, a := range actual {
+						seen = append(seen, fmt.Sprintf("%s['%s'] on %d rows",
+							bag.Column, a, shape.BagNames[bag.Column+"."+a]))
+					}
+					which := fmt.Sprintf("Re-declare it as %q", actual[0])
+					if len(actual) > 1 {
+						// More than one right answer, so there is no right
+						// answer to pick. Say which ones and make the person
+						// choose: on the live table `safepoint` and `safePoint`
+						// are both real keys, so a tool that chose for them
+						// would be guessing at data.
+						which = fmt.Sprintf("There are %d of them, so nothing can choose for "+
+							"you — declare the one you mean", len(actual))
+					}
+					rep.Hazards = append(rep.Hazards, fmt.Sprintf(
+						"declared key %s['%s'] is absent, but the data has the same name in a "+
+							"different case: %s. VARIANT keys are case-sensitive on this engine, "+
+							"so the declaration reaches nothing and `%s:value` queries a key "+
+							"that does not exist. %s",
+						bag.Column, key, strings.Join(seen, " and "), key, which))
+					continue
+				}
+				rep.Drift = append(rep.Drift, fmt.Sprintf(
+					"declared key %s['%s'] appears in 0 of %d rows over %s: every comparison "+
+						"the descriptor types for it matches nothing, silently. Either the "+
+						"writer stopped emitting it or the declaration outlived it",
+					bag.Column, key, st.Scanned, orNoWindow(shape.BagWindow)))
+				continue
+			}
+			if kind == Number && st.NumericOK < st.Present {
+				rep.Drift = append(rep.Drift, fmt.Sprintf(
+					"declared key %s['%s'] is typed \"number\" but only %d of its %d values "+
+						"cast over %s (%.1f%%): a bound on it silently drops the other %d rows, "+
+						"and an equality compares them as a number they are not. Retype it as "+
+						"a string, or fix the writer",
+					bag.Column, key, st.NumericOK, st.Present, orNoWindow(shape.BagWindow),
+					100*float64(st.NumericOK)/float64(st.Present), st.Present-st.NumericOK))
+			}
+			if st.Objects > 0 || st.Arrays > 0 {
+				rep.Drift = append(rep.Drift, fmt.Sprintf(
+					"declared key %s['%s'] is not a scalar on %d of its %d rows (%d object, %d "+
+						"array) over %s: `%s:value` compares against the rendered JSON document "+
+						"rather than against a value, so it matches nothing a reader would "+
+						"expect. Reach inside it with a dotted path instead",
+					bag.Column, key, st.Objects+st.Arrays, st.Present, st.Objects, st.Arrays,
+					orNoWindow(shape.BagWindow), key))
+			}
+		}
+	}
+
+	// (3) Shadowing, both directions.
+	//
+	// This is how `raw` bit us: the descriptor routed a name to the bag while
+	// the data lived in a column of that name. The two directions differ in
+	// severity, and conflating them is what would make this check noise.
+	byName := make([]string, 0, len(shape.BagNames))
+	for k := range shape.BagNames {
+		byName = append(byName, k)
+	}
+	sort.Strings(byName)
+	for _, full := range byName {
+		rows := shape.BagNames[full]
+		if rows == 0 {
+			continue
+		}
+		i := strings.Index(full, ".")
+		if i < 0 {
+			continue
+		}
+		bagCol, key := full[:i], full[i+1:]
+
+		// The descriptor's typed keys: a column has appeared with the name of a
+		// declared key. That IS drift, because the column now wins and the
+		// typed key becomes unreachable by its own spelling.
+		typed := false
+		for _, bag := range s.Bags {
+			if !strings.EqualFold(bag.Column, bagCol) {
+				continue
+			}
+			if _, ok := bag.Keys[key]; ok {
+				typed = true
+			}
+		}
+		f, declaredAsField := s.Fields[strings.ToLower(key)]
+		if typed && declaredAsField {
+			rep.Drift = append(rep.Drift, fmt.Sprintf(
+				"%s['%s'] exists on %d rows AND %q is a declared field reading %q: the field "+
+					"wins, so the typed bag key is unreachable by its own name and only "+
+					"`%s.%s:value` reaches those rows",
+				bagCol, key, rows, key, f.Column, bagCol, key))
+			continue
+		}
+		if declaredAsField {
+			// The standing hazard. The field wins — documented precedence — so
+			// this is not a wrong answer, but the bag rows are invisible to the
+			// obvious spelling and a reader should know.
+			rep.Hazards = append(rep.Hazards, fmt.Sprintf(
+				"%s['%s'] exists on %d rows and %q is also a declared field reading %q. The "+
+					"field wins, so those bag rows are reachable only as `%s.%s:value`. Not a "+
+					"wrong answer, but the obvious spelling cannot see them",
+				bagCol, key, rows, key, f.Column, bagCol, key))
+			continue
+		}
+		// Neither a field nor a typed key, yet the enumeration asked about it,
+		// which means it matched a bare column name that nothing declares. The
+		// column check above has already reported the undeclared column; this
+		// adds what makes it dangerous rather than merely untidy.
+		if _, isColumn := shape.column(key); isColumn {
+			rep.Drift = append(rep.Drift, fmt.Sprintf(
+				"%s['%s'] exists on %d rows and %q is ALSO an undeclared column of the table: "+
+					"a query naming it reaches the bag rows and never the column's, which is "+
+					"the shape that made `raw` answer nothing forever",
+				bagCol, key, rows, key))
+		}
+	}
 }
 
 // isBareIdent reports whether a column expression is just a column name, so an
@@ -807,8 +1326,9 @@ func ParseShape(out, wantTable string) (Shape, error) {
 			continue
 		}
 		if strings.Contains(line, probeMarker+"|") {
-			// A marked line from another section (a profile row appended to the
-			// same file). Not ours.
+			// A marked line. The bag observations are ours; a profile row
+			// appended to the same file is not.
+			readBagMarker(&sh, line)
 			continue
 		}
 		switch mode {
@@ -888,6 +1408,9 @@ func ParseShape(out, wantTable string) (Shape, error) {
 		}
 	}
 	sh.Digest = columnsDigest(sh.Columns)
+	if len(sh.bad) > 0 {
+		return Shape{}, fmt.Errorf("introspect: %s", strings.Join(sh.bad, "; "))
+	}
 	return sh, nil
 }
 
@@ -950,6 +1473,76 @@ func ParseProfile(out, wantTable string) (Profile, []string, error) {
 			"introspect: no %s profile rows in this output", probeMarker)
 	}
 	return p, bagKeys, nil
+}
+
+// readBagMarker consumes the bag section's marked rows.
+//
+// They are read wherever they appear rather than only inside their section, so
+// output pasted in a different order than it was printed still parses. The
+// markers are self-describing, which is the whole reason for tagging them.
+func readBagMarker(sh *Shape, line string) {
+	i := strings.Index(line, probeMarker+"|")
+	if i < 0 {
+		return
+	}
+	f := strings.Split(line[i:], "|")
+	if len(f) < 4 || f[1] != ProbeVersion {
+		return
+	}
+	switch f[2] {
+	case "bagstat":
+		if len(f) < 10 {
+			return
+		}
+		n := make([]int64, 5)
+		for k := 0; k < 5; k++ {
+			v, err := strconv.ParseInt(strings.TrimSpace(f[5+k]), 10, 64)
+			if err != nil {
+				return
+			}
+			n[k] = v
+		}
+		if sh.BagKeys == nil {
+			sh.BagKeys = map[string]BagKeyStat{}
+		}
+		bag, key := strings.Trim(f[3], "`"), f[4]
+		sh.BagKeys[bag+"."+key] = BagKeyStat{
+			Bag: bag, Key: key, Scanned: n[0], Present: n[1],
+			NumericOK: n[2], Objects: n[3], Arrays: n[4],
+		}
+	case "bagname":
+		if len(f) < 6 {
+			return
+		}
+		v, err := strconv.ParseInt(strings.TrimSpace(f[5]), 10, 64)
+		if err != nil {
+			return
+		}
+		if sh.BagNames == nil {
+			sh.BagNames = map[string]int64{}
+		}
+		sh.BagNames[strings.Trim(f[3], "`")+"."+f[4]] = v
+	case "bagwindow":
+		// Validated, not assumed. The whole point of the tagged-marker protocol
+		// is that malformed input is REFUSED rather than misparsed, and this one
+		// took its payload as the fourth field with no check: an extra pipe made
+		// the report say "statistics cover enum; the enumeration covers stats",
+		// which is nonsense presented as fact.
+		if len(f) != 5 || (f[3] != "stats" && f[3] != "enum") {
+			sh.bad = append(sh.bad, fmt.Sprintf(
+				"a bagwindow marker is malformed (%q): expected exactly "+
+					"`%s|%s|bagwindow|stats|<text>` or `…|enum|<text>`",
+				strings.Join(f, "|"), probeMarker, ProbeVersion))
+			return
+		}
+		if f[3] == "enum" {
+			sh.BagEnumWindow = f[4]
+		} else {
+			sh.BagWindow = f[4]
+		}
+	case "baglimit":
+		sh.BagLimited = f[3]
+	}
 }
 
 func parseSection(line string) (kind, table string, ok bool) {
@@ -1985,6 +2578,28 @@ func castRate(r ProfileRow) string {
 		return fmt.Sprintf("only %d of its %d sampled values cast (%.1f%%)",
 			r.NumericOK, r.NonNull, 100*float64(r.NumericOK)/float64(r.NonNull))
 	}
+}
+
+// orNoWindow describes a window the probe reported, or says the report is
+// missing it.
+//
+// Three cases, because two of them were previously collapsed into one wrong
+// sentence. This helper runs at DRIFT time, over a paste; it cannot know why a
+// marker is absent, so it must not guess. It previously asserted "this schema
+// declares no time column", which is false for a descriptor that declares one
+// and whose marker was merely trimmed — and it said it of the ENUMERATION window
+// too, which is never time-bounded under any circumstances.
+//
+// The reason a statistics window is unbounded is known at PROBE time, where the
+// schema is in hand, so the probe writes it into the marker itself (see
+// BagDriftProbe). Here there is only one honest thing to say when the marker is
+// gone: it is gone.
+func orNoWindow(s string) string {
+	if s == "" {
+		return "not stated in this output — the paste predates the bag section, or its window " +
+			"marker was trimmed"
+	}
+	return s
 }
 
 func orNoneStr(s string) string {

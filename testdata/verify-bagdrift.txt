@@ -1,0 +1,24 @@
+lsprobe|v1|section|columns|logs.a2_bagdrift
+ts	TIMESTAMP	YES	NULL	
+msg	VARCHAR	YES	NULL	
+latency_ms	VARCHAR	YES	NULL	
+kv	VARIANT	YES	NULL	
+lsprobe|v1|section|create|logs.a2_bagdrift
+a2_bagdrift	"CREATE TABLE a2_bagdrift (
+  ts TIMESTAMP NULL,
+  msg VARCHAR NULL,
+  latency_ms VARCHAR NULL,
+  kv VARIANT NULL,
+  SYNC INVERTED INDEX idx_msg (msg, kv) filters = 'english_stop,english_stemmer', tokenizer = 'english'
+) ENGINE=FUSE"
+lsprobe|v1|section|bagkeys|logs.a2_bagdrift
+lsprobe|v1|bagwindow|stats|the last 24 hour(s) of ts
+lsprobe|v1|bagwindow|enum|no bound (existence needs the widest window: a forward-only key is absent from history and a rare key is absent from a recent window)
+lsprobe|v1|bagstat|kv|gone_key|7|0|0|0|0
+lsprobe|v1|bagstat|kv|latency_ms|7|7|2|0|0
+lsprobe|v1|bagstat|kv|retries|7|7|7|0|0
+lsprobe|v1|bagstat|kv|shape_key|7|7|0|7|0
+lsprobe|v1|bagname|kv|retries|12
+lsprobe|v1|bagname|kv|shape_key|12
+lsprobe|v1|bagname|kv|latency_ms|12
+lsprobe|v1|bagname|kv|gone_key|5

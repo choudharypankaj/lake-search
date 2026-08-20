@@ -1,0 +1,19 @@
+{
+  "table": "logs.a2_bagdrift",
+  "default": "msg",
+  "time": "ts",
+  "indexes": [
+    {"name": "idx_msg", "kind": "inverted", "columns": ["msg", "kv"],
+     "tokenizer": "english", "filters": ["english_stop", "english_stemmer"]}
+  ],
+  "bags": [{"column": "kv", "keys": {
+    "latency_ms": "number",
+    "retries": "number",
+    "gone_key": "string",
+    "shape_key": "string"
+  }}],
+  "fields": [
+    {"name": "msg", "kind": "text"},
+    {"name": "ts", "kind": "timestamp"}
+  ]
+}

@@ -364,6 +364,10 @@ type Bag struct {
 	// is 0 — every value from 10 to 99 is textually less than "9" — but that is
 	// SQL nothing here has emitted. The real numeric defect was the hard cast;
 	// see Field.Numeric.
+	// Keyed by the EXACT declared spelling. Field names are folded and bag keys
+	// are not; see the comment at the assignment site in Def.Schema. Lookup is
+	// exact too, so the three things that must agree — what was declared, what
+	// is looked up, and what the emitted subscript says — all agree.
 	Keys map[string]Kind
 }
 
@@ -423,7 +427,12 @@ func (b Bag) field(key string) Field {
 	key = normalizeKey(b.Column, key)
 	expr, raw := variantPath(b.Column, key)
 	kind := String
-	if k, ok := b.Keys[strings.ToLower(lastSegment(key))]; ok {
+	// Exact, not folded, and for the same reason the declaration is stored
+	// exactly: the subscript this Field will carry is built from the name the
+	// user typed, so a declaration under a different spelling describes a
+	// different key. `tableID: number` must not make `tableid:5` numeric,
+	// because kv['tableid'] is not the key that was typed about.
+	if k, ok := b.Keys[lastSegment(key)]; ok {
 		kind = k
 	}
 	f := Field{Column: expr, Presence: raw, Kind: kind, Index: b.Index, StopWords: b.StopWords}
