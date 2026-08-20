@@ -3,40 +3,107 @@
   "default": "line",
   "time": "ts",
   "severity": "sev",
-  "display": ["ts", "sev", "service", "route", "status", "line"],
-
+  "display": [
+    "ts",
+    "sev",
+    "service",
+    "route",
+    "status",
+    "line"
+  ],
   "indexes": [
     {
       "name": "idx_text",
       "kind": "inverted",
-      "columns": ["line", "message", "attrs"],
+      "columns": [
+        "line",
+        "message",
+        "attrs"
+      ],
       "tokenizer": "english",
-      "filters": ["english_stop", "english_stemmer"]
+      "filters": [
+        "english_stop",
+        "english_stemmer"
+      ]
     },
-    {"name": "idx_text_ng", "kind": "ngram", "columns": ["line", "message"]}
-  ],
-
-  "bags": [
-    {"column": "resource_attrs", "prefix": "resource"},
     {
-      "column": "attrs",
-      "keys": {"latency_ms": "number", "retries": "number", "bytes_out": "number"}
+      "name": "idx_text_ng",
+      "kind": "ngram",
+      "columns": [
+        "line",
+        "message"
+      ]
     }
   ],
-
+  "bags": [
+    {
+      "column": "resource_attrs",
+      "prefix": "resource"
+    },
+    {
+      "column": "attrs",
+      "keys": {
+        "latency_ms": "number",
+        "retries": "number",
+        "bytes_out": "number"
+      }
+    }
+  ],
   "fields": [
     {
       "name": "line",
       "kind": "text",
-      "aliases": ["body"],
+      "aliases": [
+        "body"
+      ],
       "derived": "concat_ws(' ', message, nullif(json_path_query_array(attrs, '$.*')::VARCHAR, '[]'))"
     },
-    {"name": "message", "kind": "text", "aliases": ["msg"]},
-    {"name": "ts", "column": "to_timestamp(ts_micros)", "kind": "timestamp", "aliases": ["timestamp"]},
-    {"name": "sev", "column": "upper(severity_text)", "kind": "string", "aliases": ["level", "severity"]},
-    {"name": "service", "kind": "string"},
-    {"name": "route", "kind": "string"},
-    {"name": "status", "kind": "number", "aliases": ["status_code"]},
-    {"name": "trace_id", "kind": "string", "aliases": ["trace"]}
+    {
+      "name": "message",
+      "kind": "text",
+      "aliases": [
+        "msg"
+      ]
+    },
+    {
+      "name": "ts",
+      "column": "to_timestamp(ts_micros)",
+      "kind": "timestamp",
+      "aliases": [
+        "timestamp"
+      ],
+      "conversion": "the column is BIGINT microseconds since the epoch, read as an instant"
+    },
+    {
+      "name": "sev",
+      "column": "upper(severity_text)",
+      "kind": "string",
+      "aliases": [
+        "level",
+        "severity"
+      ]
+    },
+    {
+      "name": "service",
+      "kind": "string"
+    },
+    {
+      "name": "route",
+      "kind": "string"
+    },
+    {
+      "name": "status",
+      "kind": "number",
+      "aliases": [
+        "status_code"
+      ]
+    },
+    {
+      "name": "trace_id",
+      "kind": "string",
+      "aliases": [
+        "trace"
+      ]
+    }
   ]
 }

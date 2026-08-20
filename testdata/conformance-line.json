@@ -101,6 +101,12 @@
       "note": "kv['standalone'] = 'No' on exactly one row in this window, and `No` is one of the 33 words the analyzer deletes — so query('kv.standalone:No') is 0 while the equality is 1. The index clause must not be added beside the equality here, or the AND inherits the emptiness and a row that exists returns nothing. This is the only naturally occurring all-stopword bag value in the table; the multi-token form (`verb:\"to be\"`, which the first version of the guard let through) is not reachable here and is covered by TestStopwordBagValueSkipsIndex, measured on a purpose-built probe."
     },
     {
+      "name": "a declared column is not read from the attribute bag",
+      "query": "source_file:*",
+      "compare": "nonzero",
+      "note": "The general form of a defect that reached production. A real column the descriptor does not declare is not merely missing: with a bag configured, every query naming it is routed into the bag, where it matches nothing, and the advisory says the name \"is not a column\" — which is false. Measured on this table, `source_file IS NOT NULL AND source_file <> ''` is 795,924 rows while `kv['source_file'] IS NOT NULL` is 0, so this case returns 795,924 while declared and 0 the moment the declaration is dropped. It caught `raw` on the live table: 5,112 rows in the column, 0 under the bag key. The regression guard for the specific column is TestPresetDeclaresEveryLiveColumn, which compares the shipped presets against a captured table shape."
+    },
+    {
       "name": "a bare word still finds nothing that is not there",
       "query": "zzzznotpresentzzzz",
       "compare": "zero",

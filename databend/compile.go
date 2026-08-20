@@ -328,6 +328,10 @@ type compiler struct {
 	// negated fragment knows which column its anti-join keys on.
 	textCols []string
 
+	// converted records which fields have already had their cast advisory
+	// raised, so a two-sided range does not repeat it.
+	converted map[string]bool
+
 	// textIndexes records the distinct inverted indexes those columns belong
 	// to. Every text leaf merges into one query() call, and that call is legal
 	// across several columns only when a single index covers all of them —
@@ -358,6 +362,116 @@ func (c *compiler) bagOf(name string) string {
 		return f.Presence[:i]
 	}
 	return c.schema.Variant
+}
+
+// noteConversion warns that this field is read through a per-value cast.
+//
+// It is the timestamp half of the advisory numericColumn gives, and it was
+// missing. The asymmetry is what made it a defect rather than an omission: a
+// numeric bound on a string-valued expression warned in full, naming the field
+// and handing over a count, while a VARCHAR column read as an instant warned
+// about nothing at all — and that is the worse of the two, because the time role
+// gates EVERY time-bounded query rather than one filter. A value that does not
+// cast leaves its row out of every dashboard panel at once.
+//
+// Warned once per field per statement, so a two-sided range does not say it
+// twice.
+func (c *compiler) noteConversion(f Field, name string) {
+	if f.Conversion == "" {
+		return
+	}
+	if c.converted == nil {
+		c.converted = map[string]bool{}
+	}
+	if c.converted[name] {
+		return
+	}
+	c.converted[name] = true
+	msg := fmt.Sprintf("%q is not stored as %s — it is read through a cast (%s), and a value "+
+		"that does not cast becomes NULL, so that row is EXCLUDED from the comparison rather "+
+		"than raising an error. On the time field that removes the row from EVERY time-bounded "+
+		"query, not just this one.", name, KindName(f.Kind), f.Conversion)
+
+	// Only offer the count when the inner value can be named. Otherwise the
+	// predicate would read `expr IS NOT NULL AND expr IS NULL`, which is always
+	// 0 — and a reader who runs it concludes that nothing was dropped, which is
+	// the opposite of what this warning is for.
+	if inner, ok := unwrapCast(f.Column); ok {
+		msg += fmt.Sprintf(" Count them with count_if(%s IS NOT NULL AND %s IS NULL)",
+			inner, f.Column)
+	} else {
+		msg += " To count them, compare the rows where the underlying column has a value " +
+			"against the rows where this expression is not null: the schema declares the " +
+			"expression only, so the column it reads cannot be named here."
+	}
+	c.warn("%s", msg)
+}
+
+// unwrapCast recovers the inner expression a conversion is applied to, so the
+// count predicate can ask "has a value but does not convert" rather than the
+// vacuous "converts and does not convert".
+//
+// Three shapes, because a conversion is not always a TRY_CAST: `TRY_CAST(x AS
+// T)`, a single-argument call like `to_timestamp(x)` -- which is how a BIGINT
+// epoch column is read as an instant -- and `x::T`. Returns the input unchanged
+// when it recognises none of them, and the caller MUST test for that: emitting
+// `expr IS NOT NULL AND expr IS NULL` ships a predicate that is always 0, which
+// is worse than omitting it, because a reader who runs it concludes nothing was
+// dropped.
+func unwrapCast(expr string) (string, bool) {
+	e := strings.TrimSpace(expr)
+
+	if strings.HasPrefix(strings.ToUpper(e), "TRY_CAST(") && strings.HasSuffix(e, ")") {
+		inner := e[len("TRY_CAST(") : len(e)-1]
+		if i := strings.LastIndex(strings.ToUpper(inner), " AS "); i > 0 {
+			return strings.TrimSpace(inner[:i]), true
+		}
+	}
+
+	// `x::T` -- take the left of the last `::`, which is the value being cast.
+	if i := strings.LastIndex(e, "::"); i > 0 {
+		return strings.TrimSpace(e[:i]), true
+	}
+
+	// A single-argument call: `name(arg)` with balanced parentheses and no
+	// top-level comma, so `to_timestamp(ts_micros)` unwraps and
+	// `concat_ws(' ', a, b)` deliberately does not.
+	if i := strings.IndexByte(e, '('); i > 0 && strings.HasSuffix(e, ")") {
+		name := e[:i]
+		if isIdent(name) {
+			arg, depth := e[i+1:len(e)-1], 0
+			for _, r := range arg {
+				switch r {
+				case '(':
+					depth++
+				case ')':
+					depth--
+				case ',':
+					if depth == 0 {
+						return expr, false
+					}
+				}
+			}
+			if a := strings.TrimSpace(arg); a != "" {
+				return a, true
+			}
+		}
+	}
+
+	return expr, false
+}
+
+// isIdent reports whether s is a bare SQL function or column name.
+func isIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if !(r == '_' || r == '.' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z') {
+			return false
+		}
+	}
+	return true
 }
 
 // numericColumn is Field.NumericColumn plus the advisory it owes the caller.
@@ -797,6 +911,8 @@ func (c *compiler) term(t *parser.Term) (fragment, error) {
 	if !known && t.Field != "" {
 		c.warn(variantWarning(f), t.Field, c.bagOf(t.Field))
 	}
+
+	c.noteConversion(f, name)
 
 	if t.Exists {
 		return fragment{sql: c.exists(f)}, nil
@@ -1444,6 +1560,17 @@ func tokenize(v string) []string {
 // it. For a Text field both ends are therefore opened unless the user's own
 // pattern already opens them; every other kind stays anchored.
 func (c *compiler) like(f Field, value string) string {
+	if !f.Ngram {
+		// A LIKE is served by the NGRAM index or by nothing, and anchoring does
+		// not change that: without an ngram index every wildcard on this column
+		// is a full scan. It was silent until now, which mattered most on the
+		// column added last — `raw` holds the whole original log line, is not in
+		// any index, and `raw:*hello*` is the only useful way to search it, so
+		// the one thing a user needs to be told is that it costs a scan.
+		c.warn("wildcard %q on %q compiles to LIKE, and no NGRAM index covers that column, so "+
+			"this is a full scan (CREATE NGRAM INDEX ... ON <table>(%s))",
+			value, f.Column, f.Column)
+	}
 	pat := likePattern(value)
 	if f.Kind == Text {
 		if !strings.HasPrefix(value, "*") {
@@ -1579,6 +1706,7 @@ func (c *compiler) rangeField(name string) (Field, error) {
 	if f.Kind == Text {
 		return Field{}, fmt.Errorf("field %q is full-text indexed; ranges are not meaningful on it", name)
 	}
+	c.noteConversion(f, name)
 	return f, nil
 }
 

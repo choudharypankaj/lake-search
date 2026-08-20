@@ -1,0 +1,26 @@
+lsprobe|v1|section|columns|logs.a2_awkward
+event_time	VARCHAR	YES	NULL	
+severity_text	VARCHAR	YES	NULL	
+service	VARCHAR	YES	NULL	
+content	VARCHAR	YES	NULL	
+latency_ms	VARCHAR	YES	NULL	
+request_id	VARCHAR	YES	NULL	
+code	BIGINT	YES	NULL	
+attrs	VARIANT	YES	NULL	
+resource	VARIANT	YES	NULL	
+tags	ARRAY(STRING)	YES	NULL	
+lsprobe|v1|section|create|logs.a2_awkward
+a2_awkward	"CREATE TABLE a2_awkward (
+  event_time VARCHAR NULL,
+  severity_text VARCHAR NULL,
+  service VARCHAR NULL,
+  content VARCHAR NULL,
+  latency_ms VARCHAR NULL,
+  request_id VARCHAR NULL,
+  code BIGINT NULL,
+  attrs VARIANT NULL,
+  resource VARIANT NULL,
+  tags ARRAY(VARCHAR NULL) NULL,
+  SYNC INVERTED INDEX idx_content (content, attrs) filters = 'english_stop,english_stemmer', tokenizer = 'english',
+  SYNC NGRAM INDEX idx_content_ng (content)
+) ENGINE=FUSE"

@@ -30,6 +30,7 @@ through, so the habits people already have either work or fail loudly.
 - 🔁 **Rewrites what the engine gets wrong** — `a OR -b` has its negative clause silently dropped here, so De Morgan folds it into the one clause shape that evaluates correctly, still inside a single `query()`
 - 🧮 **Excludes with an anti-join, not a bare `NOT`** — `NOT (query(x))` returns **zero** rows rather than every row when `x` matches nothing, so `-pdctl` used to blank the screen
 - 📦 **Zero dependencies** — standard library only, so it vendors into a Grafana datasource plugin without dragging anything along
+- 🔭 **Bootstraps itself, without a driver** — `introspect` prints probe SQL, you run it through whatever client you already have, and a second call writes the descriptor. It reads a *sampled value profile*, not only types, because a column's declared type does not tell you whether its values suit the role
 - 🔌 **Schema is data, not code** — describe your table in a JSON file (`-schema`) or pick a built-in (`-preset`); unknown fields route into a `VARIANT` bag, which is what makes open-ended log schemas searchable, and a schema that cannot support something says so when it loads rather than when a panel renders
 - 📊 **A Grafana macro** — `$__search(msg, '$q')` expands in the datasource backend, retiring the hidden predicate-generating dashboard variable
 - ✅ **Conformance by row count, not by exit code** — 98 cases across two fixtures asserting *relationships between counts*, because a wrong query here is indistinguishable from an empty result
@@ -496,6 +497,8 @@ cast, same window:
 30,559 rows across nine keys, and the distribution is the problem more than the total: the keys a
 human puts a bound on are the worst ones. Every one of `duration`'s 1,945 values is a Go duration —
 `47.823614ms` — so `duration:>100`, the most natural latency query there is, returns **0 of 1,945**.
+That is true whatever the descriptor says; see [Bootstrapping a descriptor](#why-it-looks-at-the-data)
+for what a value profile can and cannot do about it.
 
 So every numeric conversion emits a warning that names the field, says the rows are excluded rather
 than counted, and hands over the predicate that counts them
@@ -537,6 +540,181 @@ behaviour change every saved link will notice: `query('msg:snapshot')` is 17,649
 `msg:` typed explicitly still means exactly what it always did. This is also why it is a separate
 preset (`k8s-logs-line`) rather than a change to `k8s-logs`: the migration is a deployment decision,
 and pointing a schema at a column the table does not have is `[1065]` on the first query.
+
+## Bootstrapping a descriptor
+
+Writing a descriptor for a table you did not build is a lot of guessing. `introspect` does the
+guessing from evidence, and records which parts were guesses.
+
+```
+lake-search introspect probe   -table logs.k8s_logs                       # 1. print SQL
+lake-search introspect profile -table logs.k8s_logs -shape shape.txt      # 2. print more SQL
+lake-search introspect build   -shape shape.txt -profile prof.txt -o s.json
+lake-search introspect verify  -schema s.json                             # later: drift check
+lake-search introspect verify  -schema s.json -shape verify.txt
+```
+
+**It never connects to anything.** Each step prints SQL for you to run through the client that
+already holds your credentials, and the next step reads what came back. That keeps the module
+dependency-free — the property that lets the compiler be vendored into a Grafana datasource plugin —
+and it means introspection works against warehouses this tool could not reach at all: SSO-only,
+air-gapped, or reachable only through a datasource that holds the credentials already. Nothing to
+grant, nothing to leak, and the SQL is auditable before you run it.
+
+It is three steps rather than two, and the third is forced. The value profile cannot be written
+until the shape is known: its window needs the timestamp column, its bag-key branches need to know
+which columns are `VARIANT`, and its casts have to go through `::VARCHAR` because
+`TRY_CAST(ts AS DOUBLE)` is not a NULL but `[1006] unable to cast type Timestamp to type Float64`,
+which fails the whole statement.
+
+### Why it looks at the data
+
+This is the part that earns the tool. A declared type does not tell you whether a column's values
+suit a role, and the failure is silent. Measured on the live table over
+`ts < '2026-08-20 00:00:00'` (997,592 rows):
+
+| bag key | rows | cast to a number | inferred |
+| --- | --- | --- | --- |
+| `kv.term` | 33,300 | 33,300 | numeric — safe |
+| `kv.tableID` | 250,036 | 250,033 | **refused**, 3 rows would vanish |
+| `kv.store_id` | 43,546 | 42,303 | **refused**, 1,243 rows would vanish |
+| `kv.to` | 6,604 | 923 | **refused**, 5,681 rows would vanish |
+| `kv.duration` | 2,046 | 2 | **refused** — every value is a Go duration, `47.823614ms` |
+
+`duration:>100` answers **0 of those 2,046 rows**. Be precise about what the profile does and does
+not do about that, because the obvious claim is wrong: **it does not change the SQL.** A numeric bound
+on a bag key compiles to `TRY_CAST(kv['duration']::VARCHAR AS DOUBLE) > 100` with a profile, without
+one, and with `-bag-numeric` — byte for byte, verified — and the
+[numeric-conversion warning](#the-attribute-bag) fires in all three. Nothing in this tool types that
+key as a number at any flag setting.
+
+What the profile buys is **knowing**. It is the only thing that can say the ratio is 2 of 2,046
+rather than 2,046 of 2,046, and it puts the key in `refused` so a human reads it before writing the
+query instead of after reading a zero. It also buys three decisions that are otherwise unavailable:
+`-bag-numeric` has nothing to act on without it, a mostly-empty column cannot be kept out of
+`display`, and a VARCHAR holding instants cannot be recognised as a time column. That is a smaller
+claim than "it stops the silent drop", and it is the true one.
+
+### What content evidence may and may not decide
+
+Content can **demote** a type but never silently promote a column's declared one: a VARCHAR stays a
+string even if every value casts, because `Number` changes how equality is emitted and the declared
+type is the only thing the engine itself guarantees.
+
+There are **two** promotions, not one, and the second is the more consequential:
+
+- a **bag key** to `Number` — under `-bag-numeric` only, because a bag key has no declared type at
+  all, which is exactly why the duration trap lives there;
+- a **VARCHAR column** to `Timestamp`, read through `TRY_CAST`, when every sampled value casts *and*
+  the name is a time candidate. Both halves are required: content alone promotes any stringified
+  date, the name alone is the guess that types a free-text field as time.
+
+The timestamp promotion is gated harder than the numeric one, because it is worse when wrong. A
+numeric cast drops rows from one filter; the time role gates **every** time-bounded query — every
+panel, every `$__timeFilter`, every conformance window — so a value that fails to cast removes its
+row from all of them at once. Measured on a 3-row probe holding two ISO timestamps and the string
+`yesterday`, `event_time:>2026-08-01T00:00:00Z` returns 2 of 3 and says nothing.
+
+So: it needs at least **1,000** non-null sampled values (`-min-sample`). Below that the candidate is
+recorded and the role is left **empty**, which is loud — the descriptor still loads (a table with no
+time column is legal) but says so in a note, the dashboard generator refuses to emit any panel, and
+`introspect build` exits non-zero. Confirm it with `-time-column NAME` and it is applied. Either way
+the field carries `"conversion"`, which makes the compiler warn on **every** use:
+
+```
+$ lake-search compile -schema awkward.json 'event_time:>2026-08-20T01:00:03Z'
+warning: "event_time" is not stored as timestamp — it is read through a cast (the column is VARCHAR,
+read as an instant), and a value that does not cast becomes NULL, so that row is EXCLUDED from the
+comparison rather than raising an error. On the time field that removes the row from EVERY
+time-bounded query, not just this one. Count them with
+count_if(event_time IS NOT NULL AND TRY_CAST(event_time AS TIMESTAMP) IS NULL)
+```
+
+A real `TIMESTAMP` column declares no conversion and warns about nothing, so the advisory stays
+signal.
+
+### Provenance
+
+Every field records how it was decided, and the descriptor carries a block saying what was
+considered and rejected:
+
+```json
+"introspect": {
+  "profiled": true, "window": ".. 2026-08-20 00:00:00",
+  "columns_digest": "fnv1a64:…",
+  "roles": {
+    "default": "derived-text-surface (line is a STORED column reading msg and the kv bag, and
+                index idx_msg covers it, so a bare word reaches text the collector moved out of msg)",
+    "severity": "canonical-name (level, rank 1 of level,severity,…) — content-sample agrees: ~5 distinct values"
+  },
+  "refused": ["bag key \"kv.duration\" is NOT typed as a number: 2 of its 2,046 values cast (0.1%) …"]
+}
+```
+
+A guess laundered into configuration reads as fact to the next person, which is worse than no guess.
+`refused` is the most important field in the block: it is the only record that a plausible inference
+was deliberately *not* made.
+
+### What it refuses to guess
+
+Roles are decided by a type gate, then a ranked case-insensitive name match, and — **for bag roles
+only** — a lone-compatible-column fallback. A lone `String` column is deliberately not guessed as the
+log body: getting the bag wrong costs a lookup, getting the body wrong points every free-text search
+in the deployment at the wrong column and looks like it works. The timestamp role is the exception
+that uses no name list at all: a timestamp-typed column, preferring one in the cluster key, else left
+empty. Unmatched roles stay blank and are refused by the load-time validation rather than filled in.
+
+Two things are opt-in, both because their failure mode is silent:
+
+- `-aliases` offers the other names in a role's list (`message` for `msg`). Off by default because an
+  alias that shadows a bag key answers a question about the bag with the aliased column's value —
+  and these are real keys on this very table: `body` on 3 rows, `service` on 476,490, `labels` on 47.
+- `-bag-numeric` types a cleanly-numeric bag key as a number. Off by default because it changes only
+  the **equality**, and changes it from an index-backed lookup to a full scan: `term:40` is
+  `query('kv.term:40') AND lower(kv['term']::VARCHAR) = '40'` undeclared and
+  `TRY_CAST(…) = 40` declared. Both return the same 26 rows, and `kv['term']` has no value with a
+  leading zero or a decimal point, so the default keeps the index and loses nothing.
+
+### It has to be told about the index
+
+A text field outside the inverted-index group is not slow, it is **unusable** — one search function
+per statement, and no index means no search function. So `SHOW CREATE TABLE` is mandatory in the
+probe: it is the only form that reports an index's tokenizer and filters. If nothing indexes the
+chosen default field, the descriptor records that and *fails at load naming it*:
+
+```
+refused: no inverted index covers "content", the chosen default field. …
+this descriptor does NOT load: schema: field "content" is kind "text" but no inverted index covers
+column "content"; declare the index, or give the field kind "string" …
+```
+
+`build` exits non-zero when the descriptor does not load, so `introspect build && deploy` cannot ship
+one — the file is still written, because the fastest fix is usually to edit one line of it.
+
+### Drift
+
+A descriptor is a snapshot, and that is the honest cost of not holding a connection. `verify` is the
+answer, and it earned its place on a real defect rather than a constructed one.
+
+A plain column `raw` was added to `logs.k8s_logs` and the collector began populating it. No descriptor
+declared it, so with a bag configured `raw:hello` compiled to `kv['raw']` — and `kv['raw'] IS NOT
+NULL` was **0** against `raw IS NOT NULL` of **5,112**. The query was empty forever, and the warning
+made it worse by asserting that `raw` "is not a column".
+
+**Binding did not catch it**, which is the finding: the bind statement never mentions a column nobody
+declared, so it succeeded. Only comparing the column lists finds it:
+
+```
+$ lake-search introspect verify -preset k8s-logs-line -shape verify.txt
+logs.k8s_logs: 1 drift finding(s).
+
+  • column "raw" (VARCHAR) exists in the table and is NOT declared: it will be read from the
+    attribute bag and match nothing
+```
+
+It reports the other directions too — a column the descriptor names and the table has lost, an index
+that grew or lost its filters, a moved column digest. Against the pre-migration `k8s-logs` preset the
+same live table gives four findings, two of them index growth.
 
 ## Pipeline
 

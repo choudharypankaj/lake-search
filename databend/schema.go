@@ -82,6 +82,32 @@ type Field struct {
 	// the query language.
 	Search string
 
+	// Derived is the expression a STORED computed column is generated from,
+	// carried through from the descriptor so drift detection can notice that
+	// the table's definition of it has changed. A redefined derived column
+	// changes what every bare word searches, which is a wrong answer rather
+	// than a slow one.
+	Derived string
+
+	// Conversion, when non-empty, records that Column reaches this field's Kind
+	// through a per-value cast, and describes what was converted. It makes the
+	// compiler warn on every use, because such a cast does not fail — it
+	// yields NULL, and the row leaves the comparison with nothing said.
+	//
+	// It exists because of an asymmetry that shipped. A numeric bound on a
+	// string-valued expression warns loudly (see Numeric). A TIMESTAMP reached
+	// the same way did not warn at all, and it is the worse of the two: a
+	// numeric cast drops rows from one filter, while the time role gates every
+	// time-bounded query there is — every dashboard panel, every
+	// $__timeFilter, every conformance window. A value that does not cast
+	// removes its row from all of them at once.
+	//
+	// Measured on a 3-row probe whose event_time holds two ISO timestamps and
+	// the string `yesterday`: TRY_CAST(event_time AS TIMESTAMP) IS NOT NULL is
+	// 2, and `event_time:>2026-08-01T00:00:00Z` returns 2 of 3 rows. The third
+	// is invisible to every query that bounds by time.
+	Conversion string
+
 	// Numeric is the expression a numeric comparison reads, when that has to
 	// differ from Column. A typed VARIANT key is the case: Column renders the
 	// value as VARCHAR so equality and LIKE work on it, and a `>` has to read

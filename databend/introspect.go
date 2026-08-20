@@ -29,14 +29,22 @@ import (
 // # What it buys, and it is the whole reason to prefer it
 //
 // An offline probe the operator runs deliberately can afford to look at the
-// DATA, which an interactive form debouncing at one second cannot. That is not
-// a theoretical advantage. Over logs.k8s_logs_v2 (967,912 rows, frozen
-// ts < 2026-08-19 22:19:00) the bag key `duration` holds 1,945 values and 2 of
-// them cast to a number — the rest are Go durations like `47.823614ms`. A
-// type-only inference calls that key numeric and reproduces exactly the defect
-// round 4 measured: `duration:>100` returning 0 rows out of 1,945, silently.
-// The sampled profile sees 2/1,945 and refuses the Number role with the ratio
-// in the note.
+// DATA, which an interactive form debouncing at one second cannot.
+//
+// Be precise about what that buys, because the obvious claim is wrong. Over the
+// live table bounded `ts < 2026-08-20 00:00:00` (997,592 rows) the bag key
+// `duration` holds 2,046 values and 2 of them cast to a number — the rest are Go
+// durations like `47.823614ms` — so `duration:>100` answers 0 of 2,046. The
+// profile does NOT stop that: a numeric bound on a bag key compiles to TRY_CAST
+// with or without a profile, byte for byte, and round 4b's warning fires either
+// way. Nothing in this tool types that key numeric at any flag setting.
+//
+// What the profile buys is knowing. It is the only thing that can say the ratio
+// is 2 of 2,046 rather than 2,046 of 2,046, and it names the key in `refused` so
+// a human sees it before writing the query rather than after reading a zero. It
+// also buys three decisions that are unavailable without it: -bag-numeric has
+// nothing to act on, a mostly-empty column cannot be suppressed from `display`,
+// and a VARCHAR holding instants cannot be recognised as a time column.
 //
 // # Provenance
 //
@@ -129,6 +137,9 @@ func (p ProfileRow) numeric() numericVerdict {
 	}
 }
 
+// NumericOKTimestamps is the count of sampled values that cast to TIMESTAMP.
+func (p ProfileRow) NumericOKTimestamps() int64 { return p.TimestampOK }
+
 func (p ProfileRow) allTimestamps() bool {
 	return p.NonNull > 0 && p.TimestampOK == p.NonNull
 }
@@ -137,6 +148,24 @@ func (p ProfileRow) allTimestamps() bool {
 type Profile struct {
 	Table string
 	Rows  map[string]ProfileRow
+
+	// Window is the bound the probe was emitted with, carried in the output so
+	// the provenance block records what was actually measured rather than what
+	// a second flag happened to say.
+	Window string
+}
+
+// Scanned is the largest row count any branch of the profile saw. Zero means the
+// window was empty, which is not the same as "not profiled" and must not be
+// recorded as if evidence had been gathered.
+func (p Profile) Scanned() int64 {
+	var n int64
+	for _, r := range p.Rows {
+		if r.Scanned > n {
+			n = r.Scanned
+		}
+	}
+	return n
 }
 
 func (p Profile) row(col string) (ProfileRow, bool) {
@@ -186,6 +215,57 @@ SHOW CREATE TABLE %s;
 	return b.String()
 }
 
+// ProbeWindow bounds the value profile.
+//
+// Absolute bounds are offered alongside the rolling one because a rolling window
+// is not reproducible and a frozen table has no recent rows at all. The frozen
+// copy this repo measures against, logs.k8s_logs_v2, ends at
+// 2026-08-19 22:18:58 — a `now() - 1 hour` bound over it profiles zero rows and
+// every content decision then rests on no evidence while looking like it rests
+// on some. Absolute bounds also mean a profile can be re-run and compared, which
+// is what makes a descriptor's numbers checkable rather than merely asserted.
+type ProbeWindow struct {
+	// Hours is a rolling bound: `<time> >= now() - Hours hours`.
+	Hours string
+
+	// Since and Until are absolute, and win over Hours when set.
+	Since string
+	Until string
+}
+
+// predicate renders the bound against a time column, and describes itself.
+func (w ProbeWindow) predicate(timeCol string) (sql, desc string) {
+	if timeCol == "" {
+		return "", ""
+	}
+	var parts []string
+	if w.Since != "" {
+		parts = append(parts, fmt.Sprintf("%s >= '%s'", timeCol, escapeString(w.Since)))
+	}
+	if w.Until != "" {
+		parts = append(parts, fmt.Sprintf("%s < '%s'", timeCol, escapeString(w.Until)))
+	}
+	if len(parts) > 0 {
+		return "\nWHERE " + strings.Join(parts, "\n  AND "), strings.Join(parts, " AND ")
+	}
+	if w.Hours != "" {
+		return fmt.Sprintf("\nWHERE %s >= subtract_hours(now(), %s)", timeCol, w.Hours),
+			fmt.Sprintf("the last %s hour(s) of %s", w.Hours, timeCol)
+	}
+	return "", ""
+}
+
+// Describe renders the window for the provenance block.
+func (w ProbeWindow) Describe() string {
+	switch {
+	case w.Since != "" || w.Until != "":
+		return strings.TrimSpace(w.Since + " .. " + w.Until)
+	case w.Hours != "":
+		return "last " + w.Hours + "h"
+	}
+	return "whole table"
+}
+
 // ProfileProbe emits the second probe: what the values in those columns
 // actually look like.
 //
@@ -202,7 +282,7 @@ SHOW CREATE TABLE %s;
 //     whole statement. Every cast here therefore goes through `::VARCHAR`
 //     first, which is legal on every type measured — timestamp, varchar and
 //     variant — and makes one uniform expression work for all of them.
-func ProfileProbe(shape Shape, window string, maxKeys int) (string, error) {
+func ProfileProbe(shape Shape, window ProbeWindow, maxKeys int) (string, error) {
 	if shape.Table == "" {
 		return "", fmt.Errorf("introspect: the shape names no table")
 	}
@@ -215,26 +295,24 @@ func ProfileProbe(shape Shape, window string, maxKeys int) (string, error) {
 		return "", fmt.Errorf("introspect: %s has no columns to profile", shape.Table)
 	}
 
-	where := ""
-	if t := shape.timeColumn(); t != "" && window != "" {
-		// A bound, not a LIMIT. A LIMIT would be applied after the aggregate
-		// and profile the whole table anyway.
-		where = fmt.Sprintf("\nWHERE %s >= subtract_hours(now(), %s)", t, window)
-	}
+	// A bound, not a LIMIT. A LIMIT would be applied after the aggregate and
+	// profile the whole table anyway.
+	where, desc := window.predicate(shape.timeColumn())
 
 	var b strings.Builder
 	b.WriteString(probeHeader("profile", shape.Table))
 	if where == "" {
-		b.WriteString("-- NOTE: no timestamp column was found, so this profiles the WHOLE table.\n")
-		b.WriteString("--       Add a bound by hand if that is too expensive.\n")
+		b.WriteString("-- NOTE: no bound, so this profiles the WHOLE table. Pass -since/-until or\n")
+		b.WriteString("--       -window, or add a bound by hand if that is too expensive.\n")
 	} else {
-		fmt.Fprintf(&b, "-- Bounded to the last %s hour(s) of %s.\n", window, shape.timeColumn())
+		fmt.Fprintf(&b, "-- Bounded to %s.\n", desc)
 	}
 	b.WriteString(`-- Run all statements and append the output to the SAME file as the shape probe,
 -- or save it separately and pass both to ` + "`introspect build`" + `.
 
 `)
 	b.WriteString(sectionMarker("profile", shape.Table) + "\n")
+	b.WriteString(windowMarker(window) + "\n")
 
 	branches := make([]string, 0, len(cols))
 	for _, c := range cols {
@@ -253,9 +331,9 @@ func ProfileProbe(shape Shape, window string, maxKeys int) (string, error) {
 		}
 		fmt.Fprintf(&b, `
 -- Bag %[1]s: the %[2]d most common keys, and their value profiles.
--- A bag key's type is not in any schema, so it is read from the data. This is
--- what stops a key like `+"`duration`"+` — whose values are `+"`47.823614ms`"+` — from
--- being typed as a number and then silently answering 0 rows to `+"`duration:>100`"+`.
+-- A bag key's type is not in any schema, so it is read from the data. That is
+-- what tells you a key like `+"`duration`"+` holds `+"`47.823614ms`"+` and that a bound on
+-- it therefore answers with the 2 rows of 2,046 that happen to cast.
 %[5]s
 SELECT '%[6]s|%[7]s|bagkey|%[1]s|' || f.key || '|' || to_string(count(*)) AS lake_search_probe
 FROM %[3]s, LATERAL FLATTEN(input => %[1]s) f%[4]s
@@ -279,7 +357,7 @@ LIMIT %[2]d;
 // statement, which is one round trip further out. Keeping it separate means the
 // operator can profile only the keys they care about on a table with 594 of
 // them — which is how many logs.k8s_logs_v2 actually has.
-func BagKeyProfileProbe(shape Shape, bag string, keys []string, window string) (string, error) {
+func BagKeyProfileProbe(shape Shape, bag string, keys []string, window ProbeWindow) (string, error) {
 	if len(keys) == 0 {
 		return "", fmt.Errorf("introspect: no bag keys given")
 	}
@@ -291,14 +369,12 @@ func BagKeyProfileProbe(shape Shape, bag string, keys []string, window string) (
 				shape.Table)
 		}
 	}
-	where := ""
-	if t := shape.timeColumn(); t != "" && window != "" {
-		where = fmt.Sprintf("\nWHERE %s >= subtract_hours(now(), %s)", t, window)
-	}
+	where, _ := window.predicate(shape.timeColumn())
 
 	var b strings.Builder
 	b.WriteString(probeHeader("profile", shape.Table))
 	b.WriteString(sectionMarker("profile", shape.Table) + "\n")
+	b.WriteString(windowMarker(window) + "\n")
 	branches := make([]string, 0, len(keys))
 	for _, k := range keys {
 		expr := fmt.Sprintf("%s['%s']::VARCHAR", quoteIdent(bag), escapeString(k))
@@ -372,11 +448,244 @@ func VerifyProbe(s Schema) string {
 
 `)
 	fmt.Fprintf(&b, "SELECT\n%s\nFROM %s\nWHERE 1=0;\n\n", strings.Join(exprs, ",\n"), s.Table)
-	fmt.Fprintf(&b, `-- And the drift check: compare this against introspect.columns_digest.
+	fmt.Fprintf(&b, `-- And the drift check. Save this output and feed it back:
+--   lake-search introspect verify -preset … -shape <this output>
+-- Binding alone does NOT catch drift, and that is measured rather than assumed:
+-- a column added to the table is simply not mentioned by the statement above, so
+-- it binds cleanly while every query naming that column is routed to the
+-- attribute bag and matches nothing. Only comparing the column list finds it.
 %s
 DESCRIBE %s;
-`, sectionMarker("columns", s.Table), s.Table)
+
+%s
+SHOW CREATE TABLE %s;
+`, sectionMarker("columns", s.Table), s.Table,
+		sectionMarker("create", s.Table), s.Table)
 	return b.String()
+}
+
+// Drift reports what the table has that the descriptor does not, and vice versa.
+//
+// This exists because binding is not enough, and the gap is not theoretical. A
+// plain column `raw` was added to logs.k8s_logs and the Vector pipeline started
+// populating it; no descriptor declared it. The bind statement still succeeded —
+// it never mentions a column nobody declared — while `raw:hello` compiled to
+// kv['raw'], and `kv['raw'] IS NOT NULL` was 0 against `raw IS NOT NULL` of
+// 3,711. So the query was silently empty forever AND the compiler's warning
+// asserted something false, that `raw` is not a column. Comparing the column
+// lists is the only thing that finds that.
+func Drift(shape Shape, s Schema, digest string) []string {
+	var out []string
+
+	declared := map[string]bool{}
+	for _, f := range s.Fields {
+		declared[strings.ToLower(f.Column)] = true
+	}
+	for _, b := range s.Bags {
+		declared[strings.ToLower(b.Column)] = true
+	}
+
+	for _, c := range shape.Columns {
+		if declared[strings.ToLower(c.Name)] {
+			continue
+		}
+		// The direction that matters. An undeclared column is not merely
+		// missing: with a bag configured, every query naming it is routed into
+		// the bag and answers nothing, and the advisory says the name "is not a
+		// column", which is false.
+		where := "it will be read from the attribute bag and match nothing"
+		if len(s.Bags) == 0 {
+			where = "a query naming it will be refused as an unknown field"
+		}
+		out = append(out, fmt.Sprintf(
+			"column %q (%s) exists in the table and is NOT declared: %s", c.Name, c.RawType, where))
+	}
+
+	// Sorted so two runs over the same input report in the same order; a Go map
+	// iterates randomly and a diff that reorders itself is a diff nobody reads.
+	for _, name := range sortedFieldNames(s) {
+		f := s.Fields[name]
+		// Only bare column references are checked here; an expression is
+		// checked by the bind statement instead.
+		if !isBareIdent(f.Column) {
+			continue
+		}
+		col, ok := shape.column(f.Column)
+		if !ok {
+			out = append(out, fmt.Sprintf(
+				"field %q reads column %q, which the table no longer has", name, f.Column))
+			continue
+		}
+		// The type. This was the blind spot: `ts` becoming a VARCHAR or `kv`
+		// ceasing to be a VARIANT was reported as "no drift" against a preset,
+		// because only an introspected descriptor carries a digest and nothing
+		// else looked. The type is already in the DESCRIBE row being parsed —
+		// it is quoted in the "NOT declared" message above — so comparing it is
+		// nearly free, and it changes what the emitted SQL MEANS:
+		// `ts:>2026-08-18T22:30:00Z` still compiles to a string comparison
+		// against a VARCHAR with nothing said.
+		if want := acceptableTypes(f.Kind); !want[col.Type] {
+			out = append(out, fmt.Sprintf(
+				"field %q is kind %q but column %q is %s in the table: a comparison on it is "+
+					"compiled for %s and evaluated as %s, which changes what the answer means "+
+					"rather than how fast it arrives",
+				name, KindName(f.Kind), f.Column, col.RawType, KindName(f.Kind), col.Type))
+		}
+		// A computed column the table has redefined. `line` is the case that
+		// matters: change its expression and every bare word searches something
+		// else.
+		if f.Derived != "" && col.Derived != "" && !sameExpr(f.Derived, col.Derived) {
+			out = append(out, fmt.Sprintf(
+				"field %q is a STORED computed column and the table's definition of it has "+
+					"changed:\n      descriptor: %s\n      table:      %s",
+				name, f.Derived, col.Derived))
+		}
+		if f.Derived != "" && col.Derived == "" {
+			out = append(out, fmt.Sprintf(
+				"field %q is declared as a STORED computed column but %q is a plain column in "+
+					"the table now, so nothing maintains its value", name, f.Column))
+		}
+		if f.Derived == "" && col.Derived != "" {
+			out = append(out, fmt.Sprintf(
+				"column %q is a STORED computed column in the table and the descriptor does not "+
+					"say so, so a writer may try to set it", f.Column))
+		}
+	}
+	for _, bag := range s.Bags {
+		col, ok := shape.column(bag.Column)
+		if !ok {
+			out = append(out, fmt.Sprintf(
+				"bag %q is not a column of the table any more", bag.Column))
+			continue
+		}
+		if col.Type != "variant" {
+			out = append(out, fmt.Sprintf(
+				"bag %q is %s in the table, not a VARIANT: every undeclared field name is read "+
+					"from it as a JSON path, which a %s column cannot answer",
+				bag.Column, col.RawType, col.Type))
+		}
+	}
+
+	// Index drift. An index that grew is why a column can become searchable
+	// without anyone editing a descriptor, and an index that shrank or lost its
+	// filters changes answers rather than speed.
+	byName := map[string]Index{}
+	for _, ix := range shape.Indexes {
+		byName[ix.Name] = ix
+	}
+	for _, want := range s.Indexes {
+		got, ok := byName[want.Name]
+		if !ok {
+			out = append(out, fmt.Sprintf(
+				"index %s is declared but the table does not have it: every field it makes "+
+					"full-text is now unindexed, and a term on one of them cannot be compiled",
+				want.Name))
+			continue
+		}
+		if !sameSet(got.Columns, want.Columns) {
+			out = append(out, fmt.Sprintf(
+				"index %s covers (%s) in the table but (%s) in the descriptor",
+				want.Name, strings.Join(got.Columns, ", "), strings.Join(want.Columns, ", ")))
+		}
+		if !sameSet(got.Filters, want.Filters) {
+			out = append(out, fmt.Sprintf(
+				"index %s has filters '%s' in the table but '%s' in the descriptor — a filter "+
+					"declared that the index lacks sends ordinary words to an index that "+
+					"deletes them, and one the index has but the descriptor does not sends "+
+					"them to a needless scan",
+				want.Name, strings.Join(got.Filters, ","), strings.Join(want.Filters, ",")))
+		}
+		if !strings.EqualFold(got.Tokenizer, want.Tokenizer) {
+			out = append(out, fmt.Sprintf("index %s tokenizer is %q in the table and %q in the "+
+				"descriptor", want.Name, got.Tokenizer, want.Tokenizer))
+		}
+		delete(byName, want.Name)
+	}
+	for _, ix := range byName {
+		out = append(out, fmt.Sprintf(
+			"index %s (%s %s) exists in the table and is not declared: the columns it covers "+
+				"are searched by scan rather than by the index, or in the NGRAM case a wildcard "+
+				"is warned about as a full scan when it is not one",
+			ix.Name, ix.Kind, strings.Join(ix.Columns, ", ")))
+	}
+
+	if digest != "" && shape.Digest != digest {
+		out = append(out, fmt.Sprintf(
+			"the column-list digest has changed: %s at probe time, %s now", digest, shape.Digest))
+	}
+	return out
+}
+
+// isBareIdent reports whether a column expression is just a column name, so an
+// expression-valued field is left to the bind statement.
+// acceptableTypes is the set of declared column types a field of this kind can
+// legitimately read.
+//
+// Text and String both accept `boolean`, because there is no Bool kind and a
+// boolean column is compared as a string — that is a documented choice, not
+// drift.
+func acceptableTypes(k Kind) map[string]bool {
+	switch k {
+	case Number:
+		return map[string]bool{"number": true}
+	case Timestamp:
+		return map[string]bool{"timestamp": true}
+	default:
+		return map[string]bool{"string": true, "boolean": true}
+	}
+}
+
+// sameExpr compares two SQL expressions ignoring whitespace and the difference
+// between this engine's own renderings of a string cast, which SHOW CREATE TABLE
+// prints as `::STRING` where a descriptor is likely to say `::VARCHAR`. Neither
+// difference is drift.
+func sameExpr(a, b string) bool {
+	norm := func(s string) string {
+		s = strings.ToLower(s)
+		s = strings.ReplaceAll(s, "::varchar", "::string")
+		var out []rune
+		for _, r := range s {
+			if r != ' ' && r != '\t' && r != '\n' && r != '`' {
+				out = append(out, r)
+			}
+		}
+		return string(out)
+	}
+	return norm(a) == norm(b)
+}
+
+func isBareIdent(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r == '_':
+		case r >= '0' && r <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	seen := map[string]int{}
+	for _, x := range a {
+		seen[strings.ToLower(x)]++
+	}
+	for _, x := range b {
+		seen[strings.ToLower(x)]--
+	}
+	for _, n := range seen {
+		if n != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func sortedFieldNames(s Schema) []string {
@@ -395,6 +704,20 @@ func probeHeader(kind, table string) string {
 -- column header, a box-drawing border or an ANSI colour code is skipped rather
 -- than misparsed. Keep the tagged lines; the rest does not matter.
 `, kind, ProbeVersion, table, probeMarker, ProbeVersion)
+}
+
+// windowMarker puts the profile's bound INTO its output, so `build` reads the
+// window rather than being told it a second time.
+//
+// It exists because the default path lied. `profile` bounds to one hour by
+// default, `build`'s -window defaults to empty, the output carried no window,
+// and the printed instructions never said to repeat the flag — so a user doing
+// exactly what the tool printed got a descriptor whose provenance claimed the
+// profile covered the whole table when it covered one hour. The machinery for
+// the honest answer existed and the default path defeated it.
+func windowMarker(w ProbeWindow) string {
+	return fmt.Sprintf("SELECT '%s|%s|window|%s' AS lake_search_probe;",
+		probeMarker, ProbeVersion, escapeString(w.Describe()))
 }
 
 func sectionMarker(kind, table string) string {
@@ -440,7 +763,14 @@ var (
 	reIndex     = regexp.MustCompile(`(?i)(?:SYNC\s+|ASYNC\s+)?(INVERTED|NGRAM)\s+INDEX\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)([^\n]*)`)
 	reTokenizer = regexp.MustCompile(`(?i)tokenizer\s*=\s*'([^']*)'`)
 	reFilters   = regexp.MustCompile(`(?i)filters\s*=\s*'([^']*)'`)
-	reClusterBy = regexp.MustCompile(`(?i)CLUSTER\s+BY\s*\(([^)]*)\)`)
+	// Greedy to the last `)` on the line, because a cluster key contains
+	// function calls: `CLUSTER BY (to_date(ts), component)` stops at the first
+	// `)` under a lazy match and yields `to_date(ts`, which then appears
+	// verbatim in the provenance note. CLUSTER BY is the last clause SHOW
+	// CREATE TABLE emits, so anchoring at end-of-line is safe.
+	reClusterBy = regexp.MustCompile(`(?mi)CLUSTER\s+BY\s*\((.*)\)[^()]*$`)
+	// The line that closes SHOW CREATE TABLE's column list.
+	reCloseParen = regexp.MustCompile(`(?m)^\s*\)`)
 	// `STORED COMPUTED COLUMN `expr`` from DESCRIBE, or `AS (expr) STORED` from
 	// SHOW CREATE TABLE.
 	reComputed = regexp.MustCompile("(?i)(?:STORED|VIRTUAL)\\s+COMPUTED\\s+COLUMN\\s+`(.*)`\\s*$")
@@ -504,6 +834,47 @@ func ParseShape(out, wantTable string) (Shape, error) {
 	}
 
 	ddl := strings.Join(createLines, "\n")
+
+	// Completeness, cross-checked between the two sections.
+	//
+	// A truncated capture is the failure mode a marker cannot catch on its own:
+	// the section header arrives, some rows arrive, and the parser happily
+	// builds a descriptor out of the first three columns of a nine-column
+	// table. This is not hypothetical — the first run of this code was against
+	// output a shell pipeline had cut to three lines per statement, and it
+	// produced a confident descriptor with one field in it.
+	//
+	// The two sections list the columns independently, so they check each
+	// other. Any column named in the CREATE TABLE text that DESCRIBE did not
+	// report means the DESCRIBE output was cut.
+	if ddl != "" {
+		// The DDL has to be whole. SHOW CREATE TABLE always closes the column
+		// list on its own line, so a capture without that line is cut — and
+		// this is the check that catches the case the column cross-check below
+		// cannot, where BOTH sections were truncated by the same amount and
+		// therefore agree with each other.
+		if !reCloseParen.MatchString(ddl) {
+			return Shape{}, fmt.Errorf(
+				"introspect: the SHOW CREATE TABLE output is incomplete — its closing `)` is " +
+					"missing, so the capture was cut. Re-run the probe and save all of the " +
+					"output; a partial capture would build a descriptor out of the columns " +
+					"that happened to fit")
+		}
+		var missing []string
+		for _, name := range ddlColumnNames(ddl) {
+			if _, ok := sh.column(name); !ok {
+				missing = append(missing, name)
+			}
+		}
+		if len(missing) > 0 {
+			return Shape{}, fmt.Errorf(
+				"introspect: this output is incomplete — SHOW CREATE TABLE names %d column(s) "+
+					"that DESCRIBE did not report (%s). The capture was probably truncated; "+
+					"re-run the probe and save all of the output",
+				len(missing), strings.Join(missing, ", "))
+		}
+	}
+
 	sh.Indexes = parseIndexes(ddl)
 	if m := reClusterBy.FindStringSubmatch(ddl); m != nil {
 		sh.ClusterBy = splitList(m[1])
@@ -563,6 +934,10 @@ func ParseProfile(out, wantTable string) (Profile, []string, error) {
 			p.Rows[f[3]] = ProfileRow{
 				Col: f[3], Scanned: n[0], NonNull: n[1], NumericOK: n[2],
 				TimestampOK: n[3], Distinct: n[4], MinLen: n[5], MaxLen: n[6],
+			}
+		case "window":
+			if len(f) >= 4 {
+				p.Window = f[3]
 			}
 		case "bagkey":
 			if len(f) >= 5 {
@@ -724,13 +1099,65 @@ func derivedFromDDL(ddl, col string) string {
 	return ""
 }
 
+// splitList splits a comma-separated list at TOP-LEVEL commas only.
+//
+// A cluster key is `to_date(ts), component`, and splitting naively yields
+// `to_date(ts` — which then appears verbatim in the provenance note, as it did
+// before this was fixed.
+// ddlColumnNames pulls the column names out of a CREATE TABLE body, so the two
+// probe sections can check each other for truncation.
+//
+// It reads only lines that look like a column definition — an identifier
+// followed by a type this compiler recognises — so index clauses, the CLUSTER BY
+// tail and the engine clause contribute nothing.
+func ddlColumnNames(ddl string) []string {
+	var out []string
+	for _, line := range strings.Split(ddl, "\n") {
+		s := strings.TrimSpace(strings.Trim(strings.TrimSpace(line), ","))
+		if s == "" || strings.HasPrefix(strings.ToUpper(s), "CREATE ") {
+			continue
+		}
+		up := strings.ToUpper(s)
+		if strings.HasPrefix(up, "SYNC ") || strings.HasPrefix(up, "ASYNC ") ||
+			strings.HasPrefix(up, "INVERTED ") || strings.HasPrefix(up, "NGRAM ") ||
+			strings.HasPrefix(up, "CLUSTER ") || strings.HasPrefix(up, ")") {
+			continue
+		}
+		f := strings.Fields(s)
+		if len(f) < 2 {
+			continue
+		}
+		name := strings.Trim(f[0], "`\"")
+		if name == "" || normaliseType(f[1]) == "" {
+			continue
+		}
+		out = append(out, name)
+	}
+	return out
+}
+
 func splitList(s string) []string {
 	var out []string
-	for _, one := range strings.Split(s, ",") {
-		if one = strings.Trim(strings.TrimSpace(one), "`\""); one != "" {
+	depth, start := 0, 0
+	flush := func(end int) {
+		if one := strings.Trim(strings.TrimSpace(s[start:end]), "`\""); one != "" {
 			out = append(out, one)
 		}
 	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', '[':
+			depth++
+		case ')', ']':
+			depth--
+		case ',':
+			if depth == 0 {
+				flush(i)
+				start = i + 1
+			}
+		}
+	}
+	flush(len(s))
 	return out
 }
 
@@ -885,7 +1312,26 @@ func (s Shape) column(name string) (Column, bool) {
 // the bag wrong costs a lookup; getting the body wrong points every free-text
 // search in the deployment at the wrong column, and it looks like it works.
 var (
-	bodyNames      = []string{"msg", "message", "body", "log", "content", "line"}
+	// bodyNames ranks the candidates for the default field. It is the union of
+	// the two lists below, in priority order.
+	bodyNames = []string{"msg", "message", "body", "log", "content", "line"}
+
+	// The union splits when a table has BOTH a message column and a derived
+	// column reconstructing the whole line, because then the two names mean
+	// different things and mapping them to one column loses the distinction.
+	//
+	//   surfaceNames  name the whole log record — what a reader sees, what a
+	//                 logs panel puts in its `body` field — so they belong to
+	//                 the default field, derived or not.
+	//   messageNames  name the message field specifically, so they belong to
+	//                 the column that matched the list by name.
+	//
+	// It matters because the two are measurably different questions: over
+	// logs.k8s_logs_v2, query('line:snapshot') is 25,488 rows and
+	// query('msg:snapshot') is 17,649. On a table with no derived column both
+	// lists land on the same column and the split costs nothing.
+	surfaceNames   = []string{"body", "line", "content", "log"}
+	messageNames   = []string{"msg", "message"}
 	severityNames  = []string{"level", "severity", "severity_text", "log_level", "loglevel"}
 	componentNames = []string{"component", "service", "service_name", "app"}
 	bagNames       = []string{"kv", "attributes", "attrs", "tags", "labels"}
@@ -924,6 +1370,69 @@ type BuildOptions struct {
 	// column with one value per row is an identifier, not something to show in
 	// a log view. Zero uses the default.
 	MaxFacetDistinct int64
+
+	// Aliases offers the other names in a role's candidate list as aliases —
+	// `message` for a `msg` body, `timestamp` for a `ts` time column.
+	//
+	// It is OFF by default, and that is the one place this generator is more
+	// conservative than it could be. An alias's only failure mode is shadowing
+	// a bag key, and that failure is silent in the worst direction: a missing
+	// alias makes `message:x` a bag lookup that returns nothing and the user
+	// notices, while a wrong alias makes `body:x` answer with the message text
+	// and the user does not. The names in these lists are not hypothetical bag
+	// keys either — measured on logs.k8s_logs_v2, `body` is a real key on 3
+	// rows, `service` on 476,490, `labels` on 47 and `component` on 1.
+	//
+	// A collision can only be ruled out for keys the probe actually saw, and a
+	// table with 594 keys will not have had all of them profiled, so "no
+	// collision found" is weaker than "no collision". Opting in records how
+	// many keys the check covered.
+	Aliases bool
+
+	// KnownBagKeys are every `<bag>.<key>` the probe reported, profiled or
+	// merely discovered, used for the alias collision check.
+	KnownBagKeys []string
+
+	// MinPromoteSample is how many non-null sampled values a CONTENT promotion
+	// needs before it is applied rather than merely proposed. Zero uses the
+	// default.
+	//
+	// It exists for the time role specifically. Promoting a VARCHAR column to
+	// TIMESTAMP on the strength of eight rows is not evidence, it is a
+	// coincidence with a sample size, and the time role is the one role that
+	// gates every time-bounded query in the deployment: a value that does not
+	// cast leaves its row out of every panel at once. So below this threshold
+	// the candidate is RECORDED for a human to confirm with -time-column, and
+	// the role is left empty — which makes the descriptor fail to load naming
+	// it, rather than load and quietly lose rows.
+	//
+	// The rule itself is sound at any size — on a 3-row probe where 2 of 3 cast
+	// it correctly declined — but a clean sample must not buy silence.
+	MinPromoteSample int64
+
+	// TimeColumn names the time field by hand, confirming a candidate the
+	// sample was too small to promote on its own.
+	TimeColumn string
+
+	// BagNumeric declares a bag key as Number when every sampled value casts.
+	//
+	// It is OFF by default, and the reason is a measurement rather than
+	// caution. Declaring a bag key numeric changes exactly one thing — the
+	// EQUALITY — and it changes it for the worse on this engine. An undeclared
+	// key's equality is compiled as an index-backed lookup plus an exact
+	// residual, `query('kv.term:40') AND lower(kv['term']::VARCHAR) = '40'`;
+	// declared Number it becomes `TRY_CAST(kv['term']::VARCHAR AS DOUBLE) = 40`,
+	// which is a full scan, because a numeric field never reaches the indexed
+	// equality path. Bounds convert either way, so nothing is gained there.
+	//
+	// What it buys is matching a non-canonical spelling: `040` and `40.0` equal
+	// 40 as numbers and not as strings. Measured over logs.k8s_logs_v2
+	// (967,912 rows, ts < 2026-08-19 22:19:00), kv['term'] has 0 values with a
+	// leading zero and 0 with a decimal point, and all three spellings of
+	// `term:40` return the same 26 rows. So the default trade — keep the index,
+	// keep the string equality — is the right one, and the evidence for the
+	// other choice is recorded either way so an operator can make it knowingly.
+	BagNumeric bool
 }
 
 // Build turns a shape, and optionally a value profile, into a descriptor.
@@ -951,18 +1460,53 @@ func Build(shape Shape, prof Profile, opts BuildOptions) (Def, []string, error) 
 	if opts.MaxFacetDistinct == 0 {
 		opts.MaxFacetDistinct = 10000
 	}
-	profiled := len(prof.Rows) > 0
+	if opts.MinPromoteSample == 0 {
+		opts.MinPromoteSample = 1000
+	}
+	// A profile that scanned no rows is not evidence. It used to be recorded as
+	// `profiled: true` with every per-role note correctly saying "no content
+	// evidence" — the flag and the notes contradicting each other in the one
+	// block whose whole job is answering "how much evidence backed this?".
+	scanned := prof.Scanned()
+	profiled := len(prof.Rows) > 0 && scanned > 0
 
-	b := &builder{shape: shape, prof: prof, opts: opts, roles: map[string]string{}}
-	if !profiled {
-		b.refuse("no value profile was supplied, so every type rests on the declared type " +
-			"alone. That is the blind spot that types a column of Go durations as a number: " +
-			"run `introspect profile` and rebuild")
+	// The profile's own window wins. An explicit -window is a fallback for
+	// output produced before the marker existed.
+	window := prof.Window
+	if window == "" {
+		window = opts.Window
+	}
+
+	b := &builder{shape: shape, prof: prof, opts: opts, roles: map[string]string{},
+		known: map[string]bool{}}
+	for _, k := range opts.KnownBagKeys {
+		b.known[strings.ToLower(k)] = true
+	}
+	for k := range prof.Rows {
+		if strings.Contains(k, ".") {
+			b.known[strings.ToLower(k)] = true
+		}
+	}
+	switch {
+	case len(prof.Rows) == 0:
+		b.refuse("no value profile was supplied, so nothing here rests on the data: no bag key " +
+			"can be shown to be mixed, no column can be suppressed from `display` for being " +
+			"mostly empty, and a VARCHAR holding instants cannot be recognised. Run " +
+			"`introspect profile` and rebuild")
+	case scanned == 0:
+		b.refuse("the value profile scanned 0 rows — its window is empty, so it is recorded as "+
+			"UNPROFILED. Every type here rests on the declared type alone. Re-profile with a "+
+			"window that contains data (this one was %q)", window)
 	}
 
 	timeCol := b.pickTime()
 	bags := b.pickBags()
 	bodyCol := b.pickBody(bags)
+	// The column whose NAME matched the body list, which is not always the
+	// default field: when a derived text surface wins, the message column is
+	// still the thing `message` is a synonym for.
+	msgCol, _ := b.rank(bodyNames, "string")
+	b.defaultCol = bodyCol
 	sevCol := b.pickSeverity()
 	compCol := b.pickComponent()
 
@@ -985,13 +1529,22 @@ func Build(shape Shape, prof Profile, opts BuildOptions) (Def, []string, error) 
 		def.Severity = sevCol
 	}
 	def.Bags = bags
-	def.Fields = b.fields(group, bodyCol, timeCol)
+	def.Fields = b.fields(group, bodyCol, msgCol, timeCol)
 	def.Display = b.display(bodyCol, timeCol, sevCol, compCol)
 
+	if opts.Aliases {
+		b.roles["aliases"] = fmt.Sprintf(
+			"offered from the role name lists, checked against the %d bag keys the probe "+
+				"reported. A key the probe did not see cannot be ruled out", len(b.known))
+	} else {
+		b.roles["aliases"] = "none offered (-aliases turns them on). An alias that shadows a " +
+			"bag key answers a question about the bag with the aliased column's value, and " +
+			"nothing says so"
+	}
 	def.Introspect = &IntrospectDef{
 		Version: ProbeVersion, Table: shape.Table, ColumnsDigest: shape.Digest,
-		Profiled: profiled, Window: opts.Window,
-		Roles: b.roles, Refused: b.refused,
+		Profiled: profiled, Rows: scanned, Window: window,
+		Roles: b.roles, Refused: b.refused, Blocked: b.blocked,
 	}
 	return def, b.notes, nil
 }
@@ -1002,11 +1555,33 @@ type builder struct {
 	opts    BuildOptions
 	roles   map[string]string
 	refused []string
+	blocked []string
 	notes   []string
+
+	// known is every bag key the probe saw, lowercased, for the alias check.
+	known map[string]bool
+
+	// defaultCol is the chosen default field, so the whole-record alias names
+	// attach to it rather than to whichever column matched by name.
+	defaultCol string
+
+	// timeFrom is the provenance of a content-promoted time column, which
+	// differs depending on whether a human confirmed it.
+	timeFrom string
 }
 
 func (b *builder) refuse(format string, args ...interface{}) {
 	b.refused = append(b.refused, fmt.Sprintf(format, args...))
+}
+
+// block records a refusal that needs a human before the descriptor is useful.
+// It is reported like any other, and it also makes `introspect build` exit
+// non-zero, so `build && deploy` cannot ship a descriptor whose most
+// consequential role was declined for want of evidence.
+func (b *builder) block(format string, args ...interface{}) {
+	msg := fmt.Sprintf(format, args...)
+	b.refused = append(b.refused, msg)
+	b.blocked = append(b.blocked, msg)
 }
 
 func (b *builder) note(format string, args ...interface{}) {
@@ -1046,15 +1621,76 @@ func (b *builder) pickTime() string {
 			// stringified date, and the name alone is the guess that types a
 			// free-text field as time.
 			c := stringy[0]
+			r, _ := b.prof.row(c)
+			confirmed := strings.EqualFold(b.opts.TimeColumn, c)
+			if r.NonNull < b.opts.MinPromoteSample && !confirmed {
+				// A candidate, not a decision. The time role gates every
+				// time-bounded query, so a sample this small must be confirmed
+				// by a human rather than believed.
+				b.roles["time"] = fmt.Sprintf(
+					"CANDIDATE, NOT APPLIED: %s is VARCHAR and all %d of its sampled values "+
+						"cast to TIMESTAMP, but %d values is below the %d needed to promote a "+
+						"column on content alone. Confirm with -time-column %s",
+					c, r.NonNull, r.NonNull, b.opts.MinPromoteSample, c)
+				b.block("no time role applied: %q looks like one — VARCHAR, named like a time "+
+					"field, and all %d sampled values cast — but the time role gates EVERY "+
+					"time-bounded query, so a value that does not cast leaves its row out of "+
+					"every panel at once, and %d rows is not enough evidence to accept that "+
+					"risk. Re-profile over more data, or confirm with -time-column %s. Until "+
+					"then the role is empty: the descriptor still LOADS (a table with no time "+
+					"column is legal) and says so in a note, %q stays a plain string field, "+
+					"the dashboard generator refuses to emit any panel, and `sql` emits no "+
+					"ORDER BY",
+					c, r.NonNull, r.NonNull, c, c)
+				return ""
+			}
+			why := "content-sample"
+			if confirmed {
+				why = "user-supplied, confirming a content-sample candidate"
+			}
+			b.timeFrom = why + " (VARCHAR whose every sampled value casts to TIMESTAMP)"
 			b.roles["time"] = fmt.Sprintf(
-				"content-sample (%s is VARCHAR but every value casts to TIMESTAMP, and the "+
-					"name is a time candidate; read through a cast)", c)
+				"%s (%s is VARCHAR but all %d sampled values cast to TIMESTAMP, and the name is "+
+					"a time candidate; read through a cast, so a value that does not cast is "+
+					"EXCLUDED from every time-bounded query)", why, c, r.NonNull)
+			b.refuse("time role %q is read through TRY_CAST because the column is VARCHAR, not "+
+				"TIMESTAMP: %d of %d sampled values cast. A value that does not cast becomes "+
+				"NULL and its row is excluded from every time-bounded query — not just one "+
+				"filter — with no error. Count them with count_if(%s IS NOT NULL AND "+
+				"TRY_CAST(%s AS TIMESTAMP) IS NULL)", c, r.NumericOKTimestamps(), r.NonNull,
+				quoteIdent(c), quoteIdent(c))
 			return c
+		}
+		// Report a near miss, because "2,000 of 2,001 values cast" is the
+		// actionable fact and silence about it is what sends someone hunting.
+		// A single uncastable value is enough to decline: the time role gates
+		// every time-bounded query, so that one row would be invisible to all
+		// of them.
+		var near []string
+		for _, c := range b.shape.Columns {
+			if c.Type != "string" || !nameIn(timeNames, c.Name) {
+				continue
+			}
+			if r, ok := b.prof.row(c.Name); ok && r.NonNull > 0 && r.TimestampOK > 0 &&
+				r.TimestampOK < r.NonNull {
+				near = append(near, fmt.Sprintf("%s (%d of %d values cast; %d would be invisible "+
+					"to every time-bounded query)", c.Name, r.TimestampOK, r.NonNull,
+					r.NonNull-r.TimestampOK))
+			}
 		}
 		b.roles["time"] = "UNRESOLVED: no timestamp-typed column, and no VARCHAR column both " +
 			"named like a time field and holding only timestamps"
-		b.refuse("no time role: the descriptor will be refused at load. Name the column by " +
-			"hand, or add a field of kind \"timestamp\" reading it through a cast")
+		if len(near) > 0 {
+			b.roles["time"] += " — near miss: " + strings.Join(near, "; ")
+		}
+		msg := "no time role. The descriptor still LOADS — a table with no time column is legal — " +
+			"and says so in a note, but the dashboard generator refuses to emit any panel and " +
+			"`sql` emits no ORDER BY. Declare a field of kind \"timestamp\" by hand, reading the " +
+			"column through a cast if it is not stored as one"
+		if len(near) > 0 {
+			msg += ". Near miss: " + strings.Join(near, "; ")
+		}
+		b.block("%s", msg)
 		return ""
 	}
 	inKey := false
@@ -1256,8 +1892,10 @@ func (b *builder) pickBags() []BagDef {
 // This is the only place a content sample PROMOTES a type, and it is where the
 // duration defect dies. A bag key has no declared type — that is what a bag is
 // for — so the alternatives are to guess from the name or to look at the values.
-// Guessing from the name is what makes `duration:>100` return 0 of 1,945 rows in
-// silence.
+// Guessing from the name is how `duration` ends up declared numeric; but note
+// that `duration:>100` returns 0 of its rows whatever the declaration says,
+// because a numeric bound converts either way. The declaration matters for the
+// EQUALITY, and the sample matters for knowing the bound is lossy at all.
 //
 // Three outcomes, and two of them are refusals:
 //
@@ -1276,6 +1914,14 @@ func (b *builder) bagKeys(bag string) map[string]string {
 		key := col[len(prefix):]
 		switch r.numeric() {
 		case numericYes:
+			if !b.opts.BagNumeric {
+				b.roles["bagkey:"+key] = fmt.Sprintf(
+					"all %d sampled values cast to a number, but the key is left as a string: "+
+						"declaring it Number changes only the equality, and changes it from an "+
+						"index-backed lookup to a full scan. -bag-numeric declares it anyway",
+					r.NonNull)
+				continue
+			}
 			out[key] = "number"
 		case numericMixed:
 			b.refuse("bag key %q is NOT typed as a number: %d of its %d values cast (%.1f%%), "+
@@ -1330,6 +1976,17 @@ func (b *builder) pickIndexes(group string) []IndexDef {
 	return out
 }
 
+// castRate describes a column's numeric cast rate in words, for a note.
+func castRate(r ProfileRow) string {
+	switch {
+	case r.NumericOK == 0:
+		return fmt.Sprintf("none of its %d sampled values cast", r.NonNull)
+	default:
+		return fmt.Sprintf("only %d of its %d sampled values cast (%.1f%%)",
+			r.NumericOK, r.NonNull, 100*float64(r.NumericOK)/float64(r.NonNull))
+	}
+}
+
 func orNoneStr(s string) string {
 	if s == "" {
 		return "no index"
@@ -1339,7 +1996,7 @@ func orNoneStr(s string) string {
 
 // fields renders one FieldDef per column, with the kind each column's evidence
 // supports and the aliases its role's name list can safely spare.
-func (b *builder) fields(group, bodyCol, timeCol string) []FieldDef {
+func (b *builder) fields(group, bodyCol, msgCol, timeCol string) []FieldDef {
 	var out []FieldDef
 	for _, c := range b.shape.Columns {
 		if c.Type == "variant" || c.Type == "other" {
@@ -1374,6 +2031,18 @@ func (b *builder) fields(group, bodyCol, timeCol string) []FieldDef {
 		default:
 			fd.Kind = "string"
 			fd.From = "type-only"
+			if r, ok := b.prof.row(c.Name); ok && r.NonNull > 0 && looksNumeric(c.Name) &&
+				r.numeric() != numericYes {
+				// A column, so Number was never available — the declared type
+				// decides and this one is a string. Said anyway, because the
+				// operator reading this report is the person who would
+				// otherwise write `latency_ms:>100` and read the zero as an
+				// answer.
+				b.refuse("column %q reads like a number and %s: a bound on it converts with "+
+					"TRY_CAST, so values that are not numbers are excluded rather than "+
+					"counted — check them for a unit suffix",
+					c.Name, castRate(r))
+			}
 		}
 		if c.Derived != "" {
 			fd.Derived = c.Derived
@@ -1389,9 +2058,10 @@ func (b *builder) fields(group, bodyCol, timeCol string) []FieldDef {
 			// as an instant.
 			fd.Kind = "timestamp"
 			fd.Column = fmt.Sprintf("TRY_CAST(%s AS TIMESTAMP)", quoteIdent(c.Name))
-			fd.From = "content-sample (VARCHAR whose every sampled value casts to TIMESTAMP)"
+			fd.Conversion = fmt.Sprintf("the column is %s, read as an instant", c.RawType)
+			fd.From = b.timeFrom
 		}
-		fd.Aliases = b.aliasesFor(c.Name, bodyCol, timeCol)
+		fd.Aliases = b.aliasesFor(c.Name, msgCol, timeCol)
 		if r, ok := b.prof.row(c.Name); ok && r.NonNull > 0 && r.MaxLen > 0 {
 			// One real value would be better, but the profile carries only
 			// min/max so the example is a length hint rather than a sample.
@@ -1412,18 +2082,46 @@ func (b *builder) fields(group, bodyCol, timeCol string) []FieldDef {
 // logs.k8s_logs_v2, `body` is a real bag key on 3 rows, `service` on 476,490,
 // `labels` on 47 and `component` on 1. Aliasing `body` to the message column
 // would answer a question about kv['body'] with the message text.
-func (b *builder) aliasesFor(col, bodyCol, timeCol string) []string {
+// aliasesFor offers the other names in a role's candidate list as aliases for
+// the column that matched that list by name.
+//
+// It keys on the NAME-MATCHED column, not on the role. When a derived text
+// surface wins the default-field role, `message` is still a synonym for the
+// message column and not for the reconstruction of the whole line — the two
+// differ, which is the entire point of the derived column. Attaching body
+// aliases to the derived surface made `message:peer` compile to
+// `query('line:peer')` where the hand-written descriptor gives
+// `query('msg:peer')`, and those are different questions: over
+// logs.k8s_logs_v2, query('line:snapshot') is 25,488 rows and
+// query('msg:snapshot') is 17,649.
+//
+// The derived surface itself gets no aliases. It is not a synonym for anything
+// a user would type; it is a superset, and naming it as though it were the
+// message is how a reader stops being able to ask about the message alone.
+func (b *builder) aliasesFor(col, msgCol, timeCol string) []string {
+	if !b.opts.Aliases {
+		return nil
+	}
 	var list []string
-	switch col {
-	case bodyCol:
-		list = bodyNames
-	case timeCol:
-		list = timeNames
-	default:
+	if col == b.defaultCol {
+		list = append(list, surfaceNames...)
+	}
+	if col == msgCol {
+		list = append(list, messageNames...)
+	}
+	if col == timeCol {
+		list = append(list, timeNames...)
+	}
+	if len(list) == 0 {
 		return nil
 	}
 	var out []string
+	seen := map[string]bool{}
 	for _, name := range list {
+		if seen[strings.ToLower(name)] {
+			continue
+		}
+		seen[strings.ToLower(name)] = true
 		if strings.EqualFold(name, col) {
 			continue
 		}
@@ -1446,8 +2144,8 @@ func (b *builder) aliasesFor(col, bodyCol, timeCol string) []string {
 
 func (b *builder) bagKeyExists(name string) bool {
 	suffix := "." + strings.ToLower(name)
-	for col := range b.prof.Rows {
-		if strings.HasSuffix(strings.ToLower(col), suffix) {
+	for col := range b.known {
+		if strings.HasSuffix(col, suffix) {
 			return true
 		}
 	}
@@ -1477,8 +2175,23 @@ func (b *builder) display(bodyCol, timeCol, sevCol, compCol string) []string {
 	add(timeCol)
 	add(sevCol)
 	add(compCol)
+	textCols := map[string]bool{}
+	for _, ix := range b.shape.Indexes {
+		if ix.Kind != InvertedIndex {
+			continue
+		}
+		for _, col := range ix.Columns {
+			textCols[strings.ToLower(col)] = true
+		}
+	}
 	for _, c := range b.shape.Columns {
 		if c.Type != "string" || c.Name == bodyCol || c.Derived != "" {
+			continue
+		}
+		if textCols[strings.ToLower(c.Name)] {
+			// A second full-text column is the message behind a derived
+			// surface. Showing both puts the same words on the row twice and
+			// pushes everything else off the screen.
 			continue
 		}
 		if r, ok := b.prof.row(c.Name); ok {
@@ -1487,6 +2200,22 @@ func (b *builder) display(bodyCol, timeCol, sevCol, compCol string) []string {
 				b.refuse("column %q is not in `display`: ~%d distinct values over %d rows is an "+
 					"identifier, not something a log view can show usefully",
 					c.Name, r.Distinct, r.NonNull)
+				continue
+			}
+			if r.Scanned > 0 && r.NonNull*20 < r.Scanned {
+				// A forward-only column is the case: `raw` was added to
+				// logs.k8s_logs and the collector began populating it, so
+				// 5,112 rows of 1,016,392 have a value and the rest never
+				// will. A log view that reserves a column for it shows an
+				// empty one nearly always. It stays a declared FIELD — that
+				// part is correctness, and leaving it undeclared routes
+				// `raw:x` into the bag where it matches nothing — but it is
+				// not something to put on every row.
+				b.refuse("column %q is not in `display`: only %d of %d sampled rows have a "+
+					"value (%.1f%%), so a column reserved for it is empty nearly always. It is "+
+					"still declared as a field, which is what stops a query naming it from "+
+					"being routed into the attribute bag",
+					c.Name, r.NonNull, r.Scanned, 100*float64(r.NonNull)/float64(r.Scanned))
 				continue
 			}
 		}

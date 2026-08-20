@@ -131,6 +131,55 @@ const k8sLogsDef = `{
 // reader saw. nullif keeps a row whose bag has nothing else from gaining a
 // stray `[]`.
 //
+// # `raw`, and why it is a string
+//
+// `raw` is a plain column holding the log line exactly as the container wrote
+// it, populated forward-only by the collector. It is declared here because NOT
+// declaring a real column is a silent wrong answer, not an omission: with a bag
+// configured, `raw:hello` was routed into it and compiled to
+// `query('kv.raw:hello') AND lower(kv['raw']::VARCHAR) = lower('hello')` —
+// measured over `[2026-08-20 01:00, 02:00)` (18,883 rows), `kv['raw'] IS NOT
+// NULL` is 0 while `raw IS NOT NULL` is 18,883, so that query was empty forever
+// and would have stayed empty however many rows arrived. The advisory it
+// raised made it worse by asserting something false, that "raw is not a column".
+//
+// Kind `string` is the only honest choice: `raw` is not in the inverted index
+// group, and declaring a text field outside the group is refused at load — one
+// query() call reaches the columns of one index. So `raw:x` is an exact equality
+// on a whole log line, which is nearly useless, and `raw:*hello*` is the usable
+// form: it compiles to LIKE and warns that nothing indexes it, because the NGRAM
+// index covers (msg, line) and not raw.
+//
+// It is deliberately absent from `display`, and the reason has a shape rather
+// than a number. `raw` is forward-only: the rows written before the column
+// existed cannot acquire a value, so its fill rate is near zero across
+// accumulated history and rising toward one going forward. Both halves,
+// two-sided so they stay checkable, and both windows CLOSED so they stay true:
+// over `ts < '2026-08-20 00:00:00'` (997,592 rows) 0 have a value, and over
+// `[2026-08-20 01:00, 02:00)` (18,883 rows) — an hour entirely after the
+// collector change — 18,883 do, all of them.
+//
+// The earlier version of this comment quoted `[00:00, 02:00)` as 18,260 of
+// 31,948. Both numbers were wrong the moment they were written, because 02:00
+// had not happened yet: the window kept filling, and the same query read
+// 23,880 of 37,568 an hour later. A bound in the future is not a bound. The
+// window also straddled the collector change, which is what made the ratio
+// meaningless rather than merely stale — 57.2% described the position of one
+// clock tick inside the window, not anything about the column.
+//
+// A single whole-table ratio would be quoting a moment for a different reason:
+// it read 3,711 of 1,014,991 when this comment was first written and 12,796 of
+// 1,024,076 an hour later. That is why the figures above are bounded on both
+// sides, sit wholly on one side of the change, and the argument below rests on
+// the shape rather than on any of them.
+//
+// So a column reserved for it in a log view is mostly empty *today*, and the
+// dashboard surfaces it where it belongs instead, as `coalesce(raw, line)` in
+// the log body — which is right whichever way the ratio goes. Note that the
+// introspector's own 5%-of-sampled-rows suppression rule is window-dependent
+// for exactly this reason and will start keeping `raw` in `display` once the
+// profiled window sits after the change; that is the rule working, not failing.
+//
 // # A divergence worth stating
 //
 // A bare word here searches the message *and* the attribute values. The
@@ -162,6 +211,7 @@ const k8sLogsLineDef = `{
     {"name": "namespace", "kind": "string"},
     {"name": "pod", "kind": "string"},
     {"name": "node", "kind": "string"},
-    {"name": "source_file", "kind": "string"}
+    {"name": "source_file", "kind": "string"},
+    {"name": "raw", "kind": "string"}
   ]
 }`

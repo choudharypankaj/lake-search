@@ -1,0 +1,31 @@
+lsprobe|v1|section|profile|logs.a2_awkward
+lsprobe|v1|window|whole table
+lsprobe|v1|prof|event_time|8|8|0|8|8|19|19
+lsprobe|v1|prof|severity_text|8|8|0|0|2|4|5
+lsprobe|v1|prof|service|8|8|0|0|1|12|12
+lsprobe|v1|prof|content|8|8|0|0|8|47|47
+lsprobe|v1|prof|latency_ms|8|8|0|0|8|5|6
+lsprobe|v1|prof|request_id|8|8|0|0|8|36|36
+lsprobe|v1|prof|code|8|8|8|0|8|3|3
+lsprobe|v1|prof|attrs|8|8|0|0|8|73|73
+lsprobe|v1|prof|resource|8|8|0|0|8|40|40
+lsprobe|v1|section|bagkeys|logs.a2_awkward
+lsprobe|v1|bagkey|attrs|bytes_out|8
+lsprobe|v1|bagkey|attrs|host|8
+lsprobe|v1|bagkey|attrs|ok|8
+lsprobe|v1|bagkey|attrs|retries|8
+lsprobe|v1|bagkey|attrs|latency|8
+lsprobe|v1|section|bagkeys|logs.a2_awkward
+lsprobe|v1|bagkey|resource|region|8
+lsprobe|v1|bagkey|resource|k8s_pod|8
+lsprobe|v1|section|profile|logs.a2_awkward
+lsprobe|v1|window|whole table
+lsprobe|v1|prof|attrs.bytes_out|8|8|8|0|8|4|4
+lsprobe|v1|prof|attrs.host|8|8|0|0|8|5|5
+lsprobe|v1|prof|attrs.ok|8|8|0|0|1|4|4
+lsprobe|v1|prof|attrs.retries|8|8|8|0|8|1|1
+lsprobe|v1|prof|attrs.latency|8|8|0|0|8|5|5
+lsprobe|v1|section|profile|logs.a2_awkward
+lsprobe|v1|window|whole table
+lsprobe|v1|prof|resource.region|8|8|0|0|1|9|9
+lsprobe|v1|prof|resource.k8s_pod|8|8|0|0|8|5|5

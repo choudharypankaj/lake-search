@@ -1,0 +1,26 @@
+lsprobe|v1|section|columns|logs.k8s_logs_v2
+ts	TIMESTAMP	YES	NULL	
+component	VARCHAR	YES	NULL	
+level	VARCHAR	YES	NULL	
+namespace	VARCHAR	YES	NULL	
+pod	VARCHAR	YES	NULL	
+node	VARCHAR	YES	NULL	
+source_file	VARCHAR	YES	NULL	
+msg	VARCHAR	YES	NULL	
+kv	VARIANT	YES	NULL	
+line	VARCHAR	YES	NULL	STORED COMPUTED COLUMN `concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv, 'container', 'service', 'format'), '$.*')::STRING, '[]'))`
+lsprobe|v1|section|create|logs.k8s_logs_v2
+k8s_logs_v2	"CREATE TABLE k8s_logs_v2 (
+  ts TIMESTAMP NULL,
+  component VARCHAR NULL,
+  level VARCHAR NULL,
+  namespace VARCHAR NULL,
+  pod VARCHAR NULL,
+  node VARCHAR NULL,
+  source_file VARCHAR NULL,
+  msg VARCHAR NULL,
+  kv VARIANT NULL,
+  line VARCHAR NULL AS (concat_ws(' ', msg, nullif(json_path_query_array(object_delete(kv, 'container', 'service', 'format'), '$.*')::STRING, '[]'))) STORED,
+  SYNC INVERTED INDEX idx_msg (msg, kv, line) filters = 'english_stop,english_stemmer', tokenizer = 'english',
+  SYNC NGRAM INDEX idx_msg_ng (msg, line)
+) ENGINE=FUSE CLUSTER BY (to_date(ts), component)"

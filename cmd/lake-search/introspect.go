@@ -59,16 +59,25 @@ func introspectUsage() {
   3. build   -shape F [-profile F] [-o OUT]  write the descriptor
 
   verify  -schema D | -preset N              print SQL that binds every column expression
-                                             and re-reads DESCRIBE, to catch drift
+                                             and re-reads the table's shape
+  verify  ... -shape F                       report the drift in that output
 
 Nothing here connects to a database. Each step prints SQL for you to run through
 whatever client you already use, and the next step reads what it printed.
 
-The profile step is what makes this worth doing. A column's declared type does
-not tell you whether its values suit a role: a bag key named 'duration' holding
-'47.823614ms' is a string that no numeric comparison can use, and only looking at
-the values says so. Skip the profile and every type rests on the declared type
-alone, which is the blind spot that answers 'duration:>100' with zero rows.
+The profile step is what makes this worth doing, and here is exactly what it buys.
+A column's declared type does not tell you whether its values suit a role: a bag
+key named 'duration' holding '47.823614ms' is a string no numeric comparison can
+use, and only the values say so.
+
+What it does NOT do is change how 'duration:>100' compiles. A numeric bound on a
+bag key is TRY_CAST with or without a profile, so that query answers 0 of its
+2,046 rows either way, and the compiler warns either way. What the profile buys
+is knowing WHICH bounds are lossy and by how much -- it is the only thing that
+can tell you the ratio is 2 of 2,046 -- plus three decisions that are otherwise
+unavailable: -bag-numeric has nothing to act on without it, a mostly-empty column
+cannot be kept out of 'display', and a VARCHAR holding instants cannot be
+recognised as a time column.
 `)
 }
 
@@ -88,7 +97,9 @@ func introProfile(args []string) int {
 	fs := flag.NewFlagSet("introspect profile", flag.ExitOnError)
 	table := fs.String("table", "", "qualified table (must match the shape output)")
 	shapeFile := fs.String("shape", "", "file holding the shape probe's output")
-	window := fs.String("window", "1", "hours of history to profile; empty profiles everything")
+	window := fs.String("window", "1", "rolling bound: hours of history to profile")
+	since := fs.String("since", "", "absolute lower bound on the time column (wins over -window)")
+	until := fs.String("until", "", "absolute upper bound on the time column")
 	maxKeys := fs.Int("keys-limit", 32, "how many bag keys to list")
 	bag := fs.String("bag", "", "bag column for -keys")
 	keys := fs.String("keys", "", "comma-separated bag keys to profile")
@@ -98,8 +109,9 @@ func introProfile(args []string) int {
 	if !ok {
 		return 1
 	}
+	win := databend.ProbeWindow{Hours: *window, Since: *since, Until: *until}
 	if *keys != "" {
-		sql, err := databend.BagKeyProfileProbe(shape, *bag, splitCSV(*keys), *window)
+		sql, err := databend.BagKeyProfileProbe(shape, *bag, splitCSV(*keys), win)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return 1
@@ -107,7 +119,7 @@ func introProfile(args []string) int {
 		fmt.Print(sql)
 		return 0
 	}
-	sql, err := databend.ProfileProbe(shape, *window, *maxKeys)
+	sql, err := databend.ProfileProbe(shape, win, *maxKeys)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -122,7 +134,17 @@ func introBuild(args []string) int {
 	shapeFile := fs.String("shape", "", "file holding the shape probe's output")
 	profFile := fs.String("profile", "", "file holding the value probe's output")
 	out := fs.String("o", "", "write here instead of stdout")
-	window := fs.String("window", "", "window the profile used, recorded as provenance")
+	window := fs.String("window", "", "rolling window the profile used, recorded as provenance")
+	since := fs.String("since", "", "absolute lower bound the profile used")
+	until := fs.String("until", "", "absolute upper bound the profile used")
+	aliases := fs.Bool("aliases", false, "offer role name lists as field aliases (see -h)")
+	timeCol := fs.String("time-column", "",
+		"confirm a time-role candidate the sample was too small to promote on its own")
+	minSample := fs.Int64("min-sample", 0,
+		"non-null sampled values a content promotion needs before it is applied (default 1000)")
+	bagNumeric := fs.Bool("bag-numeric", false,
+		"declare a bag key as a number when every sampled value casts. Off by default: it "+
+			"changes only the equality, and changes it from index-backed to a full scan")
 	fs.Parse(args)
 
 	shape, ok := readShape(*shapeFile, *table)
@@ -131,30 +153,54 @@ func introBuild(args []string) int {
 	}
 
 	var prof databend.Profile
+	var discovered []string
 	if *profFile != "" {
 		raw, err := os.ReadFile(*profFile)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return 1
 		}
-		var keys []string
-		prof, keys, err = databend.ParseProfile(string(raw), shape.Table)
+		prof, discovered, err = databend.ParseProfile(string(raw), shape.Table)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "error:", err)
 			return 1
 		}
-		if unprofiled := len(keys); unprofiled > 0 {
+		// Only the keys that were LISTED and not also profiled. Counting the
+		// whole listing meant the note fired in the same run that refused
+		// kv.duration *because* it was profiled — saying 32 keys went
+		// unprofiled while reporting findings from all 32. A note that is
+		// always wrong trains the reader to skip the notes, which are this
+		// tool's only mechanism for loud degradation.
+		var unprofiled []string
+		for _, k := range discovered {
+			if _, ok := prof.Rows[k]; !ok {
+				unprofiled = append(unprofiled, k)
+			}
+		}
+		if n := len(unprofiled); n > 0 {
+			shown := unprofiled
+			if n > 6 {
+				shown = unprofiled[:6]
+			}
 			fmt.Fprintf(os.Stderr,
-				"note: %d bag keys were listed but not profiled; their types default to string. "+
-					"Profile the ones you filter on: introspect profile -keys …\n", unprofiled)
+				"note: %d of %d discovered bag keys were not profiled, so their types default "+
+					"to string (%s%s). Profile the ones you filter on: "+
+					"introspect profile -keys …\n",
+				n, len(discovered), strings.Join(shown, ", "),
+				map[bool]string{true: ", …"}[n > 6])
 		}
 	} else {
 		fmt.Fprintln(os.Stderr,
-			"note: no -profile given, so every type rests on the declared type alone. That is "+
-				"how a column of Go durations gets typed as a number.")
+			"note: no -profile given, so nothing here rests on the data. Types are unaffected — "+
+				"a bag key is a string either way — but no bag key can be shown to be mixed, "+
+				"nothing can be suppressed from `display` for being mostly empty, and a VARCHAR "+
+				"holding instants cannot be recognised as a time column.")
 	}
 
-	def, notes, err := databend.Build(shape, prof, databend.BuildOptions{Window: *window})
+	win := databend.ProbeWindow{Hours: *window, Since: *since, Until: *until}
+	def, notes, err := databend.Build(shape, prof, databend.BuildOptions{
+		Window: win.Describe(), Aliases: *aliases, KnownBagKeys: discovered,
+		BagNumeric: *bagNumeric, TimeColumn: *timeCol, MinPromoteSample: *minSample})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
@@ -173,9 +219,26 @@ func introBuild(args []string) int {
 	// role, and saying so now — with the same message the loader would give —
 	// is the difference between a tool that reports and one that emits a file
 	// and lets a panel find out.
+	//
+	// The file is still written, because the fastest fix is usually to edit one
+	// line of it. But the exit status is a failure, so that
+	// `introspect build && deploy` cannot ship a descriptor that does not load.
+	loads := true
+	if def.Introspect != nil && len(def.Introspect.Blocked) > 0 {
+		// Not a load failure — a decision the tool declined to make. The
+		// descriptor is valid; it is just missing the part a human has to
+		// supply, so the exit status says "do not deploy this yet".
+		loads = false
+		fmt.Fprintf(os.Stderr,
+			"\n%d role(s) were declined for want of evidence; see `blocked` in the descriptor. "+
+				"It is written and it loads, but the exit status is 1 so a script does not "+
+				"deploy it.\n", len(def.Introspect.Blocked))
+	}
 	if _, schemaNotes, err := def.Schema(); err != nil {
+		loads = false
 		fmt.Fprintln(os.Stderr, "\nthis descriptor does NOT load:", err)
-		fmt.Fprintln(os.Stderr, "it is still written, so you can edit the missing part by hand.")
+		fmt.Fprintln(os.Stderr, "it is written anyway so you can edit the missing part by hand, "+
+			"but the exit status is 1 so a script does not deploy it.")
 	} else {
 		for _, n := range schemaNotes {
 			fmt.Fprintln(os.Stderr, "schema note:", n)
@@ -190,13 +253,16 @@ func introBuild(args []string) int {
 	blob = append(blob, '\n')
 	if *out == "" {
 		os.Stdout.Write(blob)
-		return 0
+	} else {
+		if err := os.WriteFile(*out, blob, 0o644); err != nil {
+			fmt.Fprintln(os.Stderr, "error:", err)
+			return 1
+		}
+		fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
 	}
-	if err := os.WriteFile(*out, blob, 0o644); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
+	if !loads {
 		return 1
 	}
-	fmt.Fprintf(os.Stderr, "wrote %s\n", *out)
 	return 0
 }
 
@@ -204,14 +270,41 @@ func introVerify(args []string) int {
 	fs := flag.NewFlagSet("introspect verify", flag.ExitOnError)
 	var sf schemaFlags
 	sf.register(fs)
+	shapeFile := fs.String("shape", "",
+		"output of the verify probe; given, drift is REPORTED instead of the probe being printed")
 	fs.Parse(args)
 	schema, err := sf.resolve()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		return 1
 	}
-	fmt.Print(databend.VerifyProbe(schema))
-	return 0
+	if *shapeFile == "" {
+		fmt.Print(databend.VerifyProbe(schema))
+		return 0
+	}
+
+	raw, err := os.ReadFile(*shapeFile)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	shape, err := databend.ParseShape(string(raw), schema.Table)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error:", err)
+		return 1
+	}
+	findings := databend.Drift(shape, schema, sf.digest())
+	if len(findings) == 0 {
+		fmt.Printf("%s: no drift. %d columns and %d indexes, all declared.\n",
+			shape.Table, len(shape.Columns), len(shape.Indexes))
+		return 0
+	}
+	fmt.Printf("%s: %d drift finding(s).\n\n", shape.Table, len(findings))
+	for _, f := range findings {
+		fmt.Println("  \u2022", f)
+	}
+	fmt.Println("\nRe-run `introspect probe` and `build` to regenerate, or edit the descriptor.")
+	return 1
 }
 
 func readShape(path, table string) (databend.Shape, bool) {

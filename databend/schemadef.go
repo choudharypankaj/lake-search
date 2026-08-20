@@ -150,14 +150,26 @@ type IntrospectDef struct {
 	// is the answer to a descriptor being a snapshot rather than a live read.
 	ColumnsDigest string `json:"columns_digest,omitempty"`
 
-	// Profiled records whether a sampled value profile was available. Without
-	// one every type rests on the declared type alone, which is the blind spot
-	// that types a column of Go durations as a number.
+	// Profiled records whether a sampled value profile was available.
+	//
+	// Without one every type rests on the DECLARED type alone. That is a blind
+	// spot, but state it accurately: a VARCHAR column of Go durations is left a
+	// string either way, because nothing here promotes a column on its declared
+	// type. What the profile buys is knowing -- the 2-of-2,046 cast ratio that
+	// says `duration` is not a number, the bag keys that can be typed at all,
+	// and the sample a TIME-role promotion is allowed to rest on. Unprofiled,
+	// those decisions are not made wrongly; they are not made.
 	Profiled bool `json:"profiled"`
 
 	// Window describes the profile's bound, so a reader knows how much data the
-	// content decisions rest on.
+	// content decisions rest on. It is read out of the profile's own output
+	// rather than from a flag, because the two defaults disagreed and the
+	// output is the only thing that knows what was actually measured.
 	Window string `json:"window,omitempty"`
+
+	// Rows is how many rows the profile scanned. Zero with Profiled false means
+	// the window was empty — a distinction the block used to lose.
+	Rows int64 `json:"rows,omitempty"`
 
 	// Roles says how each role was decided, or why it was not.
 	Roles map[string]string `json:"roles,omitempty"`
@@ -166,6 +178,11 @@ type IntrospectDef struct {
 	// is the most important field in the block: it is the only record that a
 	// plausible inference was deliberately NOT made.
 	Refused []string `json:"refused,omitempty"`
+
+	// Blocked is the subset of Refused that needs a human before the descriptor
+	// is useful — a role declined for want of evidence rather than because the
+	// table lacks it. `introspect build` exits non-zero when it is non-empty.
+	Blocked []string `json:"blocked,omitempty"`
 }
 
 // IndexDef is one index in the on-disk form.
@@ -219,6 +236,13 @@ type FieldDef struct {
 
 	// Example is one real value, used only by the dashboard help text.
 	Example string `json:"example,omitempty"`
+
+	// Conversion describes a per-value cast in Column that reaches the declared
+	// Kind — `TRY_CAST(event_time AS TIMESTAMP)` for a VARCHAR column read as
+	// an instant. Declaring it is what makes the compiler warn that a value
+	// which does not cast is excluded rather than raised. A bare column needs
+	// none.
+	Conversion string `json:"conversion,omitempty"`
 
 	// From records how this field was decided when the descriptor was
 	// generated: `canonical-name`, `content-sample`, `lone-candidate`,
@@ -463,7 +487,28 @@ func (d Def) Schema() (Schema, []string, error) {
 			col = fd.Name
 		}
 
-		f := Field{Column: col, Kind: kind, Example: fd.Example}
+		f := Field{Column: col, Kind: kind, Example: fd.Example,
+			Conversion: fd.Conversion, Derived: fd.Derived}
+
+		// A cast in Column with no Conversion beside it buys silence. The
+		// compiler's per-value-cast advisory is driven by Conversion, not by
+		// reading the expression -- deliberately, because Column is allowed to
+		// hold arbitrary SQL and a compiler that parsed it would be guessing --
+		// so a descriptor that casts without saying so compiles correct SQL and
+		// says nothing about the rows the cast drops. That is how the defect
+		// this field exists to fix reappears: by hand, or from a descriptor
+		// written before Conversion existed.
+		//
+		// A note rather than an error. The SQL is right, only the advisory is
+		// missing, and refusing to load a descriptor that works would be worse
+		// than telling its author what it forgot.
+		if fd.Conversion == "" && castInExpr(col) {
+			notes = append(notes, fmt.Sprintf(
+				"field %q reads column expression %q, which casts per value, but declares no "+
+					"\"conversion\": a value that does not cast becomes NULL and its row leaves "+
+					"the comparison silently, and nothing will say so. Add \"conversion\" naming "+
+					"what the cast reaches (the introspector writes it for you)", fd.Name, col))
+		}
 		if kind == Text {
 			ixName, covered := byCol[col]
 			if !covered {
@@ -719,4 +764,17 @@ func PresetNames() []string {
 var presets = map[string]string{
 	"k8s-logs":      k8sLogsDef,
 	"k8s-logs-line": k8sLogsLineDef,
+}
+
+// castInExpr reports whether a column expression performs a per-value cast.
+//
+// Substring matching, and that is the right amount of cleverness: this decides
+// whether to say something, never what SQL to emit, so a false positive costs
+// one sentence and a false negative costs the sentence that was missing anyway.
+// Parsing the expression properly would be a promise this cannot keep -- Column
+// may hold any SQL the engine accepts.
+func castInExpr(col string) bool {
+	up := strings.ToUpper(col)
+	return strings.Contains(up, "TRY_CAST(") || strings.Contains(up, "::") ||
+		strings.Contains(up, "TRY_TO_TIMESTAMP(") || strings.Contains(up, "TO_TIMESTAMP(")
 }
