@@ -17,8 +17,21 @@ is generated from the POST-migration preset, and that is the command to repeat
 if you redeploy it:
 
 ```bash
-python3 dashboards/tidb-logs-explorer.py --preset k8s-logs-line > dash.json
+python3 dashboards/tidb-logs-explorer.py --preset k8s-logs-line \
+  --display-body 'coalesce(raw, line)' > dash.json
 ```
+
+`--display-body` is there because parsing is lossy in one direction. The
+collector splits a line into a message and a bag of `[k=v]` fields, and the
+searched surface deliberately holds the bag's VALUES without the key names --
+an indexed `thread_id` also indexes `thread` and `id`, which would match ~195k
+rows on key names alone -- so the searchable text can never be the line a reader
+saw. The collector therefore also keeps the original line in `raw`, and the
+panel shows that. `coalesce` covers the rows collected before `raw` existed:
+they fall back to the parsed surface rather than rendering blank. The panel says
+out loud that a key name is matched as `err:RemoteStopped` and not as a bare
+term, because that is the one thing visible on screen that the index does not
+hold.
 
 Generated with no flags you get the `k8s-logs` preset, which describes the table
 as it was BEFORE that migration: `msg` alone, searched and shown. Both presets

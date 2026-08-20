@@ -225,6 +225,18 @@ data:
           msg = strip_whitespace(msg)
           fields = set!(fields, ["format"], fmt)
 
+          # `raw` is the line exactly as the container wrote it, kept because
+          # parsing is lossy in a way a reader notices. The parsed columns hold
+          # the message and the bracket fields SEPARATELY, so nothing downstream
+          # can reconstruct what was on screen: the key names are gone from the
+          # derived search column (deliberately -- an indexed `thread_id` also
+          # indexes `thread` and `id`, which would match ~195k rows on key names
+          # alone), and no expression can pair keys with values again because
+          # this engine has no lambda. So the original is stored rather than
+          # rebuilt. It costs a copy of the message text; the table is 11MB
+          # compressed for a million rows, which is a price worth paying to be
+          # able to compare a dashboard line against a pod log line character
+          # for character.
           . = {
             "ts":          format_timestamp!(ets, "%Y-%m-%d %H:%M:%S%.6f"),
             "component":   comp,
@@ -234,6 +246,7 @@ data:
             "node":        node,
             "source_file": src,
             "msg":         msg,
+            "raw":         raw,
             "kv":          fields
           }
       # tidb-operator prints multi-line ASCII status tables, one log event per

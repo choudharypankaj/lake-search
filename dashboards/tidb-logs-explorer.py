@@ -60,6 +60,16 @@ parser.add_argument("--lake-search", default="go run ./cmd/lake-search",
 parser.add_argument("--table", help="override the table the schema names. Same shape, different "
                                     "table — this does NOT change the column set, so it is for "
                                     "pointing at a copy, not at a different deployment.")
+parser.add_argument("--display-body", metavar="EXPR",
+                    help="SQL expression the log panel SHOWS instead of the body column. "
+                         "Display only -- the search box still searches --body. Use it when the "
+                         "table keeps the original line in a column of its own: parsing splits a "
+                         "line into a message and a bag, and the searched surface holds the bag's "
+                         "VALUES without the key names on purpose (an indexed `thread_id` also "
+                         "indexes `thread` and `id`), so the searchable text can never be the line "
+                         "a reader saw. This shows that line. The cost, which the panel says out "
+                         "loud: text visible here and absent from the searched surface -- the key "
+                         "names -- is not matched by a bare term, only as `key:value`.")
 parser.add_argument("--body", help="field to show as the log body and search with a bare term "
                                    "(default: the schema's own default field)")
 parser.add_argument("--pattern", help="field the fingerprint groups on "
@@ -419,7 +429,21 @@ def sel(name):
     return c if c == name else f"{c} AS {name}"
 
 
-logs_cols = [f"{TS} AS timestamp", f"{BODY_COL} AS body"]
+# The panel shows DISPLAY_BODY when the schema's table keeps the original line,
+# and the searched column otherwise. These two being different is a deliberate
+# exception to the rule the rest of this file enforces, so the panel states it
+# rather than letting a reader find out by searching for a key name and getting
+# nothing back.
+DISPLAY_BODY = args.display_body or BODY_COL
+logs_desc = None
+if args.display_body:
+    logs_desc = ("Showing the line as the collector received it. The search box searches the "
+                 f"parsed surface (`{BODY_COL}`), which holds the message and the attribute "
+                 "VALUES but not the attribute KEY NAMES — so a bare term finds `RemoteStopped` "
+                 "and not `err`. A key name is matched in field position: `err:RemoteStopped`. "
+                 "Rows collected before the original line was kept fall back to the parsed "
+                 "surface.")
+logs_cols = [f"{TS} AS timestamp", f"{DISPLAY_BODY} AS body"]
 if SEVERITY:
     logs_cols.append(f"{col(SEVERITY)} AS severity")
 logs_cols += [sel(n) for n in DETAIL]
@@ -429,7 +453,8 @@ panels.append(panel(2, "logs", "Log lines", 0, 13, 16, 16,
                     "SELECT " + ", ".join(logs_cols) + "\n"
                     f"FROM {TABLE}\nWHERE {WHERE}\nORDER BY {TS} DESC\nLIMIT 1000",
                     options={"showTime": True, "wrapLogMessage": True, "sortOrder": "Descending",
-                             "enableLogDetails": True, "dedupStrategy": "none"}))
+                             "enableLogDetails": True, "dedupStrategy": "none"},
+                    desc=logs_desc))
 
 pattern_group = f"{col(PRIMARY)},\n       " if PRIMARY else ""
 pattern_by = f"{col(PRIMARY)}, pattern" if PRIMARY else "pattern"
